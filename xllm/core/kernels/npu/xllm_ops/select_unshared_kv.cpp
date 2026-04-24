@@ -13,24 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#include <c10/core/Device.h>
-#include <glog/logging.h>
 #include <torch/torch.h>
-#include <torch_npu/csrc/libs/init_npu.h>
-#include <torch_npu/torch_npu.h>
 
-#include <nlohmann/json.hpp>
-#ifdef TORCH_HIGHER_THAN_PTA6
-#include <torch_npu/csrc/framework/OpCommand.h>
-#else
-#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
-#include <torch_npu/csrc/framework/utils/OpPreparation.h>
-#endif
-
-#include "acl/acl.h"
-#include "aclnn_select_unshared_kv.h"
 #include "core/common/macros.h"
 #include "core/kernels/npu/utils.h"
+#include "third_party/torch_npu_ops/ascendc_npu/pytorch_npu_helper.hpp"
 #include "xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
@@ -63,70 +50,18 @@ void select_unshared_kv(const torch::Tensor& beam_index,
   for (const auto& t : x_value_block) {
     check_tensor(t, "x_value_block[i]", "select_unshared_kv");
   }
-
-  aclTensor* beam_index_ids = nullptr;
-  aclTensor* group_offset_ids = nullptr;
-  aclTensor* block_table_ids = nullptr;
-  aclTensorList* x_key_block_list_ids = nullptr;
-  aclTensorList* x_value_block_list_ids = nullptr;
-  std::vector<aclTensor*> x_key_block_list_ids_vec;
-  std::vector<aclTensor*> x_value_block_list_ids_vec;
-  for (auto& x_key_block_tensor : x_key_block) {
-    aclTensor* x_key_block_id = nullptr;
-    create_acltensor(&x_key_block_id, x_key_block_tensor);
-    x_key_block_list_ids_vec.push_back(x_key_block_id);
-  }
-  for (auto& x_value_block_tensor : x_value_block) {
-    aclTensor* x_value_block_id = nullptr;
-    create_acltensor(&x_value_block_id, x_value_block_tensor);
-    x_value_block_list_ids_vec.push_back(x_value_block_id);
-  }
-  x_key_block_list_ids = aclCreateTensorList(x_key_block_list_ids_vec.data(),
-                                             x_key_block_list_ids_vec.size());
-  x_value_block_list_ids = aclCreateTensorList(
-      x_value_block_list_ids_vec.data(), x_value_block_list_ids_vec.size());
-  create_acltensor(&beam_index_ids, beam_index);
-  create_acltensor(&group_offset_ids, group_offset);
-  create_acltensor(&block_table_ids, block_table);
-
-  int32_t device_id = beam_index.device().index();
-  aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  uint64_t workspace_size = 0;
-  aclOpExecutor* executor = nullptr;
-
-  CHECK_ACL_SUCCESS(
-      aclnnSelectUnsharedKVGetWorkspaceSize(beam_index_ids,
-                                            block_table_ids,
-                                            x_key_block_list_ids,
-                                            x_value_block_list_ids,
-                                            group_offset_ids,
-                                            decode_step,
-                                            beam_size,
-                                            layer_num,
-                                            x_key_block_list_ids,
-                                            x_value_block_list_ids,
-                                            &workspace_size,
-                                            &executor),
-      "select_unshared_kv: failed to get workspace size");
-  void* workspace_addr = nullptr;
-  if (workspace_size > 0) {
-    CHECK_ACL_SUCCESS(
-        aclrtMalloc(&workspace_addr, workspace_size, ACL_MEM_MALLOC_HUGE_FIRST),
-        "select_unshared_kv: failed to allocate workspace");
-  }
-  CHECK_ACL_SUCCESS(
-      aclnnSelectUnsharedKV(workspace_addr, workspace_size, executor, stream),
-      "select_unshared_kv: failed to reorder caches");
-  CHECK_ACL_SUCCESS(aclrtSynchronizeStream(stream),
-                    "select_unshared_kv: failed to synchronize stream");
-  aclDestroyTensor(beam_index_ids);
-  aclDestroyTensor(group_offset_ids);
-  aclDestroyTensor(block_table_ids);
-  aclDestroyTensorList(x_key_block_list_ids);
-  aclDestroyTensorList(x_value_block_list_ids);
-  if (workspace_size > 0) {
-    CHECK_ACL_SUCCESS(aclrtFree(workspace_addr),
-                      "select_unshared_kv: failed to free workspace");
-  }
+  torch::TensorList x_key_block_list(x_key_block);
+  torch::TensorList x_value_block_list(x_value_block);
+  EXEC_NPU_CMD(aclnnSelectUnsharedKV,
+               beam_index,
+               block_table,
+               x_key_block_list,
+               x_value_block_list,
+               group_offset,
+               decode_step,
+               beam_size,
+               layer_num,
+               x_key_block_list,
+               x_value_block_list);
 }
 }  // namespace xllm::kernel::npu
