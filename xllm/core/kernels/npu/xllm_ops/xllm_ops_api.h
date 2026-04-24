@@ -54,6 +54,12 @@ void select_unshared_kv(const torch::Tensor& beam_index,
                         int64_t beam_size,
                         int64_t layer_num);
 
+void gemma_rms_norm(const torch::Tensor& x,
+                    const torch::Tensor& gamma,
+                    double epsilon,
+                    torch::Tensor& rstd_out,
+                    torch::Tensor& y_out);
+
 torch::Tensor causal_conv1d(const torch::Tensor& x,
                             const torch::Tensor& weight,
                             const torch::Tensor& conv_state,

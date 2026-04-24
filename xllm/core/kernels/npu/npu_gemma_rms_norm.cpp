@@ -13,10 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 #include "npu_ops_api.h"
-
-// Include ascendc_ops_api.h for npu_ops::npu_gemma_rms_norm
-#include "ascendc_npu/ascendc_ops_api.h"
 
 namespace xllm::kernel::npu {
 
@@ -25,7 +23,7 @@ void npu_gemma_rms_norm(const torch::Tensor& x,
                         double epsilon,
                         torch::Tensor& rstdOut,
                         torch::Tensor& yOut) {
-  npu_ops::npu_gemma_rms_norm(x, gamma, epsilon, rstdOut, yOut);
+  gemma_rms_norm(x, gamma, epsilon, rstdOut, yOut);
 }
 
 }  // namespace xllm::kernel::npu

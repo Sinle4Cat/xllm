@@ -24,5 +24,6 @@ cc_library(
   DEPS
     :torch_npu_kernels
     :tilelang_kernels
+    :xllm_ops
     ascendc_ops
 )
