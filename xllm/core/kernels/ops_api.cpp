@@ -18,6 +18,8 @@ limitations under the License.
 #if defined(USE_MLU)
 #include "mlu/mlu_ops_api.h"
 #elif defined(USE_NPU)
+#include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "npu/npu_ops_api.h"
 #include "triton_npu/torch_api/triton_ops_api.h"
@@ -31,12 +33,216 @@ limitations under the License.
 #include "musa/musa_ops_api.h"
 #endif
 
+#include <cmath>
+#include <cstdlib>
 #include <numeric>
+#include <vector>
 
 #include "common/macros.h"
 #include "layers/common/attention_metadata.h"
 
 namespace xllm::kernel {
+
+#if defined(USE_NPU)
+namespace {
+
+int64_t cdiv(int64_t a, int64_t b) {
+  CHECK_GT(b, 0) << "cdiv divisor must be positive.";
+  return (a + b - 1) / b;
+}
+
+int64_t read_int_tensor_value(const torch::Tensor& tensor, int64_t index) {
+  if (tensor.scalar_type() == torch::kInt32) {
+    return static_cast<int64_t>(tensor.data_ptr<int32_t>()[index]);
+  }
+  CHECK_EQ(tensor.scalar_type(), torch::kInt64)
+      << "cu_seqlens only supports int32 or int64, got "
+      << tensor.scalar_type();
+  return tensor.data_ptr<int64_t>()[index];
+}
+
+void prepare_varlen_chunk_metadata(
+    const std::optional<torch::Tensor>& cu_seqlens,
+    int64_t chunk_size,
+    std::vector<int64_t>& cu_seqlens_host,
+    std::vector<int64_t>& chunk_indices_host) {
+  if (!cu_seqlens.has_value()) {
+    return;
+  }
+
+  auto cu_cpu = cu_seqlens.value().to(torch::kCPU).contiguous();
+  CHECK_EQ(cu_cpu.dim(), 1) << "cu_seqlens must be a 1-D tensor.";
+  CHECK_GE(cu_cpu.numel(), 2) << "cu_seqlens must have at least 2 entries.";
+
+  const int64_t num_sequences = cu_cpu.numel() - 1;
+  cu_seqlens_host.reserve(cu_cpu.numel());
+  for (int64_t seq_idx = 0; seq_idx <= num_sequences; ++seq_idx) {
+    cu_seqlens_host.push_back(read_int_tensor_value(cu_cpu, seq_idx));
+  }
+  CHECK_EQ(cu_seqlens_host.front(), 0) << "cu_seqlens must start with 0.";
+
+  for (int64_t seq_idx = 0; seq_idx < num_sequences; ++seq_idx) {
+    const int64_t start = cu_seqlens_host[seq_idx];
+    const int64_t end = cu_seqlens_host[seq_idx + 1];
+    CHECK_GT(end, start) << "cu_seqlens must be strictly increasing.";
+
+    const int64_t num_chunks = cdiv(end - start, chunk_size);
+    for (int64_t chunk_idx = 0; chunk_idx < num_chunks; ++chunk_idx) {
+      chunk_indices_host.push_back(seq_idx);
+      chunk_indices_host.push_back(chunk_idx);
+    }
+  }
+}
+
+void record_npu_tensor_if_needed(const torch::Tensor& tensor,
+                                 c10_npu::NPUStream stream) {
+  if (!tensor.defined() || !tensor.device().is_privateuseone()) {
+    return;
+  }
+  c10_npu::NPUCachingAllocator::recordStream(tensor.storage().data_ptr(),
+                                             stream);
+}
+
+bool chunk_gdn_use_triton_path() {
+  static const bool enabled =
+      std::getenv("XLLM_CHUNK_GDN_USE_TRITON") != nullptr;
+  return enabled;
+}
+
+std::pair<torch::Tensor, torch::Tensor> npu_chunk_gated_delta_rule_aclnn(
+    ChunkGatedDeltaRuleParams& params) {
+  CHECK(!params.head_first)
+      << "chunk_gated_delta_rule ACLNN path only supports head_first=false.";
+  CHECK_EQ(params.chunk_size, 64)
+      << "chunk_gated_delta_rule ACLNN path only supports chunk_size=64.";
+  CHECK_EQ(params.q.scalar_type(), torch::kBFloat16)
+      << "chunk_gated_delta_rule expects q to be bfloat16.";
+  CHECK_EQ(params.k.scalar_type(), torch::kBFloat16)
+      << "chunk_gated_delta_rule expects k to be bfloat16.";
+  CHECK_EQ(params.v.scalar_type(), torch::kBFloat16)
+      << "chunk_gated_delta_rule expects v to be bfloat16.";
+  CHECK_EQ(params.q.sizes(), params.k.sizes())
+      << "q and k must have the same shape.";
+  CHECK_EQ(params.q.dim(), 4) << "q/k/v must be 4-D tensors.";
+  CHECK_EQ(params.v.dim(), 4) << "q/k/v must be 4-D tensors.";
+
+  const auto input_dtype = params.q.scalar_type();
+  const int64_t batch = params.q.size(0);
+  const int64_t seq_len = params.q.size(1);
+  const int64_t qk_heads = params.q.size(2);
+  const int64_t value_heads = params.v.size(2);
+  const int64_t head_dim = params.q.size(3);
+  const int64_t chunk_size = params.chunk_size;
+  CHECK_EQ(params.v.size(0), batch);
+  CHECK_EQ(params.v.size(1), seq_len);
+  CHECK_EQ(params.g.sizes(), torch::IntArrayRef({batch, seq_len, value_heads}));
+  CHECK_EQ(params.beta.sizes(),
+           torch::IntArrayRef({batch, seq_len, value_heads}));
+
+  auto q_prepared = params.use_qk_l2norm_in_kernel
+                        ? npu::npu_l2norm_last_dim(params.q)
+                        : params.q;
+  auto k_prepared = params.use_qk_l2norm_in_kernel
+                        ? npu::npu_l2norm_last_dim(params.k)
+                        : params.k;
+  auto cu_prepared =
+      params.cu_seqlens.has_value()
+          ? std::optional<torch::Tensor>(
+                params.cu_seqlens.value().to(torch::kInt32).contiguous())
+          : std::nullopt;
+
+  std::vector<int64_t> cu_seqlens_host;
+  std::vector<int64_t> chunk_indices_host;
+  prepare_varlen_chunk_metadata(
+      cu_prepared, chunk_size, cu_seqlens_host, chunk_indices_host);
+  std::optional<torch::IntArrayRef> cu_seqlens_ref;
+  std::optional<torch::IntArrayRef> chunk_indices_ref;
+  if (cu_prepared.has_value()) {
+    CHECK_EQ(batch, 1)
+        << "chunk_gated_delta_rule varlen ACLNN path requires B=1.";
+    cu_seqlens_ref = torch::IntArrayRef(cu_seqlens_host);
+    chunk_indices_ref = torch::IntArrayRef(chunk_indices_host);
+  }
+
+  const auto npu_stream =
+      c10_npu::getCurrentNPUStream(params.q.device().index());
+  auto g_cumsum =
+      npu::npu_chunk_local_cumsum(params.g, chunk_size, cu_prepared);
+  const float scale_value = params.scale.has_value()
+                                ? params.scale.value()
+                                : std::pow(static_cast<float>(head_dim), -0.5f);
+  auto A = npu::npu_chunk_scaled_dot_kkt_fwd(
+      k_prepared, params.beta, g_cumsum, chunk_size, cu_prepared);
+  auto A_inv =
+      npu::npu_solve_tril(A, chunk_size, cu_prepared, params.k.scalar_type());
+
+  CHECK_EQ(value_heads % qk_heads, 0)
+      << "chunk_gated_delta_rule expects value heads to be divisible by q/k "
+         "heads, value_heads="
+      << value_heads << ", qk_heads=" << qk_heads;
+
+  auto [w_bt, u_bt] = npu::npu_recompute_w_u_fwd(
+      k_prepared, params.v, params.beta, g_cumsum, A_inv, cu_prepared);
+
+  auto q_hf = q_prepared.transpose(1, 2).contiguous();
+  auto k_hf = k_prepared.transpose(1, 2).contiguous();
+  auto w_hf = w_bt.transpose(1, 2).contiguous();
+  auto u_hf = u_bt.transpose(1, 2).contiguous();
+  auto g_hf = g_cumsum.transpose(1, 2).contiguous();
+  auto init_state_prepared =
+      params.initial_state.has_value()
+          ? std::optional<torch::Tensor>(
+                params.initial_state.value().to(torch::kFloat32).contiguous())
+          : std::nullopt;
+  auto [h, v_new, final_state] =
+      npu::npu_chunk_gated_delta_rule_fwd_h_aclnn(k_hf,
+                                                  w_hf,
+                                                  u_hf,
+                                                  g_hf,
+                                                  init_state_prepared,
+                                                  params.output_final_state,
+                                                  chunk_size,
+                                                  cu_seqlens_ref,
+                                                  chunk_indices_ref);
+  auto out_hf = npu::npu_chunk_fwd_o_aclnn(q_hf,
+                                           k_hf,
+                                           v_new,
+                                           h,
+                                           g_hf,
+                                           scale_value,
+                                           chunk_size,
+                                           cu_seqlens_ref,
+                                           chunk_indices_ref);
+  auto out = out_hf.transpose(1, 2).contiguous().to(input_dtype);
+
+  record_npu_tensor_if_needed(q_prepared, npu_stream);
+  record_npu_tensor_if_needed(k_prepared, npu_stream);
+  if (cu_prepared.has_value()) {
+    record_npu_tensor_if_needed(cu_prepared.value(), npu_stream);
+  }
+  record_npu_tensor_if_needed(g_cumsum, npu_stream);
+  record_npu_tensor_if_needed(A, npu_stream);
+  record_npu_tensor_if_needed(A_inv, npu_stream);
+  record_npu_tensor_if_needed(w_bt, npu_stream);
+  record_npu_tensor_if_needed(u_bt, npu_stream);
+  record_npu_tensor_if_needed(q_hf, npu_stream);
+  record_npu_tensor_if_needed(k_hf, npu_stream);
+  record_npu_tensor_if_needed(w_hf, npu_stream);
+  record_npu_tensor_if_needed(u_hf, npu_stream);
+  record_npu_tensor_if_needed(g_hf, npu_stream);
+  if (init_state_prepared.has_value()) {
+    record_npu_tensor_if_needed(init_state_prepared.value(), npu_stream);
+  }
+  record_npu_tensor_if_needed(h, npu_stream);
+  record_npu_tensor_if_needed(v_new, npu_stream);
+  record_npu_tensor_if_needed(final_state, npu_stream);
+  record_npu_tensor_if_needed(out_hf, npu_stream);
+
+  return {out, params.output_final_state ? final_state : torch::Tensor()};
+}
+
+}  // namespace
+#endif
 
 void apply_rotary(RotaryParams& params) {
 #if defined(USE_MLU)
@@ -1068,6 +1274,9 @@ torch::Tensor build_split_qkv_rmsnorm_mrope_gather_pattern(
 std::pair<torch::Tensor, torch::Tensor> chunk_gated_delta_rule(
     ChunkGatedDeltaRuleParams& params) {
 #if defined(USE_NPU)
+  if (!chunk_gdn_use_triton_path()) {
+    return npu_chunk_gated_delta_rule_aclnn(params);
+  }
   return npu::npu_chunk_gated_delta_rule(params.q,
                                          params.k,
                                          params.v,

@@ -182,6 +182,39 @@ torch::Tensor npu_recurrent_gated_delta_rule(
     const std::optional<torch::Tensor>& g,
     const std::optional<torch::Tensor>& gk);
 
+std::pair<torch::Tensor, torch::Tensor> npu_recompute_w_u_fwd_aclnn(
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& beta,
+    const torch::Tensor& g,
+    const torch::Tensor& A,
+    int64_t chunk_size,
+    const std::optional<torch::IntArrayRef>& cu_seqlens,
+    const std::optional<torch::IntArrayRef>& chunk_indices);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+npu_chunk_gated_delta_rule_fwd_h_aclnn(
+    const torch::Tensor& k,
+    const torch::Tensor& w,
+    const torch::Tensor& u,
+    const torch::Tensor& g,
+    const std::optional<torch::Tensor>& initial_state,
+    bool output_final_state,
+    int64_t chunk_size,
+    const std::optional<torch::IntArrayRef>& cu_seqlens,
+    const std::optional<torch::IntArrayRef>& chunk_indices);
+
+torch::Tensor npu_chunk_fwd_o_aclnn(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& h,
+    const torch::Tensor& g,
+    double scale,
+    int64_t chunk_size,
+    const std::optional<torch::IntArrayRef>& cu_seqlens,
+    const std::optional<torch::IntArrayRef>& chunk_indices);
+
 torch::Tensor causal_conv1d(const torch::Tensor& x,
                             const torch::Tensor& weight,
                             const torch::Tensor& conv_state,

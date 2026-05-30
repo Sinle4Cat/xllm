@@ -18,6 +18,7 @@ cc_library(
     torch_npu
     gflags::gflags
     nlohmann_json::nlohmann_json
+    nnopbase
     opapi
     spdlog::spdlog
 )

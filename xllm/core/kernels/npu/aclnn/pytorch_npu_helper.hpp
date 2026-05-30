@@ -36,6 +36,7 @@ limitations under the License.
 #include <vector>
 
 #include "torch_npu/csrc/aten/NPUNativeFunctions.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "torch_npu/csrc/framework/OpCommand.h"
 #include "torch_npu/csrc/framework/interface/EnvVariables.h"
@@ -709,7 +710,8 @@ using ReleaseHugeMemFn = void (*)(void*, bool);
         << ", or "                                                             \
         << ::xllm::kernel::npu::aclnn::detail::get_op_api_lib_name()           \
         << "not found.";                                                       \
-    auto acl_stream = c10_npu::getCurrentNPUStream().stream(false);            \
+    auto npu_stream = c10_npu::getCurrentNPUStream();                          \
+    auto acl_stream = npu_stream.stream(false);                                \
     uint64_t workspace_size = 0;                                               \
     uint64_t* workspace_size_addr = &workspace_size;                           \
     ::aclOpExecutor* executor = nullptr;                                       \
@@ -742,6 +744,8 @@ using ReleaseHugeMemFn = void (*)(void*, bool);
       workspace_tensor = at::empty({static_cast<int64_t>(workspace_size)},     \
                                    options.dtype(at::kByte));                  \
       workspace_addr = const_cast<void*>(workspace_tensor.storage().data());   \
+      c10_npu::NPUCachingAllocator::recordStream(                              \
+          workspace_tensor.storage().data_ptr(), npu_stream);                  \
     }                                                                          \
     auto acl_call = [=]() -> int {                                             \
       using OpApiFunc =                                                        \

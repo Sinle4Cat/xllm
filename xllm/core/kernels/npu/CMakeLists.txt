@@ -19,6 +19,7 @@ cc_library(
     npu_fused_infer_attention.cpp
     npu_gemma_rms_norm.cpp
     npu_grouped_matmul.cpp
+    npu_chunk_gated_delta_rule_aclnn.cpp
     npu_moe_gating_topk_softmax.cpp
     npu_moe_init_routing_v2.cpp
     npu_moe_token_unpermute.cpp
