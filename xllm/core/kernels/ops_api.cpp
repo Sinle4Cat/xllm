@@ -38,6 +38,54 @@ limitations under the License.
 
 namespace xllm::kernel {
 
+namespace {
+#if defined(USE_NPU)
+bool is_supported_initial_state_dtype(torch::ScalarType dtype) {
+  return dtype == torch::kBFloat16 || dtype == torch::kFloat32;
+}
+
+constexpr int64_t kMegaChunkGdnChunkSize = 128;
+
+int64_t ceil_div(int64_t value, int64_t divisor) {
+  CHECK_GT(divisor, 0) << "divisor must be positive.";
+  return (value + divisor - 1) / divisor;
+}
+
+int64_t compute_mega_chunk_gdn_num_matrices(
+    const ChunkGatedDeltaRuleParams& params,
+    int64_t num_heads_v,
+    int64_t seq_len) {
+  int64_t num_chunks = 0;
+  if (!params.seq_lens.empty()) {
+    for (int32_t seq_len_value : params.seq_lens) {
+      CHECK_GE(seq_len_value, 0)
+          << "chunk_gated_delta_rule expects non-negative seq_lens.";
+      num_chunks +=
+          ceil_div(static_cast<int64_t>(seq_len_value), kMegaChunkGdnChunkSize);
+    }
+  } else if (params.cu_seqlens.has_value()) {
+    torch::Tensor cu_cpu = params.cu_seqlens.value()
+                               .to(torch::kCPU)
+                               .to(torch::kInt64)
+                               .contiguous();
+    const int64_t* cu_data = cu_cpu.data_ptr<int64_t>();
+    for (int64_t i = 0; i + 1 < cu_cpu.numel(); ++i) {
+      const int64_t cur_seq_len = cu_data[i + 1] - cu_data[i];
+      CHECK_GE(cur_seq_len, 0)
+          << "chunk_gated_delta_rule expects non-decreasing cu_seqlens.";
+      num_chunks += ceil_div(cur_seq_len, kMegaChunkGdnChunkSize);
+    }
+  } else {
+    num_chunks = ceil_div(seq_len, kMegaChunkGdnChunkSize);
+  }
+
+  CHECK_GT(num_chunks, 0)
+      << "chunk_gated_delta_rule expects at least one chunk.";
+  return num_chunks * num_heads_v;
+}
+#endif
+}  // namespace
+
 void apply_rotary(RotaryParams& params) {
 #if defined(USE_MLU)
   mlu::apply_rotary(params.q,
@@ -1068,17 +1116,70 @@ torch::Tensor build_split_qkv_rmsnorm_mrope_gather_pattern(
 std::pair<torch::Tensor, torch::Tensor> chunk_gated_delta_rule(
     ChunkGatedDeltaRuleParams& params) {
 #if defined(USE_NPU)
-  return npu::npu_chunk_gated_delta_rule(params.q,
-                                         params.k,
-                                         params.v,
-                                         params.g,
-                                         params.beta,
-                                         params.scale,
-                                         params.initial_state,
-                                         params.output_final_state,
-                                         params.cu_seqlens,
-                                         params.head_first,
-                                         params.use_qk_l2norm_in_kernel);
+  CHECK(!params.head_first)
+      << "chunk_gated_delta_rule only supports head_first=false.";
+  CHECK(params.q.scalar_type() == torch::kBFloat16 &&
+        params.k.scalar_type() == torch::kBFloat16 &&
+        params.v.scalar_type() == torch::kBFloat16)
+      << "chunk_gated_delta_rule expects q/k/v to be bfloat16.";
+  if (params.initial_state.has_value()) {
+    CHECK(is_supported_initial_state_dtype(
+        params.initial_state.value().scalar_type()))
+        << "chunk_gated_delta_rule expects initial_state to be bfloat16 or "
+           "float32, got "
+        << params.initial_state.value().scalar_type();
+  }
+
+  const int64_t batch_size = params.q.size(0);
+  const int64_t seq_len = params.q.size(1);
+  const int64_t num_heads_qk = params.q.size(2);
+  CHECK(params.q.sizes() == params.k.sizes())
+      << "q and k must have the same shape.";
+  CHECK(params.v.dim() == 4 && params.v.size(0) == batch_size &&
+        params.v.size(1) == seq_len)
+      << "v must have shape [B, T, Hv, V].";
+  const int64_t num_heads_v = params.v.size(2);
+  const int64_t chunk_size = params.chunk_size;
+  CHECK_EQ(chunk_size, kMegaChunkGdnChunkSize)
+      << "mega_chunk_gdn only supports chunk_size=" << kMegaChunkGdnChunkSize;
+  CHECK(num_heads_v % num_heads_qk == 0)
+      << "chunk_gated_delta_rule expects num_heads_v to be "
+         "divisible by num_heads_qk, got "
+      << num_heads_v << " and " << num_heads_qk;
+  CHECK(params.beta.dim() == 3 && params.beta.size(0) == batch_size &&
+        params.beta.size(1) == seq_len && params.beta.size(2) == num_heads_v)
+      << "beta must have shape [B, T, H].";
+  CHECK(params.g.dim() == 3 && params.g.size(0) == batch_size &&
+        params.g.size(1) == seq_len && params.g.size(2) == num_heads_v)
+      << "g must have shape [B, T, H].";
+  CHECK(params.cu_seqlens.has_value()) << "mega_chunk_gdn requires cu_seqlens.";
+
+  auto q_prepared = params.use_qk_l2norm_in_kernel
+                        ? npu::npu_l2norm_last_dim(params.q)
+                        : params.q;
+  auto k_prepared = params.use_qk_l2norm_in_kernel
+                        ? npu::npu_l2norm_last_dim(params.k)
+                        : params.k;
+  auto cu_prepared = params.cu_seqlens.value().to(torch::kInt32).contiguous();
+  const int64_t num_matrices =
+      compute_mega_chunk_gdn_num_matrices(params, num_heads_v, seq_len);
+  auto init_state_prepared =
+      params.initial_state.has_value()
+          ? std::optional<torch::Tensor>(
+                params.initial_state.value().contiguous())
+          : std::nullopt;
+  auto [out, final_state] = npu::npu_mega_chunk_gdn(q_prepared,
+                                                    k_prepared,
+                                                    params.v,
+                                                    params.g,
+                                                    params.beta,
+                                                    params.scale,
+                                                    init_state_prepared,
+                                                    params.output_final_state,
+                                                    cu_prepared,
+                                                     num_matrices);
+
+  return {out, params.output_final_state ? final_state : torch::Tensor()};
 #else
   NOT_IMPLEMENTED();
 #endif

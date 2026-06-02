@@ -698,6 +698,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     chunk_gated_delta_params.initial_state = initial_state_tensor;
     chunk_gated_delta_params.output_final_state = true;
     chunk_gated_delta_params.cu_seqlens = attn_metadata.q_cu_seq_lens;
+    chunk_gated_delta_params.seq_lens = attn_metadata.q_seq_lens_vec;
     chunk_gated_delta_params.head_first = false;
     chunk_gated_delta_params.use_qk_l2norm_in_kernel = true;
     torch::Tensor packed_core_attn_out;

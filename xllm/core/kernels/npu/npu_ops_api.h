@@ -182,6 +182,18 @@ torch::Tensor npu_recurrent_gated_delta_rule(
     const std::optional<torch::Tensor>& g,
     const std::optional<torch::Tensor>& gk);
 
+std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
+    const torch::Tensor& q,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& g,
+    const torch::Tensor& beta,
+    const std::optional<float>& scale,
+    const std::optional<torch::Tensor>& initial_state,
+    bool output_final_state,
+    const torch::Tensor& cu_seqlens,
+    int64_t num_matrices);
+
 torch::Tensor causal_conv1d(const torch::Tensor& x,
                             const torch::Tensor& weight,
                             const torch::Tensor& conv_state,

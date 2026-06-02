@@ -22,6 +22,7 @@ cc_library(
     npu_moe_gating_topk_softmax.cpp
     npu_moe_init_routing_v2.cpp
     npu_moe_token_unpermute.cpp
+    npu_mega_chunk_gdn.cpp
     rope.cpp
     npu_recurrent_gated_delta_rule.cpp
   DEPS

@@ -1447,11 +1447,14 @@ struct ChunkGatedDeltaRuleParams {
   std::optional<torch::Tensor> initial_state = std::nullopt;
   // Whether to output the final state.
   bool output_final_state = false;
-  // Chunk size for processing. Default: 64.
-  int64_t chunk_size = 64;
+  // Chunk size for processing. Default: 128.
+  int64_t chunk_size = 128;
   // Optional cumulative sequence lengths. Shape: [num_sequences + 1]. Dtype:
   // int32.
   std::optional<torch::Tensor> cu_seqlens = std::nullopt;
+  // Optional host sequence lengths used to compute chunk metadata without
+  // reading device-side cu_seqlens.
+  std::vector<int32_t> seq_lens;
   // Whether input is head-first format. Default: false (batch-first).
   bool head_first = false;
   // Whether to apply L2 norm to q and k inside the kernel. Default: false.
