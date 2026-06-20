@@ -64,6 +64,17 @@ struct XAttentionTwoStageDecodeCache {
 };
 #endif
 
+#if defined(USE_NPU)
+struct XFlashAttentionInferCache {
+  torch::Tensor actual_q_lens;
+  torch::Tensor extra_tiling;
+  int64_t cached_num_heads = -1;
+  int64_t cached_num_kv_heads = -1;
+  int64_t cached_block_size = -1;
+  bool cached_use_fd = true;
+};
+#endif
+
 // AttentionMetadata contains batch-level information shared across all
 // attention layers. It is built once at the beginning of model forward pass and
 // reused by all layers. This avoids redundant computation and memory allocation
@@ -176,6 +187,12 @@ struct AttentionMetadata {
   std::vector<int64_t> kv_cu_seq_lens_host_vec;
   // Non-cumulative per-sequence lengths for chunked_prefill mode.
   std::vector<int64_t> kv_seq_lens_host_vec;
+  // Device cumulative q lengths without a leading zero for xllm_ops attention
+  // kernels whose TND contract follows FusedInferAttention host vectors.
+  torch::Tensor q_cu_seq_lens_no_zero;
+  // Reusable tensors for x_flash_attention_infer. Cached at batch scope and
+  // shared across attention layers to avoid repeated host/device preparation.
+  std::shared_ptr<XFlashAttentionInferCache> x_flash_attention_infer_cache;
 #endif
 };
 

@@ -246,6 +246,28 @@ at::Tensor sparse_flash_attention(
     c10::string_view layout_kv,
     int64_t sparse_mode);
 
+torch::Tensor build_x_flash_attention_infer_extra_tiling(
+    const std::vector<int64_t>& actual_q_lens,
+    const std::vector<int64_t>& actual_kv_lens,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    int64_t block_size,
+    bool use_fd,
+    const torch::Tensor& reference);
+
+torch::Tensor x_flash_attention_infer(const torch::Tensor& query,
+                                      const torch::Tensor& key_cache,
+                                      const torch::Tensor& value_cache,
+                                      const std::optional<torch::Tensor>& mask,
+                                      const torch::Tensor& block_table,
+                                      const torch::Tensor& actual_q_lens,
+                                      const torch::Tensor& actual_kv_lens,
+                                      const torch::Tensor& extra_tiling,
+                                      int64_t num_heads,
+                                      int64_t num_key_value_heads,
+                                      double scale,
+                                      const std::string& layout);
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mla_preprocess(
     const at::Tensor& input,
     const at::Tensor& gamma0,

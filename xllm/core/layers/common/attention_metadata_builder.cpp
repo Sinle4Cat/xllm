@@ -98,6 +98,8 @@ AttentionMetadata build_attention_metadata(
 #endif
 
 #if defined(USE_NPU)
+  attn_metadata.x_flash_attention_infer_cache =
+      std::make_shared<XFlashAttentionInferCache>();
   attn_metadata.is_spec_verify = params.is_spec_verify;
   attn_metadata.use_expanded_decode_for_spec_verify_attention =
       params.graph.use_expanded_decode_for_spec_verify_attention;
@@ -143,6 +145,21 @@ AttentionMetadata build_attention_metadata(
     for (int32_t len : params.attention.host.q_cu_seq_lens) {
       attn_metadata.q_cu_seq_lens_host_vec.emplace_back(len);
     }
+    if (params.attention.device.q_cu_seq_lens.defined()) {
+      if (params.attention.device.q_cu_seq_lens.dtype() == torch::kInt32) {
+        attn_metadata.q_cu_seq_lens_no_zero =
+            params.attention.device.q_cu_seq_lens;
+      } else {
+        attn_metadata.q_cu_seq_lens_no_zero =
+            params.attention.device.q_cu_seq_lens.to(torch::kInt32);
+      }
+    } else {
+      attn_metadata.q_cu_seq_lens_no_zero =
+          torch::tensor(params.attention.host.q_cu_seq_lens,
+                        torch::TensorOptions().dtype(torch::kInt32));
+    }
+    attn_metadata.x_flash_attention_infer_cache->actual_q_lens =
+        attn_metadata.q_cu_seq_lens_no_zero;
   }
   if (!params.attention.host.kv_seq_lens.empty()) {
     attn_metadata.kv_seq_lens_host_vec.reserve(

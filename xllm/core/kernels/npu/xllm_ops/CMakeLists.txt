@@ -26,6 +26,7 @@ cc_library(
     moe_gating_top_k_hash.cpp
     sparse_attn_sharedkv.cpp
     sparse_flash_attention.cpp
+    x_flash_attention_infer.cpp
     mla_preprocess.cpp
     ../utils.cpp
     beam_search.cpp
