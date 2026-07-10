@@ -15,9 +15,11 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <cstdlib>
 #include <optional>
 #include <tuple>
 
+#include "xllm/core/kernels/npu/tilelang/tilelang_ops_api.h"
 #include "xllm/core/kernels/ops_api.h"
 #include "xllm/core/platform/npu/acl_graph_task_update_context.h"
 
@@ -850,6 +852,23 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     mega_chunk_gdn_params.q_seq_lens = c10::ArrayRef<int32_t>(
         attn_metadata.q_seq_lens_vec.data(), static_cast<size_t>(batch_size));
     mega_chunk_gdn_params.use_qk_l2norm_in_kernel = true;
+    int64_t direct_state_cache_index = -1;
+    if (use_single_prefill_pack && fla_ssm_state_layout &&
+        ssm_cache.scalar_type() == torch::kFloat32 &&
+        ssm_cache.is_contiguous() && checkpoint_stride > 0 &&
+        input_params.embedding.linear_state_ids.size() == 1) {
+      direct_state_cache_index =
+          static_cast<int64_t>(input_params.embedding.linear_state_ids[0]) *
+          checkpoint_stride;
+    }
+    const bool use_direct_prefill_state_store =
+        std::getenv("XLLM_DISABLE_DIRECT_PREFILL_STATE_STORE") == nullptr &&
+        direct_state_cache_index >= 0 &&
+        direct_state_cache_index < ssm_cache.size(0) &&
+        xllm::kernel::npu::tilelang::has_final_state_cache_store_specialization(
+            processed_v.size(2), processed_q.size(3), processed_v.size(3));
+    mega_chunk_gdn_params.defer_final_state_cast =
+        use_direct_prefill_state_store;
     use_fused_prefill_output_norm =
         use_single_prefill_pack &&
         norm_->supports_fused_scale_gated_rmsnorm(z, processed_v.size(-1));
@@ -880,11 +899,18 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         packed_offset += valid_len;
       }
     }
-    torch::Tensor state_to_store = fla_ssm_state_layout
-                                       ? last_recurrent_state
-                                       : last_recurrent_state.transpose(-1, -2);
-    ssm_cache.index_put_({linear_state_base_indices},
-                         state_to_store.to(ssm_cache.dtype()));
+    if (use_direct_prefill_state_store) {
+      auto cache_slot =
+          ssm_cache.narrow(/*dim=*/0, direct_state_cache_index, /*length=*/1);
+      xllm::kernel::npu::tilelang::final_state_cache_store(last_recurrent_state,
+                                                           cache_slot);
+    } else {
+      torch::Tensor state_to_store =
+          fla_ssm_state_layout ? last_recurrent_state
+                               : last_recurrent_state.transpose(-1, -2);
+      ssm_cache.index_put_({linear_state_base_indices},
+                           state_to_store.to(ssm_cache.dtype()));
+    }
   } else if (checkpoint_stride > 1) {
     auto ssm_state =
         torch::index_select(ssm_cache, 0, linear_state_base_indices);

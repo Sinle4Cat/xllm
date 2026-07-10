@@ -375,5 +375,6 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     const std::optional<torch::Tensor>& cu_seqlens = std::nullopt,
     c10::ArrayRef<int32_t> q_seq_lens = {},
     bool use_qk_l2norm_in_kernel = false,
-    bool defer_output_scale = false);
+    bool defer_output_scale = false,
+    bool defer_final_state_cast = false);
 }  // namespace xllm::kernel::npu

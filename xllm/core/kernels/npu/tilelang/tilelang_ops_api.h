@@ -65,6 +65,13 @@ qwen35_projection_layout(const torch::Tensor& projection,
                          int64_t z_size,
                          int64_t num_heads);
 
+bool has_final_state_cache_store_specialization(int64_t num_heads,
+                                                int64_t head_k_dim,
+                                                int64_t head_v_dim);
+
+void final_state_cache_store(const torch::Tensor& final_state,
+                             torch::Tensor& cache_slot);
+
 bool has_qwen35_projection_layout_specialization(int64_t qkv_size,
                                                  int64_t z_size,
                                                  int64_t num_heads,

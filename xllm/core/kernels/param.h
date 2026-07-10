@@ -1686,6 +1686,9 @@ struct MegaChunkGdnParams {
   // Return the raw float16 Mega output so a following fused kernel can keep
   // output scaling and dtype conversion on chip. Default: false.
   bool defer_output_scale = false;
+  // Return the raw float16 final state so a following fused store can cast it
+  // directly into the SSM cache. Default: false.
+  bool defer_final_state_cast = false;
 };
 
 struct HcPostParams {

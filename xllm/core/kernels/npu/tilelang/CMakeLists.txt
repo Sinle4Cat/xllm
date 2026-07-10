@@ -143,6 +143,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME final_state_cache_store
+  WRAPPER_SRCS final_state_cache_store_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME split_qkv_rmsnorm_mrope
   WRAPPER_SRCS split_qkv_rmsnorm_mrope_wrapper.cpp
 )
