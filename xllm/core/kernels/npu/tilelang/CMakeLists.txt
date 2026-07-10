@@ -138,6 +138,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME qwen35_projection_layout
+  WRAPPER_SRCS qwen35_projection_layout_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME split_qkv_rmsnorm_mrope
   WRAPPER_SRCS split_qkv_rmsnorm_mrope_wrapper.cpp
 )

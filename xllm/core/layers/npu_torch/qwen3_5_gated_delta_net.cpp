@@ -14,6 +14,13 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cstdlib>
+#include <unordered_map>
+#include <vector>
+
+#include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/kernels/ops_api.h"
+
 namespace xllm {
 namespace layer {
 
@@ -27,6 +34,28 @@ Qwen3_5GatedDeltaNetImpl::Qwen3_5GatedDeltaNetImpl(
                                  parallel_args,
                                  options,
                                  /*init_projections=*/false) {
+  const int64_t qkv_size = (2 * k_size_ + v_size_) / tp_size_;
+  const int64_t z_size = v_size_ / tp_size_;
+  const int64_t num_heads = num_v_heads_ / tp_size_;
+  use_fused_projection_ =
+      std::getenv("XLLM_DISABLE_FUSED_QWEN35_PROJECTION") == nullptr &&
+      quant_args.quant_method().empty() && quant_args.quant_descs().empty() &&
+      !quant_args.is_compressed_tensors_w8a8_dynamic() &&
+      xllm::kernel::npu::tilelang::has_qwen35_projection_layout_specialization(
+          qkv_size, z_size, num_heads, options.dtype().toScalarType());
+  if (use_fused_projection_) {
+    in_proj_fused_ = register_module(
+        "in_proj_fused",
+        ColumnParallelLinear(args.hidden_size(),
+                             2 * k_size_ + 2 * v_size_ + 2 * num_v_heads_,
+                             /*bias=*/false,
+                             /*gather_output=*/false,
+                             quant_args,
+                             parallel_args.tp_group_,
+                             options));
+    return;
+  }
+
   in_proj_qkv_ = register_module("in_proj_qkv",
                                  ColumnParallelLinear(args.hidden_size(),
                                                       k_size_ * 2 + v_size_,
@@ -59,6 +88,36 @@ Qwen3_5GatedDeltaNetImpl::Qwen3_5GatedDeltaNetImpl(
                                                     quant_args,
                                                     parallel_args.tp_group_,
                                                     options));
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+Qwen3_5GatedDeltaNetImpl::project_split_activations(
+    const torch::Tensor& hidden_states) {
+  if (!use_fused_projection_) {
+    return {in_proj_qkv_->forward(hidden_states),
+            in_proj_z_->forward(hidden_states),
+            in_proj_b_->forward(hidden_states),
+            in_proj_a_->forward(hidden_states)};
+  }
+
+  const std::vector<int64_t> local_sizes = {(2 * k_size_ + v_size_) / tp_size_,
+                                            v_size_ / tp_size_,
+                                            num_v_heads_ / tp_size_,
+                                            num_v_heads_ / tp_size_};
+  const auto weight_slices =
+      torch::split(in_proj_fused_->weight(), local_sizes, /*dim=*/0);
+  CHECK_EQ(weight_slices.size(), local_sizes.size());
+
+  std::vector<torch::Tensor> projections;
+  projections.reserve(weight_slices.size());
+  for (const auto& weight_slice : weight_slices) {
+    xllm::kernel::MatmulParams matmul_params;
+    matmul_params.a = hidden_states;
+    matmul_params.b = weight_slice;
+    matmul_params.bias = std::nullopt;
+    projections.emplace_back(xllm::kernel::matmul(matmul_params));
+  }
+  return {projections[0], projections[1], projections[2], projections[3]};
 }
 
 torch::Tensor Qwen3_5GatedDeltaNetImpl::merge_qkvz_from_split_activations(
@@ -128,10 +187,12 @@ Qwen3_5GatedDeltaNetImpl::project_decode_inputs(
   const auto reshape_projection = [](const torch::Tensor& projection) {
     return projection.view({projection.size(0), -1, projection.size(-1)});
   };
-  auto qkv = reshape_projection(in_proj_qkv_->forward(hidden_states));
-  auto z_proj = reshape_projection(in_proj_z_->forward(hidden_states));
-  auto b_proj = reshape_projection(in_proj_b_->forward(hidden_states));
-  auto a_proj = reshape_projection(in_proj_a_->forward(hidden_states));
+  auto [qkv_flat, z_flat, b_flat, a_flat] =
+      project_split_activations(hidden_states);
+  auto qkv = reshape_projection(qkv_flat);
+  auto z_proj = reshape_projection(z_flat);
+  auto b_proj = reshape_projection(b_flat);
+  auto a_proj = reshape_projection(a_flat);
   return {merge_qkvz_from_split_activations(qkv, z_proj),
           merge_ba_from_split_activations(b_proj, a_proj)};
 }
@@ -139,10 +200,12 @@ Qwen3_5GatedDeltaNetImpl::project_decode_inputs(
 std::pair<torch::Tensor, torch::Tensor>
 Qwen3_5GatedDeltaNetImpl::project_flat_inputs(
     const torch::Tensor& hidden_states) {
-  auto qkv = in_proj_qkv_->forward(hidden_states).unsqueeze(0);
-  auto z_proj = in_proj_z_->forward(hidden_states).unsqueeze(0);
-  auto b_proj = in_proj_b_->forward(hidden_states).unsqueeze(0);
-  auto a_proj = in_proj_a_->forward(hidden_states).unsqueeze(0);
+  auto [qkv_flat, z_flat, b_flat, a_flat] =
+      project_split_activations(hidden_states);
+  auto qkv = qkv_flat.unsqueeze(0);
+  auto z_proj = z_flat.unsqueeze(0);
+  auto b_proj = b_flat.unsqueeze(0);
+  auto a_proj = a_flat.unsqueeze(0);
   auto qkvz = merge_qkvz_from_split_activations(qkv, z_proj);
   auto ba = merge_ba_from_split_activations(b_proj, a_proj);
   return {qkvz.view({hidden_states.size(0), qkvz.size(-1)}).contiguous(),
@@ -154,14 +217,12 @@ std::optional<
 Qwen3_5GatedDeltaNetImpl::project_prefill_split_inputs(
     const torch::Tensor& hidden_states,
     const AttentionMetadata& attn_metadata) {
-  auto qkv = reshape_qkvz_with_pad(attn_metadata,
-                                   in_proj_qkv_->forward(hidden_states));
-  auto z_proj =
-      reshape_qkvz_with_pad(attn_metadata, in_proj_z_->forward(hidden_states));
-  auto b_proj =
-      reshape_qkvz_with_pad(attn_metadata, in_proj_b_->forward(hidden_states));
-  auto a_proj =
-      reshape_qkvz_with_pad(attn_metadata, in_proj_a_->forward(hidden_states));
+  auto [qkv_flat, z_flat, b_flat, a_flat] =
+      project_split_activations(hidden_states);
+  auto qkv = reshape_qkvz_with_pad(attn_metadata, qkv_flat);
+  auto z_proj = reshape_qkvz_with_pad(attn_metadata, z_flat);
+  auto b_proj = reshape_qkvz_with_pad(attn_metadata, b_flat);
+  auto a_proj = reshape_qkvz_with_pad(attn_metadata, a_flat);
 
   const int64_t batch_size = qkv.size(0);
   const int64_t seq_len = qkv.size(1);
@@ -172,8 +233,71 @@ Qwen3_5GatedDeltaNetImpl::project_prefill_split_inputs(
   return std::make_tuple(qkv, z, b, a);
 }
 
+std::optional<
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+Qwen3_5GatedDeltaNetImpl::project_decode_split_inputs(
+    const torch::Tensor& hidden_states) {
+  if (!use_fused_projection_) {
+    return std::nullopt;
+  }
+
+  auto projection = in_proj_fused_->forward(hidden_states);
+  const int64_t batch_size = projection.size(0);
+  const int64_t qkv_size = (2 * k_size_ + v_size_) / tp_size_;
+  const int64_t z_size = v_size_ / tp_size_;
+  const int64_t num_heads = num_v_heads_ / tp_size_;
+  auto projection_flat =
+      projection.view({-1, projection.size(-1)}).contiguous();
+
+  torch::Tensor qkv, z, b, a;
+  std::tie(qkv, z, b, a) =
+      xllm::kernel::npu::tilelang::qwen35_projection_layout(
+          projection_flat, qkv_size, z_size, num_heads);
+  const int64_t seq_len = qkv.size(0) / batch_size;
+  qkv = qkv.view({batch_size, seq_len, qkv_size});
+  z = z.view({batch_size, seq_len, num_heads, head_v_dim_});
+  b = b.view({batch_size, seq_len, num_heads});
+  a = a.view({batch_size, seq_len, num_heads});
+  return std::make_tuple(qkv, z, b, a);
+}
+
 void Qwen3_5GatedDeltaNetImpl::load_projection_state_dict(
     const StateDict& state_dict) {
+  if (use_fused_projection_) {
+    std::unordered_map<std::string, torch::Tensor> fused_state_dict;
+    auto qkv_weight = state_dict.get_tensor("in_proj_qkv.weight");
+    if (qkv_weight.defined()) {
+      CHECK_EQ(qkv_weight.dim(), 2)
+          << state_dict.prefix() << "in_proj_qkv.weight must be 2D";
+      CHECK_EQ(qkv_weight.size(0), 2 * k_size_ + v_size_)
+          << state_dict.prefix() << "in_proj_qkv.weight size mismatch";
+      auto qkv_weights =
+          torch::split(qkv_weight, {k_size_, k_size_, v_size_}, /*dim=*/0);
+      fused_state_dict.emplace("q.weight", qkv_weights[0]);
+      fused_state_dict.emplace("k.weight", qkv_weights[1]);
+      fused_state_dict.emplace("v.weight", qkv_weights[2]);
+    }
+
+    const auto add_projection_weight = [&](const std::string& checkpoint_name,
+                                           const std::string& fused_name) {
+      auto weight = state_dict.get_tensor(checkpoint_name);
+      if (weight.defined()) {
+        fused_state_dict.emplace(fused_name, weight);
+      }
+    };
+    add_projection_weight("in_proj_z.weight", "z.weight");
+    add_projection_weight("in_proj_b.weight", "b.weight");
+    add_projection_weight("in_proj_a.weight", "a.weight");
+
+    if (!fused_state_dict.empty()) {
+      in_proj_fused_->load_state_dict(
+          StateDict(std::move(fused_state_dict),
+                    std::string(state_dict.prefix())),
+          {"q.", "k.", "v.", "z.", "b.", "a."});
+    }
+    return;
+  }
+
   auto in_proj_qkv_state_dict = state_dict.get_dict_with_prefix("in_proj_qkv.");
   if (in_proj_qkv_state_dict.size() > 0 && !in_proj_qkv_->is_weight_loaded()) {
     in_proj_qkv_->load_state_dict(
@@ -201,6 +325,14 @@ void Qwen3_5GatedDeltaNetImpl::load_projection_state_dict(
 
 void Qwen3_5GatedDeltaNetImpl::verify_projection_weights(
     const std::string& prefix) const {
+  if (use_fused_projection_) {
+    CHECK(in_proj_fused_ && in_proj_fused_->is_weight_loaded())
+        << "Missing required Qwen3.5 fused projection weights after all shards "
+           "loaded: "
+        << prefix;
+    return;
+  }
+
   CHECK(in_proj_qkv_ && in_proj_qkv_->is_weight_loaded())
       << "Missing required weight after all shards loaded: " << prefix
       << "in_proj_qkv.weight";

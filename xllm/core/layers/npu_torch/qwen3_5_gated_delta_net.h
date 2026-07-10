@@ -44,6 +44,9 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
       std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
   project_prefill_split_inputs(const torch::Tensor& hidden_states,
                                const AttentionMetadata& attn_metadata) override;
+  std::optional<
+      std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+  project_decode_split_inputs(const torch::Tensor& hidden_states) override;
   bool use_fla_ssm_state_layout() const override { return true; }
 
   void load_projection_state_dict(const StateDict& state_dict) override;
@@ -54,7 +57,11 @@ class Qwen3_5GatedDeltaNetImpl : public Qwen3NextGatedDeltaNetImpl {
                                                   const torch::Tensor& z) const;
   torch::Tensor merge_ba_from_split_activations(const torch::Tensor& b,
                                                 const torch::Tensor& a) const;
+  std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+  project_split_activations(const torch::Tensor& hidden_states);
 
+  bool use_fused_projection_ = false;
+  ColumnParallelLinear in_proj_fused_{nullptr};
   ColumnParallelLinear in_proj_qkv_{nullptr};
   ColumnParallelLinear in_proj_z_{nullptr};
   ColumnParallelLinear in_proj_b_{nullptr};

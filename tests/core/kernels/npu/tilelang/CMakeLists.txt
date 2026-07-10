@@ -44,6 +44,19 @@ cc_test(
 
 cc_test(
   NAME
+    qwen35_projection_layout_wrapper_test
+  SRCS
+    qwen35_projection_layout_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+)
+
+cc_test(
+  NAME
     fused_sigmoid_gating_delta_rule_wrapper_test
   SRCS
     fused_sigmoid_gating_delta_rule_wrapper_test.cpp

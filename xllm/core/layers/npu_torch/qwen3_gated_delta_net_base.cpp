@@ -543,12 +543,17 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   int64_t batch_size = 0;
   int64_t seq_len = 0;
 
-  auto prefill_split_inputs =
-      (!use_spec_verify && is_any_prefill)
-          ? project_prefill_split_inputs(hidden_states, attn_metadata)
-          : std::nullopt;
-  if (prefill_split_inputs.has_value()) {
-    std::tie(mixed_qkv, z, b, a) = prefill_split_inputs.value();
+  std::optional<
+      std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+      projected_split_inputs;
+  if (!use_spec_verify) {
+    projected_split_inputs =
+        is_any_prefill
+            ? project_prefill_split_inputs(hidden_states, attn_metadata)
+            : project_decode_split_inputs(hidden_states);
+  }
+  if (projected_split_inputs.has_value()) {
+    std::tie(mixed_qkv, z, b, a) = projected_split_inputs.value();
     batch_size = mixed_qkv.size(0);
     seq_len = mixed_qkv.size(1);
   } else {

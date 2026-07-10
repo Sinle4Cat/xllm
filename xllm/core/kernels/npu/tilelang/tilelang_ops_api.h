@@ -57,6 +57,19 @@ bool has_fused_scale_gated_rmsnorm_specialization(
     torch::ScalarType gate_dtype,
     torch::ScalarType weight_dtype);
 
+// Split one fused Qwen3.5 TP2 decode projection [qkv|z|b|a] into four
+// row-contiguous tensors without host-side Slice/Concat/Pack copies.
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+qwen35_projection_layout(const torch::Tensor& projection,
+                         int64_t qkv_size,
+                         int64_t z_size,
+                         int64_t num_heads);
+
+bool has_qwen35_projection_layout_specialization(int64_t qkv_size,
+                                                 int64_t z_size,
+                                                 int64_t num_heads,
+                                                 torch::ScalarType dtype);
+
 // Build merged mRoPE gather offsets for split_qkv_rmsnorm_mrope.
 torch::Tensor build_split_qkv_rmsnorm_mrope_gather_pattern(
     int64_t rope_dim,

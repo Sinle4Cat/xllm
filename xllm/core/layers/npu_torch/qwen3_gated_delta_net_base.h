@@ -62,6 +62,11 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
                                const AttentionMetadata& attn_metadata) {
     return std::nullopt;
   }
+  virtual std::optional<
+      std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>>
+  project_decode_split_inputs(const torch::Tensor& hidden_states) {
+    return std::nullopt;
+  }
   virtual bool use_fla_ssm_state_layout() const { return false; }
 
   void load_common_state_dict(const StateDict& state_dict);
