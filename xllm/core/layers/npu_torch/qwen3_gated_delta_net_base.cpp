@@ -736,6 +736,8 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   auto [processed_q, processed_k, processed_v] = process_mixed_qkv(mixed_qkv);
   torch::Tensor core_attn_out;
   torch::Tensor last_recurrent_state;
+  bool use_fused_prefill_output_norm = false;
+  float deferred_mega_output_scale = 1.0F;
   // Apply chunked or recurrent gated-delta attention and update caches.
   if (use_spec_verify) {
     torch::Tensor spec_num_accepted_tokens = expand_sequence_tensor_to_batch(
@@ -843,12 +845,22 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     mega_chunk_gdn_params.q_seq_lens = c10::ArrayRef<int32_t>(
         attn_metadata.q_seq_lens_vec.data(), static_cast<size_t>(batch_size));
     mega_chunk_gdn_params.use_qk_l2norm_in_kernel = true;
+    use_fused_prefill_output_norm =
+        use_single_prefill_pack &&
+        norm_->supports_fused_scale_gated_rmsnorm(z, processed_v.size(-1));
+    if (use_fused_prefill_output_norm) {
+      deferred_mega_output_scale =
+          1.0F / std::sqrt(static_cast<float>(processed_q.size(-1)));
+      mega_chunk_gdn_params.scale = deferred_mega_output_scale;
+      mega_chunk_gdn_params.defer_output_scale = true;
+    }
     torch::Tensor packed_core_attn_out;
     std::tie(packed_core_attn_out, last_recurrent_state) =
         xllm::kernel::mega_chunk_gdn(mega_chunk_gdn_params);
     if (use_single_prefill_pack) {
       core_attn_out = packed_core_attn_out;
-      if (core_attn_out.scalar_type() != processed_v.scalar_type()) {
+      if (!use_fused_prefill_output_norm &&
+          core_attn_out.scalar_type() != processed_v.scalar_type()) {
         core_attn_out = core_attn_out.to(processed_v.scalar_type());
       }
     } else {
@@ -931,7 +943,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   auto z_reshaped = z.view({-1, z.size(-1)});
   auto core_attn_out_reshaped =
       core_attn_out.view({-1, core_attn_out.size(-1)});
-  auto norm_out = norm_->forward(core_attn_out_reshaped, z_reshaped);
+  auto norm_out =
+      use_fused_prefill_output_norm
+          ? norm_->forward_scaled(
+                core_attn_out_reshaped, z_reshaped, deferred_mega_output_scale)
+          : norm_->forward(core_attn_out_reshaped, z_reshaped);
   auto z_shape_og = z.sizes().vec();
   norm_out = norm_out.view(z_shape_og);
   norm_out = norm_out.view({-1, norm_out.size(2), norm_out.size(3)});

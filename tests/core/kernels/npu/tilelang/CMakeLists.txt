@@ -28,6 +28,22 @@ cc_test(
 
 cc_test(
   NAME
+    fused_scale_gated_rmsnorm_wrapper_test
+  SRCS
+    fused_scale_gated_rmsnorm_wrapper_test.cpp
+  DEPS
+    :tilelang_kernels
+    triton_adapter
+    torch
+    GTest::gtest_main
+    glog::glog
+    unified_dlog
+  LINKOPTS
+    "-Wl,-rpath-link,$ENV{PYTORCH_INSTALL_PATH}/../torch.libs"
+)
+
+cc_test(
+  NAME
     fused_sigmoid_gating_delta_rule_wrapper_test
   SRCS
     fused_sigmoid_gating_delta_rule_wrapper_test.cpp

@@ -133,6 +133,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME fused_scale_gated_rmsnorm
+  WRAPPER_SRCS fused_scale_gated_rmsnorm_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME split_qkv_rmsnorm_mrope
   WRAPPER_SRCS split_qkv_rmsnorm_mrope_wrapper.cpp
 )

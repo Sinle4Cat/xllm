@@ -1683,6 +1683,9 @@ struct MegaChunkGdnParams {
   c10::ArrayRef<int32_t> q_seq_lens = {};
   // Whether to apply L2 norm to q and k inside the kernel. Default: false.
   bool use_qk_l2norm_in_kernel = false;
+  // Return the raw float16 Mega output so a following fused kernel can keep
+  // output scaling and dtype conversion on chip. Default: false.
+  bool defer_output_scale = false;
 };
 
 struct HcPostParams {

@@ -73,7 +73,8 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     bool output_final_state,
     const std::optional<torch::Tensor>& cu_seqlens,
     c10::ArrayRef<int32_t> q_seq_lens,
-    bool use_qk_l2norm_in_kernel) {
+    bool use_qk_l2norm_in_kernel,
+    bool defer_output_scale) {
   const torch::ScalarType input_dtype = q.scalar_type();
 
   torch::Tensor q_normalized = q;
@@ -193,7 +194,7 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
                v_new,
                final_state);
 
-  auto output = (out * scale_value).to(input_dtype);
+  auto output = defer_output_scale ? out : (out * scale_value).to(input_dtype);
 
   torch::Tensor final_state_out;
   if (output_final_state) {

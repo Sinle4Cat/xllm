@@ -1944,7 +1944,8 @@ std::pair<torch::Tensor, torch::Tensor> mega_chunk_gdn(
                                  params.output_final_state,
                                  params.cu_seqlens,
                                  params.q_seq_lens,
-                                 params.use_qk_l2norm_in_kernel);
+                                 params.use_qk_l2norm_in_kernel,
+                                 params.defer_output_scale);
 #else
   NOT_IMPLEMENTED();
 #endif

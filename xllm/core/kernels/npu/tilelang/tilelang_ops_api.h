@@ -43,6 +43,20 @@ std::pair<torch::Tensor, torch::Tensor> fused_gdn_gating(
     float softplus_beta,
     float softplus_threshold);
 
+// Fuse MegaChunkGdn output scaling, the original BF16 rounding point,
+// gated RMSNorm, and SiLU gating for Qwen3.5 prefill.
+torch::Tensor fused_scale_gated_rmsnorm(const torch::Tensor& x,
+                                        const torch::Tensor& gate,
+                                        const torch::Tensor& weight,
+                                        float eps,
+                                        float scale);
+
+bool has_fused_scale_gated_rmsnorm_specialization(
+    int64_t head_size,
+    torch::ScalarType x_dtype,
+    torch::ScalarType gate_dtype,
+    torch::ScalarType weight_dtype);
+
 // Build merged mRoPE gather offsets for split_qkv_rmsnorm_mrope.
 torch::Tensor build_split_qkv_rmsnorm_mrope_gather_pattern(
     int64_t rope_dim,

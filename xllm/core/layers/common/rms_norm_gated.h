@@ -34,6 +34,13 @@ class RmsNormGatedImpl : public torch::nn::Module {
   torch::Tensor forward(torch::Tensor& input,
                         std::optional<torch::Tensor> gate = std::nullopt);
 
+  bool supports_fused_scale_gated_rmsnorm(const torch::Tensor& gate,
+                                          int64_t head_size) const;
+
+  torch::Tensor forward_scaled(torch::Tensor& input,
+                               torch::Tensor& gate,
+                               float scale);
+
   void load_state_dict(const StateDict& state_dict);
 
  private:
