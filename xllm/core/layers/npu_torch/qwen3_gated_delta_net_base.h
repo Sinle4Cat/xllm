@@ -97,6 +97,7 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
   int64_t tp_size_ = 1;
   int64_t rank_ = 0;
   int32_t conv_kernel_size_ = 0;
+  torch::Tensor conv1d_zero_bias_;
 
   ColumnParallelLinear conv1d_{nullptr};
   RowParallelLinear o_proj_{nullptr};

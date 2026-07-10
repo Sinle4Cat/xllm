@@ -451,6 +451,8 @@ Qwen3GatedDeltaNetBaseImpl::Qwen3GatedDeltaNetBaseImpl(
   k_size_ = num_k_heads_ * head_k_dim_;
   v_size_ = num_v_heads_ * head_v_dim_;
   conv_kernel_size_ = args.linear_conv_kernel_dim();
+  const int64_t local_conv_dim = (k_size_ * 2 + v_size_) / tp_size_;
+  conv1d_zero_bias_ = torch::zeros({local_conv_dim}, options);
 
   // Shared causal conv projection over mixed QKV states.
   conv1d_ = register_module("conv1d",
@@ -654,6 +656,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         conv1d_params.x = conv_input_2d;
         conv1d_params.conv_state = conv_cache;
         conv1d_params.weight = conv_weight;
+        if (std::getenv("XLLM_DISABLE_CACHED_CAUSAL_CONV1D_BIAS") == nullptr) {
+          conv1d_params.bias = conv1d_zero_bias_;
+        }
         conv1d_params.conv_state_indices = logical_state_indices;
         conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
         conv1d_params.max_query_len = attn_metadata.max_query_len;
@@ -688,6 +693,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         conv1d_params.x = conv_input_2d;
         conv1d_params.conv_state = conv_cache;
         conv1d_params.weight = conv_weight;
+        if (std::getenv("XLLM_DISABLE_CACHED_CAUSAL_CONV1D_BIAS") == nullptr) {
+          conv1d_params.bias = conv1d_zero_bias_;
+        }
         conv1d_params.conv_state_indices = logical_state_indices;
         conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
         conv1d_params.max_query_len = attn_metadata.max_query_len;
