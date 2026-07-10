@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <cstdlib>
+
 #include "xllm/core/kernels/ops_api.h"
 
 namespace xllm {
@@ -27,6 +29,10 @@ Qwen3NextRMSNormImpl::Qwen3NextRMSNormImpl(int64_t dim,
                                            const torch::TensorOptions& options)
     : norm_dim_(dim), eps_(eps) {
   weight_ = register_parameter("weight", torch::empty({dim}, options), false);
+  effective_weight_ =
+      register_buffer("effective_weight", torch::empty({dim}, options));
+  use_cached_effective_weight_ =
+      std::getenv("XLLM_DISABLE_CACHED_QWEN3_NEXT_RMSNORM_WEIGHT") == nullptr;
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>>
@@ -52,7 +58,8 @@ Qwen3NextRMSNormImpl::forward(torch::Tensor& input,
   fused_params.output = torch::empty_like(input);
   fused_params.residual_out = torch::empty_like(residual.value());
 #endif
-  fused_params.weight = 1.0 + weight_;
+  fused_params.weight =
+      use_cached_effective_weight_ ? effective_weight_ : 1.0 + weight_;
   fused_params.eps = eps_;
   fused_params.mode = "rmsnorm";
   xllm::kernel::fused_layernorm(fused_params);
@@ -60,7 +67,11 @@ Qwen3NextRMSNormImpl::forward(torch::Tensor& input,
 }
 
 void Qwen3NextRMSNormImpl::load_state_dict(const StateDict& state_dict) {
+  const bool weight_was_loaded = weight_is_loaded_;
   LOAD_WEIGHT(weight);
+  if (!weight_was_loaded && weight_is_loaded_ && use_cached_effective_weight_) {
+    effective_weight_.copy_(1.0 + weight_);
+  }
 }
 
 }  // namespace layer

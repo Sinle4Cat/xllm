@@ -40,6 +40,8 @@ class Qwen3NextRMSNormImpl : public torch::nn::Module {
 
  private:
   DEFINE_WEIGHT(weight);
+  torch::Tensor effective_weight_;
+  bool use_cached_effective_weight_ = true;
   int64_t norm_dim_;
   double eps_;
 };
