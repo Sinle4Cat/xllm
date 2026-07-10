@@ -740,7 +740,33 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     gdn_params.threshold = 20.0f;
     std::tie(g, beta) = xllm::kernel::fused_gdn_gating(gdn_params);
   }
-  auto [processed_q, processed_k, processed_v] = process_mixed_qkv(mixed_qkv);
+  torch::Tensor processed_q;
+  torch::Tensor processed_k;
+  torch::Tensor processed_v;
+  bool use_fused_prefill_qkv_prepare = false;
+  if (!use_spec_verify && attn_metadata.is_prefill &&
+      !attn_metadata.is_chunked_prefill && batch_size == 1 &&
+      attn_metadata.q_seq_lens_vec.size() == 1 &&
+      attn_metadata.q_seq_lens_vec[0] == seq_len && fla_ssm_state_layout &&
+      std::getenv("XLLM_DISABLE_CAUSAL_CONV1D_QKV_PREPARE") == nullptr &&
+      xllm::kernel::npu::tilelang::has_causal_conv1d_qkv_prepare_specialization(
+          num_k_heads_ / tp_size_, num_v_heads_ / tp_size_, head_k_dim_)) {
+    auto conv_qkv = mixed_qkv.transpose(1, 2).reshape({seq_len, -1});
+    if (conv_qkv.scalar_type() == torch::kBFloat16 &&
+        conv_qkv.is_contiguous()) {
+      std::tie(processed_q, processed_k, processed_v) =
+          xllm::kernel::npu::tilelang::causal_conv1d_qkv_prepare(
+              conv_qkv,
+              num_k_heads_ / tp_size_,
+              num_v_heads_ / tp_size_,
+              head_k_dim_);
+      use_fused_prefill_qkv_prepare = true;
+    }
+  }
+  if (!use_fused_prefill_qkv_prepare) {
+    std::tie(processed_q, processed_k, processed_v) =
+        process_mixed_qkv(mixed_qkv);
+  }
   torch::Tensor core_attn_out;
   torch::Tensor last_recurrent_state;
   bool use_fused_prefill_output_norm = false;
@@ -851,7 +877,8 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     mega_chunk_gdn_params.cu_seqlens = attn_metadata.q_cu_seq_lens;
     mega_chunk_gdn_params.q_seq_lens = c10::ArrayRef<int32_t>(
         attn_metadata.q_seq_lens_vec.data(), static_cast<size_t>(batch_size));
-    mega_chunk_gdn_params.use_qk_l2norm_in_kernel = true;
+    mega_chunk_gdn_params.use_qk_l2norm_in_kernel =
+        !use_fused_prefill_qkv_prepare;
     int64_t direct_state_cache_index = -1;
     if (use_single_prefill_pack && fla_ssm_state_layout &&
         ssm_cache.scalar_type() == torch::kFloat32 &&

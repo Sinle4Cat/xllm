@@ -168,6 +168,11 @@ tilelang_register_runtime_kernel(
 )
 
 tilelang_register_runtime_kernel(
+  NAME causal_conv1d_qkv_prepare
+  WRAPPER_SRCS causal_conv1d_qkv_prepare_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
   NAME fused_sigmoid_gating_delta_rule
   WRAPPER_SRCS fused_sigmoid_gating_delta_rule_wrapper.cpp
 )

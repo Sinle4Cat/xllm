@@ -72,6 +72,17 @@ bool has_final_state_cache_store_specialization(int64_t num_heads,
 void final_state_cache_store(const torch::Tensor& final_state,
                              torch::Tensor& cache_slot);
 
+bool has_causal_conv1d_qkv_prepare_specialization(int64_t num_k_heads,
+                                                  int64_t num_v_heads,
+                                                  int64_t head_dim);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+causal_conv1d_qkv_prepare(const torch::Tensor& mixed_qkv,
+                          int64_t num_k_heads,
+                          int64_t num_v_heads,
+                          int64_t head_dim,
+                          float eps = 1e-6F);
+
 bool has_qwen35_projection_layout_specialization(int64_t qkv_size,
                                                  int64_t z_size,
                                                  int64_t num_heads,
