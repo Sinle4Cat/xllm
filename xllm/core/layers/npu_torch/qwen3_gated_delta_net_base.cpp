@@ -662,6 +662,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         conv1d_params.conv_state_indices = logical_state_indices;
         conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
         conv1d_params.max_query_len = attn_metadata.max_query_len;
+        if (std::getenv(
+                "XLLM_DISABLE_REUSED_CAUSAL_CONV1D_INITIAL_STATE_MODE") ==
+            nullptr) {
+          conv1d_params.initial_state_mode = attn_metadata.q_seq_lens;
+        }
         mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);
         if (conv_input.dim() == 3) {
           mixed_qkv =
@@ -699,6 +704,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         conv1d_params.conv_state_indices = logical_state_indices;
         conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
         conv1d_params.max_query_len = attn_metadata.max_query_len;
+        if (std::getenv(
+                "XLLM_DISABLE_REUSED_CAUSAL_CONV1D_INITIAL_STATE_MODE") ==
+            nullptr) {
+          conv1d_params.initial_state_mode = attn_metadata.q_seq_lens;
+        }
         mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);
         if (conv_input.dim() == 3) {
           mixed_qkv =
