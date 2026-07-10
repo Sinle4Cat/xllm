@@ -16,6 +16,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 
@@ -150,12 +151,22 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
   auto g_sum = torch::empty({B, T, H}, opts_fp32);
   auto g_t = torch::empty({H, T}, opts_fp32);
   auto beta_t = torch::empty({H, T}, opts_fp16);
-  auto a = torch::zeros({B, T, H, kMegaChunkSize}, opts_fp16);
-  auto a_inv_f32 = torch::zeros({B, T, H, kMegaChunkSize}, opts_fp32);
-  auto a_inv = torch::zeros({B, T, H, kMegaChunkSize}, opts_fp16);
+  const bool zero_initialize_outputs =
+      std::getenv("XLLM_DISABLE_EMPTY_MEGA_CHUNK_GDN_OUTPUTS") != nullptr;
+  auto a = zero_initialize_outputs
+               ? torch::zeros({B, T, H, kMegaChunkSize}, opts_fp16)
+               : torch::empty({B, T, H, kMegaChunkSize}, opts_fp16);
+  auto a_inv_f32 = zero_initialize_outputs
+                       ? torch::zeros({B, T, H, kMegaChunkSize}, opts_fp32)
+                       : torch::empty({B, T, H, kMegaChunkSize}, opts_fp32);
+  auto a_inv = zero_initialize_outputs
+                   ? torch::zeros({B, T, H, kMegaChunkSize}, opts_fp16)
+                   : torch::empty({B, T, H, kMegaChunkSize}, opts_fp16);
   auto w = torch::empty({B, T, H, V}, opts_fp16);
   auto u = torch::empty({B, T, H, V}, opts_fp16);
-  auto h = torch::zeros({num_matrices, K, V}, opts_fp16);
+  auto h = zero_initialize_outputs
+               ? torch::zeros({num_matrices, K, V}, opts_fp16)
+               : torch::empty({num_matrices, K, V}, opts_fp16);
   auto v_new = torch::empty({B, T, H, V}, opts_fp16);
 
   torch::Tensor initial_state_arg;
@@ -167,7 +178,9 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     initial_state_arg = torch::zeros({num_sequences, H, K, V}, opts_fp16);
   }
 
-  auto final_state = torch::zeros({num_sequences * H, K, V}, opts_fp16);
+  auto final_state = zero_initialize_outputs
+                         ? torch::zeros({num_sequences * H, K, V}, opts_fp16)
+                         : torch::empty({num_sequences * H, K, V}, opts_fp16);
 
   EXEC_NPU_CMD(aclnnMegaChunkGdn,
                q_fp16,
