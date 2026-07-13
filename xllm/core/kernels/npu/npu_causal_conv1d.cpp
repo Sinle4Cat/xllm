@@ -83,4 +83,60 @@ torch::Tensor causal_conv1d(const torch::Tensor& x,
   return output;
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> causal_conv1d_qkv(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& conv_state,
+    const torch::IntArrayRef query_start_loc_opt,
+    const torch::IntArrayRef cache_indices_opt,
+    const torch::IntArrayRef initial_state_mode_opt) {
+  constexpr int64_t kQkHeads = 8;
+  constexpr int64_t kVHeads = 24;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kQElementsPerToken = kQkHeads * kHeadDim;
+  constexpr int64_t kKElementsPerToken = kQkHeads * kHeadDim;
+  constexpr int64_t kVElementsPerToken = kVHeads * kHeadDim;
+  constexpr int64_t kPackedQkvActivationMode = 2;
+  constexpr int64_t kPadSlotId = -1;
+  constexpr int64_t kForwardRunMode = 0;
+
+  check_tensor(x, "x", "causal_conv1d_qkv");
+  check_tensor(weight, "weight", "causal_conv1d_qkv");
+  check_tensor(conv_state, "conv_state", "causal_conv1d_qkv");
+  CHECK_EQ(x.dim(), 2) << "causal_conv1d_qkv expects x with shape [T, D]";
+  CHECK_EQ(x.size(1),
+           kQElementsPerToken + kKElementsPerToken + kVElementsPerToken)
+      << "causal_conv1d_qkv only supports the Qwen3.5 TP2 layout";
+
+  auto packed = torch::empty(x.sizes(), x.options().dtype(torch::kFloat16));
+  c10::optional<torch::Tensor> bias_opt = c10::nullopt;
+  torch::IntArrayRef num_accepted_tokens_opt;
+  EXEC_NPU_CMD(aclnnCausalConv1dQkv,
+               x,
+               weight,
+               bias_opt,
+               conv_state,
+               query_start_loc_opt,
+               cache_indices_opt,
+               initial_state_mode_opt,
+               num_accepted_tokens_opt,
+               kPackedQkvActivationMode,
+               kPadSlotId,
+               kForwardRunMode,
+               packed);
+
+  const int64_t num_tokens = x.size(0);
+  auto packed_flat = packed.view({-1});
+  const int64_t q_elements = num_tokens * kQElementsPerToken;
+  const int64_t k_elements = num_tokens * kKElementsPerToken;
+  const int64_t v_elements = num_tokens * kVElementsPerToken;
+  auto q = packed_flat.narrow(0, 0, q_elements)
+               .view({1, num_tokens, kQkHeads, kHeadDim});
+  auto k = packed_flat.narrow(0, q_elements, k_elements)
+               .view({1, num_tokens, kQkHeads, kHeadDim});
+  auto v = packed_flat.narrow(0, q_elements + k_elements, v_elements)
+               .view({1, num_tokens, kVHeads, kHeadDim});
+  return {q, k, v};
+}
+
 }  // namespace xllm::kernel::npu

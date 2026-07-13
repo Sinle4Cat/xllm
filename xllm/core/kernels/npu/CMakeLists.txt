@@ -20,6 +20,8 @@ cc_library(
     npu_gemma_rms_norm.cpp
     npu_block_sparse_attention.cpp
     npu_rain_fusion_attention.cpp
+    npu_qwen35_gdn_decode_super_op.cpp
+    npu_qwen35_gdn_prefill_super_op.cpp
     npu_grouped_matmul.cpp
     npu_moe_gating_topk_softmax.cpp
     npu_dispatch_ffn_combine.cpp

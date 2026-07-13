@@ -308,6 +308,32 @@ torch::Tensor npu_recurrent_gated_delta_rule(
     const std::optional<torch::Tensor>& g,
     const std::optional<torch::Tensor>& gk);
 
+torch::Tensor qwen35_gdn_decode_super_op(const torch::Tensor& qkv,
+                                         const torch::Tensor& z,
+                                         const torch::Tensor& b,
+                                         const torch::Tensor& a,
+                                         const torch::Tensor& conv_weight,
+                                         torch::Tensor& conv_state,
+                                         const torch::Tensor& a_log,
+                                         const torch::Tensor& dt_bias,
+                                         torch::Tensor& ssm_state,
+                                         const torch::Tensor& state_indices,
+                                         const torch::Tensor& norm_weight);
+
+torch::Tensor qwen35_gdn_prefill_super_op(const torch::Tensor& mixed_qkv,
+                                          const torch::Tensor& z,
+                                          const torch::Tensor& b,
+                                          const torch::Tensor& a,
+                                          const torch::Tensor& conv_weight,
+                                          torch::Tensor& conv_state,
+                                          const torch::Tensor& a_log,
+                                          const torch::Tensor& dt_bias,
+                                          torch::Tensor& ssm_state,
+                                          const torch::Tensor& norm_weight,
+                                          const torch::Tensor& cu_seqlens,
+                                          int64_t conv_state_index,
+                                          int64_t ssm_state_index);
+
 std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,
@@ -352,6 +378,14 @@ torch::Tensor causal_conv1d(const torch::Tensor& x,
                             int64_t activation_mode,
                             int64_t pad_slot_id,
                             int64_t run_mode);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> causal_conv1d_qkv(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& conv_state,
+    const torch::IntArrayRef query_start_loc_opt,
+    const torch::IntArrayRef cache_indices_opt,
+    const torch::IntArrayRef initial_state_mode_opt);
 
 void causal_conv1d_out(const torch::Tensor& output,
                        const torch::Tensor& x,
