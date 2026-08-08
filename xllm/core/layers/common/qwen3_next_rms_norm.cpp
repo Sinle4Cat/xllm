@@ -48,7 +48,7 @@ Qwen3NextRMSNormImpl::forward(torch::Tensor& input,
     return std::make_tuple(norm_params.norm_out, std::nullopt);
   }
 
-  // With residual: use fused_layernorm (which calls npu::add_rms_norm on NPU)
+  // With residual: use the fused NPU AddRmsNorm path.
   xllm::kernel::FusedLayerNormParams fused_params;
   fused_params.input = input;
   fused_params.residual = residual;
@@ -58,8 +58,16 @@ Qwen3NextRMSNormImpl::forward(torch::Tensor& input,
   fused_params.output = torch::empty_like(input);
   fused_params.residual_out = torch::empty_like(residual.value());
 #endif
-  fused_params.weight =
-      use_cached_effective_weight_ ? effective_weight_ : 1.0 + weight_;
+#if defined(USE_NPU)
+  if (use_cached_effective_weight_) {
+    fused_params.weight = effective_weight_;
+  } else {
+    fused_params.weight = weight_;
+    fused_params.add_gamma_offset = true;
+  }
+#else
+  fused_params.weight = 1.0 + weight_;
+#endif
   fused_params.eps = eps_;
   fused_params.mode = "rmsnorm";
   xllm::kernel::fused_layernorm(fused_params);

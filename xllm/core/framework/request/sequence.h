@@ -20,7 +20,9 @@ limitations under the License.
 #include <absl/time/time.h>
 #include <folly/futures/Future.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
 #include <utility>
@@ -66,6 +68,10 @@ struct SequenceParams {
 
   // whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
+
+  // whether to include stop strings or stop tokens in the output text.
+  // default = false.
+  bool include_stop_str_in_output = false;
 
   // whether to echo the prompt in the output text. default = false.
   bool echo = false;
@@ -133,9 +139,10 @@ class Sequence final {
   bool is_prefill_stage() const { return stage() != SequenceStage::DECODE; }
   // get the sequence stage
   SequenceStage stage() const {
-    if (kv_state_.kv_cache_tokens_num() <
+    const size_t cached_tokens = kv_cache_tokens_num();
+    if (cached_tokens <
         std::max(volatile_num_prompt_tokens_, num_prompt_tokens())) {
-      if (kv_state_.kv_cache_tokens_num() > 0) {
+      if (cached_tokens > 0) {
         return SequenceStage::CHUNKED_PREFILL;
       }
       return SequenceStage::PREFILL;
@@ -168,13 +175,13 @@ class Sequence final {
 
   // get the number of tokens need compute
   size_t num_need_compute_tokens() const {
-    return num_tokens_ - std::max(kv_state_.kv_cache_tokens_num(),
-                                  host_kv_state_.kv_cache_tokens_num());
+    return num_tokens_ - kv_cache_tokens_num();
   }
 
   size_t kv_cache_tokens_num() const {
-    return std::max(kv_state_.kv_cache_tokens_num(),
-                    host_kv_state_.kv_cache_tokens_num());
+    return std::max({kv_state_.kv_cache_tokens_num(),
+                     host_kv_state_.kv_cache_tokens_num(),
+                     effective_restore_tokens_.value_or(0)});
   }
 
   size_t num_prefix_cache_tokens() const;
@@ -186,7 +193,7 @@ class Sequence final {
   void update_token(size_t index, const Token& token);
   void update_last_step_token(const Token& token, size_t token_offset = 0);
   bool has_new_tokens_generated() const {
-    return num_tokens_ > decoder_.output_offset();
+    return num_tokens_ > stream_output_token_offset_;
   }
 
   // update mm embeddings to the sequence
@@ -200,10 +207,44 @@ class Sequence final {
   void clear_mtp_bootstrap_embedding() {
     mtp_bootstrap_embedding_ = torch::Tensor();
   }
-  // Single per-sequence resource block id (linear-state / embedding), or -1.
-  int32_t get_single_block_id() const {
-    return kv_state_.get_single_block_id();
+
+  int32_t get_embedding_block_id() const {
+    return kv_state_.get_embedding_block_id();
   }
+
+  // Linear-state (Qwen3.5 GDN) live slot, stored in composite_blocks_ under
+  // BlockType::LINEAR. Drawn from the dedicated LinearStateBlockManager id
+  // space.
+  bool has_linear_state_slot() const {
+    return kv_state_.get_linear_block_id() >= 0;
+  }
+  int32_t get_linear_state_slot_id() const {
+    return kv_state_.get_linear_block_id();
+  }
+
+  int32_t get_recurrent_state_slot_id() const {
+    return get_linear_state_slot_id();
+  }
+
+  void set_pending_linear_save(const XXH3Key& hash) {
+    kv_state_.set_pending_linear_save(hash);
+  }
+  std::optional<XXH3Key> take_pending_linear_save() {
+    return kv_state_.take_pending_linear_save();
+  }
+  bool has_pending_linear_save() const {
+    return kv_state_.has_pending_linear_save();
+  }
+  void set_linear_restore_src_block(Block&& block) {
+    kv_state_.set_linear_restore_src_block(std::move(block));
+  }
+  bool has_linear_restore_src_block() const {
+    return kv_state_.has_linear_restore_src_block();
+  }
+  std::optional<Block> take_linear_restore_src_block() {
+    return kv_state_.take_linear_restore_src_block();
+  }
+  Block copy_block(BlockType type) const { return kv_state_.copy_block(type); }
   const std::string& request_id() const { return request_id_; }
   // get input embedding
   torch::Tensor get_input_embedding() const { return input_embedding_; }
@@ -215,13 +256,30 @@ class Sequence final {
 
   // Precomputed chained block hashes used by the prefix cache. Covers all full
   // blocks of the current tokens; reused by match()/insert() so the hash is
-  // computed once per sequence instead of recomputed on every call.
-  Slice<XXH3Key> block_hashes() const { return block_hashes_; }
+  // computed once per sequence instead of recomputed on every call. Returns the
+  // chain for the stride set by the most recent update_block_hashes() call.
+  Slice<XXH3Key> block_hashes() const;
 
-  // Extend `block_hashes_` to cover any newly completed full blocks. Cheap
-  // (no-op) when no new full block is available, so it is safe to call before
-  // every match()/cache().
+  // Extend the per-stride chain for `block_size` to cover any newly completed
+  // full blocks, and select it as the one block_hashes() returns. Cheap (no-op)
+  // when no new full block is available, so it is safe to call before every
+  // match()/cache(). DSV4 admission probes SWA / C4 / C128 back-to-back with
+  // different strides (base / 4*base / 128*base); each stride keeps its own
+  // chain so switching strides no longer discards and rebuilds the whole chain.
   void update_block_hashes(uint32_t block_size, BlockHasherType hasher_type);
+
+  // Precomputed chained per-chunk hashes for the linear-state checkpoint index.
+  // Separate hash domain from the KV block-hash chains: the stride is one
+  // prefill chunk (a multiple of the KV block size), not a KV block, so a
+  // linear checkpoint is a sparse overlay on the per-block KV cache. Consumed
+  // by the batch builder (save/restore boundaries) and the LINEAR leaf's match
+  // probe.
+  Slice<XXH3Key> linear_state_hashes() const { return linear_state_hashes_; }
+
+  // Extend `linear_state_hashes_` to cover any newly completed full chunks at
+  // the given stride. Cheap (no-op) when no new full chunk is available, so it
+  // is safe to call before every match()/save-boundary check.
+  void update_linear_state_hashes(uint32_t chunk_stride);
 
   // whether the prefill stage has been cached.
   bool if_cache_block_for_prefill() {
@@ -264,6 +322,14 @@ class Sequence final {
 
   // time between two tokens
   int64_t tbt(const absl::Time& now);
+  int64_t tbt_microseconds(const absl::Time& now);
+
+  // Number of real tokens committed to this sequence since the last tbt/tbt_us
+  // reset. Speculative/MTP steps commit multiple tokens per step, so this is
+  // used to amortize the per-step inter-token latency into a per-token value.
+  size_t generated_tokens_since_latency() const {
+    return generated_tokens_since_latency_;
+  }
 
   void set_wait_time_ms() {
     wait_time_ms_ = static_cast<int32_t>(
@@ -297,7 +363,19 @@ class Sequence final {
 
   KVCacheState& kv_state() { return kv_state_; }
 
+  bool has_any_blocks() const {
+    return kv_state_.has_any_blocks() || host_kv_state_.has_any_blocks();
+  }
+
   KVCacheState& host_kv_state() { return host_kv_state_; }
+
+  void set_host_cache_match(size_t restore_tokens, size_t copy_units);
+  void set_host_cache_restore(size_t restore_tokens, size_t copy_units);
+  void clear_host_cache_match();
+  bool has_host_cache_match() const {
+    return effective_restore_tokens_.has_value();
+  }
+  size_t host_cache_copy_units() const { return host_cache_copy_units_; }
 
   // for generated tokens
   float get_acc_logprob();
@@ -428,6 +506,15 @@ class Sequence final {
   // `token_index` was rewritten (beam search / speculative / disagg PD).
   void invalidate_block_hashes_from(size_t token_index);
 
+  // Same as above for the linear-state hash domain: drop cached chunk hashes
+  // from the chunk containing `token_index` onward.
+  void invalidate_linear_state_hashes_from(size_t token_index);
+
+  // Number of tokens available to the decoder after applying stop-output
+  // suppression and streaming buffering. The underlying sequence retains all
+  // generated tokens for usage and scheduling accounting.
+  size_t get_decodable_token_count(size_t size) const;
+
   SequenceOutputType output_type();
   void generate_embeddings_output(SequenceOutput& output);
   void generate_mm_embeddings_output(SequenceOutput& output);
@@ -459,10 +546,16 @@ class Sequence final {
 
   KVCacheState host_kv_state_;
 
+  std::optional<size_t> effective_restore_tokens_;
+  size_t host_cache_copy_units_ = 0;
+
   std::unique_ptr<LogprobState> logprob_state_;
 
   // latest token generate time
   absl::Time latest_generate_time_;
+
+  // number of real tokens committed since the last tbt() reset
+  size_t generated_tokens_since_latency_ = 0;
 
   // sequence ttft latency
   double time_to_first_token_latency_seconds_ = 0.0;
@@ -477,6 +570,11 @@ class Sequence final {
 
   // incremental decoder to decode the tokens
   IncrementalDecoder decoder_;
+
+  // All tokens before this offset have been returned in streaming output.
+  // This is independent from the decoder offset because hidden stop tokens
+  // remain present in token_ids and logprobs.
+  size_t stream_output_token_offset_ = 0;
 
   // token ids generated for the sequence
   std::vector<int32_t> tokens_;
@@ -505,12 +603,27 @@ class Sequence final {
   // the length of the prompt tokens
   size_t num_prompt_tokens_ = 0;
 
-  // Precomputed chained block hashes covering all full blocks of `tokens_`.
-  // Extended incrementally; consumed by the prefix cache.
-  std::vector<XXH3Key> block_hashes_;
+  // Precomputed chained block hashes covering all full blocks of `tokens_`,
+  // keyed by block-size stride. DSV4 admission probes multiple strides (base /
+  // 4*base / 128*base) per tick; each keeps its own chain so a stride switch
+  // extends incrementally instead of discarding and rebuilding. Extended
+  // incrementally; consumed by the prefix cache. std::map node storage is
+  // pointer-stable, so a Slice handed out by block_hashes() survives inserts of
+  // other strides.
+  std::map<uint32_t, std::vector<XXH3Key>> block_hashes_by_stride_;
 
-  // Block size used to compute `block_hashes_` (0 until first computed).
+  // Stride selected by the most recent update_block_hashes() call; keys
+  // block_hashes() into `block_hashes_by_stride_` (0 until first computed).
   uint32_t hash_block_size_ = 0;
+
+  // Precomputed chained per-chunk hashes for the linear-state checkpoint index
+  // (own hash domain, chunk-strided). Extended incrementally, invalidated on
+  // token rewrite; see linear_state_hashes()/update_linear_state_hashes().
+  std::vector<XXH3Key> linear_state_hashes_;
+
+  // Chunk stride used to compute `linear_state_hashes_` (0 until first
+  // computed).
+  uint32_t linear_hash_stride_ = 0;
 
   std::optional<OneRecState> onerec_state_;
 
@@ -530,6 +643,11 @@ class Sequence final {
 
   // the reason why the sequence is finished
   mutable FinishReason finish_reason_ = FinishReason::NONE;
+
+  // Number of trailing tokens that matched the stopping criterion. These
+  // tokens remain in `tokens_` and are omitted from decoded output when
+  // `include_stop_str_in_output` is false.
+  mutable size_t matched_stop_token_count_ = 0;
 
   // is the sequence closed.
   bool closed_ = false;

@@ -39,11 +39,7 @@ class Options {
 
   PROPERTY(std::string, model_id);
 
-  PROPERTY(std::optional<std::string>, devices);
-
   PROPERTY(std::optional<std::string>, draft_model_path);
-
-  PROPERTY(std::optional<std::string>, draft_devices);
 
   // model backend
   PROPERTY(std::string, backend);
@@ -65,6 +61,9 @@ class Options {
 
   // maximum encoder cache size in MB (0 disables encoder cache)
   PROPERTY(int64_t, max_encoder_cache_size) = 0;
+
+  // maximum processor cache item count (default 256; 0 disables)
+  PROPERTY(int64_t, max_processor_cache_items) = 256;
 
   // active linear-state slots. 0 derives capacity from the KV cache budget.
   PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
@@ -95,6 +94,8 @@ class Options {
 
   PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
 
+  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
+
   // thread num to handle requests
   PROPERTY(size_t, num_request_handling_threads) = 4;
 
@@ -120,7 +121,14 @@ class Options {
 
   PROPERTY(bool, enable_chunked_prefill) = true;
 
-  PROPERTY(bool, enable_prefill_sp) = false;
+  // Flash Communication 1 (FC1) sequence-parallel optimization.
+  PROPERTY(bool, enable_flashcomm1) = false;
+
+  PROPERTY(int32_t, flashcomm1_min_prefill_tokens) = 8192;
+
+  PROPERTY(bool, enable_mmrs_fusion) = false;
+
+  PROPERTY(std::string, mmrs_comm_mode) = "aiv";
 
   PROPERTY(std::optional<std::string>, master_node_addr);
 
@@ -141,6 +149,8 @@ class Options {
   PROPERTY(int32_t, cfg_size) = 1;
 
   PROPERTY(int32_t, vae_size) = 1;
+
+  PROPERTY(int32_t, text_encoder_tp_size) = 1;
 
   PROPERTY(std::optional<std::string>, instance_name);
 

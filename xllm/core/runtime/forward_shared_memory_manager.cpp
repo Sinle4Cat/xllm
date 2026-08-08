@@ -34,7 +34,7 @@ limitations under the License.
 #endif
 #if defined(USE_NPU)
 #include "platform/npu/device_capture_lock.h"
-#elif defined(USE_CUDA)
+#elif defined(USE_CUDA) || defined(USE_MUSA)
 #include "platform/cuda/device_capture_lock.h"
 #endif
 #include "core/util/net.h"
@@ -208,21 +208,29 @@ inline size_t get_xtensor_layer_offsets_size(
   return total;
 }
 
+inline size_t get_kv_transfer_mappings_size(
+    const std::vector<KVTransferMapping>& mappings) {
+  size_t total = type_size<uint64_t>;
+  for (const KVTransferMapping& mapping : mappings) {
+    total += type_size<int32_t> + get_vector_size(mapping.local_ids) +
+             get_vector_size(mapping.remote_ids);
+  }
+  return total;
+}
+
 inline size_t get_transfer_kv_info_size(const TransferKVInfo& info) {
-  return get_string_size(info.request_id) +
-         get_vector_size(info.local_blocks_ids) +
-         get_vector_size(info.remote_blocks_ids) +
-         get_vector_size(info.local_linear_state_ids) +
-         get_vector_size(info.remote_linear_state_ids) +
-         type_size<int32_t>  // dp_rank
+  return get_string_size(info.request_id) + type_size<int32_t>  // dp_rank
          + get_instance_info_size(info.remote_instance_info) +
-         get_xtensor_layer_offsets_size(info.dst_xtensor_layer_offsets);
+         get_xtensor_layer_offsets_size(info.dst_xtensor_layer_offsets) +
+         get_kv_transfer_mappings_size(info.mappings);
 }
 
 inline size_t get_eplb_info_size(const EplbInfo& info) {
-  return type_size<int32_t>  // prepare_layer_id
+  return type_size<int32_t>    // prepare_layer_id
+         + type_size<int64_t>  // prepare_token
          + get_vector_size(info.expert_ids) +
-         type_size<int32_t>;  // update_layer_id
+         type_size<int32_t> +  // update_layer_id
+         type_size<int64_t>;   // activation_token
 }
 
 inline size_t get_mm_dict_size(const MMDict& mm_dict) {
@@ -341,8 +349,12 @@ inline size_t get_dit_generation_params_size(
          + type_size<double>    // video_fps
          + type_size<float> *   // guidance_scale_2, boundary_ratio, flow_shift
                3 +
-         type_size<int32_t>      // seconds
-         + type_size<uint32_t>;  // num_videos_per_prompt
+         type_size<int32_t>        // seconds
+         + type_size<uint32_t>     // num_videos_per_prompt
+         + type_size<int32_t> * 2  // max_new_tokens, diffusion_steps
+         + type_size<float> * 3    // temperature, top_p, repetition_penalty
+         + type_size<int32_t>      // top_k
+         + type_size<bool>;        // seed_is_set
 }
 
 inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
@@ -376,7 +388,8 @@ inline size_t get_dit_forward_input_size(const DiTForwardInput& input) {
 }
 
 inline size_t get_dit_forward_output_size(const DiTForwardOutput& output) {
-  return get_vector_tensor_size(output.tensors);
+  return get_vector_tensor_size(output.tensors) +
+         get_string_vector_size(output.text_output);
 }
 
 template <typename T>
@@ -405,6 +418,18 @@ inline void write_bytes(RawInputSectionCursor& cursor,
     cursor.ptr += bytes;
   }
   cursor.size += bytes;
+}
+
+inline void write_linear_state_cache_ops(
+    RawInputSerializeContext& context,
+    const std::vector<LinearStateCacheOp>& cache_ops) {
+  write_data(context.descriptor, static_cast<uint64_t>(cache_ops.size()));
+  for (const LinearStateCacheOp& cache_op : cache_ops) {
+    write_data(context.descriptor, cache_op.linear_state_id);
+    write_data(context.descriptor, cache_op.reset_requested);
+    write_data(context.descriptor, cache_op.restore_requested);
+    write_data(context.descriptor, cache_op.restore_src_slot_id);
+  }
 }
 
 inline void write_padding(RawInputSectionCursor& cursor, uint64_t bytes) {
@@ -745,6 +770,28 @@ inline void write_xtensor_layer_offsets(
   }
 }
 
+inline void write_kv_transfer_mappings(
+    char*& buffer,
+    const std::vector<KVTransferMapping>& mappings) {
+  write_data(buffer, static_cast<uint64_t>(mappings.size()));
+  for (const KVTransferMapping& mapping : mappings) {
+    write_data(buffer, mapping.group_id);
+    write_vector(buffer, mapping.local_ids);
+    write_vector(buffer, mapping.remote_ids);
+  }
+}
+
+inline void write_kv_transfer_mappings(
+    RawInputSerializeContext& context,
+    const std::vector<KVTransferMapping>& mappings) {
+  write_data(context.descriptor, static_cast<uint64_t>(mappings.size()));
+  for (const KVTransferMapping& mapping : mappings) {
+    write_data(context.descriptor, mapping.group_id);
+    write_vector(context.descriptor, mapping.local_ids);
+    write_vector(context.descriptor, mapping.remote_ids);
+  }
+}
+
 inline void write_xtensor_layer_offsets(
     RawInputSerializeContext& context,
     const std::vector<XTensorLayerOffsets>& offsets) {
@@ -757,38 +804,36 @@ inline void write_xtensor_layer_offsets(
 
 inline void write_transfer_kv_info(char*& buffer, const TransferKVInfo& info) {
   write_string(buffer, info.request_id);
-  write_vector(buffer, info.local_blocks_ids);
-  write_vector(buffer, info.remote_blocks_ids);
-  write_vector(buffer, info.local_linear_state_ids);
-  write_vector(buffer, info.remote_linear_state_ids);
   write_data(buffer, info.dp_rank);
   write_instance_info(buffer, info.remote_instance_info);
   write_xtensor_layer_offsets(buffer, info.dst_xtensor_layer_offsets);
+  write_kv_transfer_mappings(buffer, info.mappings);
 }
 
 inline void write_transfer_kv_info(RawInputSerializeContext& context,
                                    const TransferKVInfo& info) {
   write_string(context.descriptor, info.request_id);
-  write_vector(context.descriptor, info.local_blocks_ids);
-  write_vector(context.descriptor, info.remote_blocks_ids);
-  write_vector(context.descriptor, info.local_linear_state_ids);
-  write_vector(context.descriptor, info.remote_linear_state_ids);
   write_data(context.descriptor, info.dp_rank);
   write_instance_info(context, info.remote_instance_info);
   write_xtensor_layer_offsets(context, info.dst_xtensor_layer_offsets);
+  write_kv_transfer_mappings(context, info.mappings);
 }
 
 inline void write_eplb_info(char*& buffer, const EplbInfo& info) {
   write_data(buffer, info.prepare_layer_id);
+  write_data(buffer, info.prepare_token);
   write_vector(buffer, info.expert_ids);
   write_data(buffer, info.update_layer_id);
+  write_data(buffer, info.activation_token);
 }
 
 inline void write_eplb_info(RawInputSerializeContext& context,
                             const EplbInfo& info) {
   write_data(context.descriptor, info.prepare_layer_id);
+  write_data(context.descriptor, info.prepare_token);
   write_vector(context.descriptor, info.expert_ids);
   write_data(context.descriptor, info.update_layer_id);
+  write_data(context.descriptor, info.activation_token);
 }
 
 inline void write_swap_blocks(char*& buffer,
@@ -1001,6 +1046,13 @@ inline void write_dit_generation_params(char*& buffer,
   write_data(buffer, params.boundary_ratio);
   write_data(buffer, params.flow_shift);
   write_data(buffer, params.num_videos_per_prompt);
+  write_data(buffer, params.max_new_tokens);
+  write_data(buffer, params.diffusion_steps);
+  write_data(buffer, params.temperature);
+  write_data(buffer, params.top_k);
+  write_data(buffer, params.top_p);
+  write_data(buffer, params.repetition_penalty);
+  write_data(buffer, params.seed_is_set);
 }
 
 inline void write_dit_generation_params(RawInputSerializeContext& context,
@@ -1024,6 +1076,13 @@ inline void write_dit_generation_params(RawInputSerializeContext& context,
   write_data(context.descriptor, params.boundary_ratio);
   write_data(context.descriptor, params.flow_shift);
   write_data(context.descriptor, params.num_videos_per_prompt);
+  write_data(context.descriptor, params.max_new_tokens);
+  write_data(context.descriptor, params.diffusion_steps);
+  write_data(context.descriptor, params.temperature);
+  write_data(context.descriptor, params.top_k);
+  write_data(context.descriptor, params.top_p);
+  write_data(context.descriptor, params.repetition_penalty);
+  write_data(context.descriptor, params.seed_is_set);
 }
 
 inline void write_dit_forward_input(char*& buffer,
@@ -1081,6 +1140,7 @@ inline void write_dit_forward_input(RawInputSerializeContext& context,
 inline void write_dit_forward_output(char*& buffer,
                                      const DiTForwardOutput& output) {
   write_vector_tensor(buffer, output.tensors);
+  write_string_vector(buffer, output.text_output);
 }
 
 inline void safe_advance_buffer(const char*& buffer, size_t offset) {
@@ -1145,6 +1205,20 @@ template <typename T>
 inline void read_data(ReadContext& context, T& data) {
   data = *reinterpret_cast<const T*>(context.descriptor_cursor);
   advance_descriptor_cursor(context, type_size<T>);
+}
+
+inline void read_linear_state_cache_ops(
+    ReadContext& context,
+    std::vector<LinearStateCacheOp>& cache_ops) {
+  uint64_t size;
+  read_data(context, size);
+  cache_ops.resize(size);
+  for (LinearStateCacheOp& cache_op : cache_ops) {
+    read_data(context, cache_op.linear_state_id);
+    read_data(context, cache_op.reset_requested);
+    read_data(context, cache_op.restore_requested);
+    read_data(context, cache_op.restore_src_slot_id);
+  }
 }
 
 template <typename T>
@@ -1598,6 +1672,32 @@ inline void read_xtensor_layer_offsets(
   }
 }
 
+inline void read_kv_transfer_mappings(
+    const char*& buffer,
+    std::vector<KVTransferMapping>& mappings) {
+  uint64_t mapping_count;
+  read_data(buffer, mapping_count);
+  mappings.resize(mapping_count);
+  for (KVTransferMapping& mapping : mappings) {
+    read_data(buffer, mapping.group_id);
+    read_vector(buffer, mapping.local_ids);
+    read_vector(buffer, mapping.remote_ids);
+  }
+}
+
+inline void read_kv_transfer_mappings(
+    ReadContext& context,
+    std::vector<KVTransferMapping>& mappings) {
+  uint64_t mapping_count;
+  read_data(context, mapping_count);
+  mappings.resize(mapping_count);
+  for (KVTransferMapping& mapping : mappings) {
+    read_data(context, mapping.group_id);
+    read_vector(context, mapping.local_ids);
+    read_vector(context, mapping.remote_ids);
+  }
+}
+
 inline void read_xtensor_layer_offsets(
     ReadContext& context,
     std::vector<XTensorLayerOffsets>& offsets) {
@@ -1612,36 +1712,34 @@ inline void read_xtensor_layer_offsets(
 
 inline void read_transfer_kv_info(const char*& buffer, TransferKVInfo& info) {
   read_string(buffer, info.request_id);
-  read_vector(buffer, info.local_blocks_ids);
-  read_vector(buffer, info.remote_blocks_ids);
-  read_vector(buffer, info.local_linear_state_ids);
-  read_vector(buffer, info.remote_linear_state_ids);
   read_data(buffer, info.dp_rank);
   read_instance_info(buffer, info.remote_instance_info);
   read_xtensor_layer_offsets(buffer, info.dst_xtensor_layer_offsets);
+  read_kv_transfer_mappings(buffer, info.mappings);
 }
 
 inline void read_transfer_kv_info(ReadContext& context, TransferKVInfo& info) {
   read_string(context, info.request_id);
-  read_vector(context, info.local_blocks_ids);
-  read_vector(context, info.remote_blocks_ids);
-  read_vector(context, info.local_linear_state_ids);
-  read_vector(context, info.remote_linear_state_ids);
   read_data(context, info.dp_rank);
   read_instance_info(context, info.remote_instance_info);
   read_xtensor_layer_offsets(context, info.dst_xtensor_layer_offsets);
+  read_kv_transfer_mappings(context, info.mappings);
 }
 
 inline void read_eplb_info(const char*& buffer, EplbInfo& info) {
   read_data(buffer, info.prepare_layer_id);
+  read_data(buffer, info.prepare_token);
   read_vector(buffer, info.expert_ids);
   read_data(buffer, info.update_layer_id);
+  read_data(buffer, info.activation_token);
 }
 
 inline void read_eplb_info(ReadContext& context, EplbInfo& info) {
   read_data(context, info.prepare_layer_id);
+  read_data(context, info.prepare_token);
   read_vector(context, info.expert_ids);
   read_data(context, info.update_layer_id);
+  read_data(context, info.activation_token);
 }
 
 inline void read_swap_blocks(const char*& buffer,
@@ -1916,6 +2014,13 @@ inline void read_dit_generation_params(const char*& buffer,
   read_data(buffer, params.boundary_ratio);
   read_data(buffer, params.flow_shift);
   read_data(buffer, params.num_videos_per_prompt);
+  read_data(buffer, params.max_new_tokens);
+  read_data(buffer, params.diffusion_steps);
+  read_data(buffer, params.temperature);
+  read_data(buffer, params.top_k);
+  read_data(buffer, params.top_p);
+  read_data(buffer, params.repetition_penalty);
+  read_data(buffer, params.seed_is_set);
 }
 
 inline void read_dit_generation_params(ReadContext& context,
@@ -1939,6 +2044,13 @@ inline void read_dit_generation_params(ReadContext& context,
   read_data(context, params.boundary_ratio);
   read_data(context, params.flow_shift);
   read_data(context, params.num_videos_per_prompt);
+  read_data(context, params.max_new_tokens);
+  read_data(context, params.diffusion_steps);
+  read_data(context, params.temperature);
+  read_data(context, params.top_k);
+  read_data(context, params.top_p);
+  read_data(context, params.repetition_penalty);
+  read_data(context, params.seed_is_set);
 }
 
 inline void clone_tensor_if_defined(torch::Tensor& tensor) {
@@ -2073,6 +2185,7 @@ inline void read_dit_forward_output(const char*& buffer,
       tensor = tensor.clone();
     }
   }
+  read_string_vector(buffer, output.text_output);
 }
 
 inline void initialize_device_buffer_session(ReadContext& context,
@@ -2104,13 +2217,21 @@ inline void initialize_device_buffer_session(ReadContext& context,
 #endif
 
   auto& session = *context.device_session;
-  torch::Tensor host_input_buffer =
-      torch::from_blob(const_cast<char*>(payload_base),
-                       {static_cast<int64_t>(payload_size)},
-                       torch::TensorOptions()
-                           .dtype(torch::kUInt8)
-                           .device(torch::kCPU)
-                           .pinned_memory(/*pinned_memory=*/true));
+  // POSIX shared-memory pages are not pinned merely because TensorOptions says
+  // so. Own a genuinely pinned staging copy and keep it alive with ForwardInput
+  // until the asynchronous H2D has completed.
+  forward_input.input_host_buffer =
+      torch::empty({static_cast<int64_t>(payload_size)},
+                   torch::TensorOptions()
+                       .dtype(torch::kUInt8)
+                       .device(torch::kCPU)
+                       .pinned_memory(/*pinned_memory=*/true));
+  std::memcpy(
+      forward_input.input_host_buffer.data_ptr(), payload_base, payload_size);
+  const torch::Tensor& host_input_buffer = forward_input.input_host_buffer;
+  context.tensor_cursor =
+      static_cast<const char*>(host_input_buffer.data_ptr()) +
+      tensor_arena_offset;
 
   auto device_options =
       torch::TensorOptions().dtype(torch::kUInt8).device(device);
@@ -2120,7 +2241,7 @@ inline void initialize_device_buffer_session(ReadContext& context,
     auto& capture_lock =
         ::xllm::npu::DeviceCaptureLock::get_instance().get_lock(device.index());
     session.capture_lock_guard.emplace(capture_lock);
-#elif defined(USE_CUDA)
+#elif defined(USE_CUDA) || defined(USE_MUSA)
     if (::xllm::ExecutionConfig::get_instance().enable_graph()) {
       auto& replay_lock =
           ::xllm::cuda::DeviceCaptureLock::get_instance().get_read_lock(
@@ -2241,11 +2362,20 @@ inline void deserialize_forward_input_payload(
       context, input_params.attention.device.kv_cache_start_offsets, stream);
   read_tensor(context, input_params.embedding.input_embedding, stream);
   read_vector(context, input_params.parallel.dp_global_token_nums);
+  read_vector(context, input_params.parallel.raw_dp_global_token_nums);
+  read_vector(context, input_params.parallel.dp_global_kv_max_seq_lens);
   read_vector(context, input_params.parallel.dp_is_decode);
   read_vector(context, input_params.embedding.embedding_ids);
   read_vector(context, input_params.embedding.linear_state_ids);
+  read_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   normalize_linear_state_ids(input_params.embedding.linear_state_ids,
                              input_params.meta.num_sequences);
+  if (materialize_device_buffer &&
+      !input_params.embedding.linear_state_ids.empty()) {
+    input_params.embedding.linear_state_indices =
+        torch::tensor(input_params.embedding.linear_state_ids, torch::kInt)
+            .to(device, /*non_blocking=*/true);
+  }
   read_string_vector(context, input_params.embedding.request_ids);
   read_vector(context, input_params.embedding.extra_token_ids);
   // Keep upstream's root mtp_shifted_token_ids serialization (consumed by
@@ -2393,6 +2523,7 @@ size_t calculate_raw_sample_output_size(const RawSampleOutput& sample) {
   for (const auto& token : sample.tokens) {
     size += calculate_raw_token_size(token);
   }
+  size += get_vector_tensor_size(sample.mm_embeddings);
   return size;
 }
 
@@ -2408,9 +2539,7 @@ size_t calculate_raw_forward_output_size(const RawForwardOutput& output) {
   size += get_vector_size(output.src_seq_idxes);
   size += get_vector_size(output.out_tokens);
   size += get_vector_size(output.out_logprobs);
-  size += type_size<int32_t>;  // prepared_layer_id
-  // mm_embedding_data
-  size += get_vector_tensor_size(output.mm_embeddings);
+  size += type_size<int64_t>;  // prepared_token
   const bool has_dit_forward_output =
       !output.dit_forward_output.tensors.empty();
   size += type_size<bool>;
@@ -2439,6 +2568,7 @@ void write_raw_sample_output(char*& buffer, const RawSampleOutput& sample) {
   for (const auto& token : sample.tokens) {
     write_raw_token(buffer, token);
   }
+  write_vector_tensor(buffer, sample.mm_embeddings);
 }
 
 void read_raw_token(const char*& buffer, RawToken& token) {
@@ -2466,6 +2596,7 @@ void read_raw_sample_output(const char*& buffer, RawSampleOutput& sample) {
   for (auto& token : sample.tokens) {
     read_raw_token(buffer, token);
   }
+  read_vector_tensor(buffer, sample.mm_embeddings);
 }
 
 void deserialize_raw_forward_output(const char* buffer,
@@ -2482,9 +2613,7 @@ void deserialize_raw_forward_output(const char* buffer,
   read_vector(buffer, output.out_tokens);
   read_vector(buffer, output.out_logprobs);
 
-  read_data(buffer, output.prepared_layer_id);
-
-  read_vector_tensor(buffer, output.mm_embeddings);
+  read_data(buffer, output.prepared_token);
 
   bool has_dit_forward_output = false;
   read_data(buffer, has_dit_forward_output);
@@ -2505,9 +2634,8 @@ void serialize_raw_forward_output(const RawForwardOutput& output,
   write_vector(buffer, output.out_tokens);
   write_vector(buffer, output.out_logprobs);
 
-  write_data(buffer, output.prepared_layer_id);
+  write_data(buffer, output.prepared_token);
 
-  write_vector_tensor(buffer, output.mm_embeddings);
   const bool has_dit_forward_output =
       !output.dit_forward_output.tensors.empty();
   write_data(buffer, has_dit_forward_output);
@@ -2597,9 +2725,14 @@ inline void serialize_forward_input_sections(
   write_tensor(context, input_params.attention.device.kv_cache_start_offsets);
   write_tensor(context, input_params.embedding.input_embedding);
   write_vector(context.descriptor, input_params.parallel.dp_global_token_nums);
+  write_vector(context.descriptor,
+               input_params.parallel.raw_dp_global_token_nums);
+  write_vector(context.descriptor,
+               input_params.parallel.dp_global_kv_max_seq_lens);
   write_vector(context.descriptor, input_params.parallel.dp_is_decode);
   write_vector(context.descriptor, input_params.embedding.embedding_ids);
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
+  write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
   // Mirror the read_* layout: write root + embedding mtp paths so the
@@ -2721,15 +2854,16 @@ void convert_tensor_to_raw_output(
     const torch::Tensor& top_tokens,
     const torch::Tensor& top_logprobs,
     const torch::Tensor& embeddings,
-    const std::vector<torch::Tensor>& mm_embeddings,
+    const std::vector<std::vector<torch::Tensor>>& mm_embeddings,
     const std::vector<torch::Tensor>& dit_images,
+    const std::vector<std::string>& dit_text_output,
     const torch::Tensor& expert_load_data,
-    int32_t prepared_layer_id,
+    int64_t prepared_token,
     const torch::Tensor& src_seq_idxes,
     const torch::Tensor& out_tokens,
     const torch::Tensor& out_logprobs,
     RawForwardOutput& raw_output) {
-  raw_output.prepared_layer_id = prepared_layer_id;
+  raw_output.prepared_token = prepared_token;
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     torch::Tensor expert_load_data_flattened =
@@ -2764,10 +2898,13 @@ void convert_tensor_to_raw_output(
   if (embeddings.defined() && embeddings.numel() > 0) {
     num_seqs = std::max(num_seqs, static_cast<int32_t>(embeddings.size(0)));
   }
+  if (!mm_embeddings.empty()) {
+    num_seqs = std::max(num_seqs, static_cast<int32_t>(mm_embeddings.size()));
+  }
 
   raw_output.outputs.reserve(num_seqs);
-  raw_output.mm_embeddings = mm_embeddings;
   raw_output.dit_forward_output.tensors = dit_images;
+  raw_output.dit_forward_output.text_output = dit_text_output;
   for (int32_t output_idx = 0; output_idx < num_seqs; ++output_idx) {
     RawSampleOutput raw_sample_output;
 
@@ -2838,6 +2975,9 @@ void convert_tensor_to_raw_output(
       }
 
       raw_sample_output.tokens.push_back(std::move(raw_token));
+    }
+    if (output_idx < static_cast<int32_t>(mm_embeddings.size())) {
+      raw_sample_output.mm_embeddings = mm_embeddings[output_idx];
     }
     raw_output.outputs.push_back(std::move(raw_sample_output));
   }
@@ -3009,8 +3149,10 @@ bool ForwardSharedMemoryManager::input_write(const ForwardInput& input) {
   return true;
 }
 
-void ForwardSharedMemoryManager::input_read(ForwardInput& input,
-                                            const torch::Device& device) {
+void ForwardSharedMemoryManager::input_read(
+    ForwardInput& input,
+    const torch::Device& device,
+    InputDeviceMaterializationPolicy policy) {
   while (true) {
     if (control_ptr_->version != last_version_) {
       last_version_ = control_ptr_->version;
@@ -3026,11 +3168,24 @@ void ForwardSharedMemoryManager::input_read(ForwardInput& input,
   read_data(data_ptr, total_size);
   bool materialize_device_buffer = false;
 #if defined(USE_NPU)
-  materialize_device_buffer = true;
+  materialize_device_buffer =
+      policy == InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
 #elif defined(USE_CUDA)
   materialize_device_buffer = device.type() == torch::kCUDA;
 #elif defined(USE_MLU)
   materialize_device_buffer = device.type() == torch::kPrivateUse1;
+#endif
+#if defined(USE_NPU)
+  if (policy == InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE) {
+    input.input_host_buffer =
+        torch::empty({static_cast<int64_t>(total_size)},
+                     torch::TensorOptions()
+                         .dtype(torch::kUInt8)
+                         .device(torch::kCPU)
+                         .pinned_memory(/*pinned_memory=*/true));
+    std::memcpy(input.input_host_buffer.data_ptr(), data_ptr, total_size);
+    data_ptr = static_cast<const char*>(input.input_host_buffer.data_ptr());
+  }
 #endif
   deserialize_forward_input_payload(data_ptr,
                                     total_size,
@@ -3049,10 +3204,11 @@ bool ForwardSharedMemoryManager::raw_output_write(
     const torch::Tensor& top_tokens,
     const torch::Tensor& top_logprobs,
     const torch::Tensor& embeddings,
-    const std::vector<torch::Tensor>& mm_embeddings,
+    const std::vector<std::vector<torch::Tensor>>& mm_embeddings,
     const std::vector<torch::Tensor>& dit_images,
+    const std::vector<std::string>& dit_text_output,
     const torch::Tensor& expert_load_data,
-    int32_t prepared_layer_id,
+    int64_t prepared_token,
     const torch::Tensor& src_seq_idxes,
     const torch::Tensor& out_tokens,
     const torch::Tensor& out_logprobs) {
@@ -3064,8 +3220,9 @@ bool ForwardSharedMemoryManager::raw_output_write(
                                embeddings,
                                mm_embeddings,
                                dit_images,
+                               dit_text_output,
                                expert_load_data,
-                               prepared_layer_id,
+                               prepared_token,
                                src_seq_idxes,
                                out_tokens,
                                out_logprobs,

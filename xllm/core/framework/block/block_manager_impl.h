@@ -24,6 +24,7 @@ class BlockManagerImpl : public BlockManager {
  public:
   explicit BlockManagerImpl(const Options& options);
   virtual ~BlockManagerImpl() {
+    prefix_cache_.reset();
     CHECK_EQ(num_free_blocks_, free_blocks_.size() - 1)
         << "Not all blocks have been freed";
   };
@@ -39,6 +40,10 @@ class BlockManagerImpl : public BlockManager {
   // flat-KV / compressed / xtensor leaves; SlidingWindow and Single override.
   std::optional<std::vector<Block>> allocate_for_sequence(
       Sequence* seq,
+      size_t num_tokens) override;
+  std::optional<std::vector<Block>> allocate_for_sequence(
+      Sequence* seq,
+      KVCacheState& kv_state,
       size_t num_tokens) override;
 
   // allocate shared blocks when enable prefix cache
@@ -93,12 +98,20 @@ class BlockManagerImpl : public BlockManager {
   // total blocks num
   size_t num_total_blocks() const override { return free_blocks_.size() - 1; }
 
+ protected:
+  // Flip a block's entry in `usage_ids` from 0 to 1. Returns true if the flip
+  // happened; false if the entry was already 1 (i.e. block was already marked
+  // used). Shared with subclasses (e.g. SlidingWindowBlockManager) that need
+  // to reproduce the base allocate_shared refcount bookkeeping over their own
+  // custom probe path. Static-friendly signature keeps callers free of `this`.
+  static bool mark_used(std::vector<uint8_t>* usage_ids, int32_t block_id);
+
  private:
   // check if has enough slots, if not, try to evict some blocks
   // from the prefix cache
   bool has_enough_blocks(uint32_t num_blocks);
 
- private:
+ protected:
   // prefix cache
   std::unique_ptr<PrefixCache> prefix_cache_;
 

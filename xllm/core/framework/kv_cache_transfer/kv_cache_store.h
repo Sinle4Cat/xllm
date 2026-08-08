@@ -1,6 +1,6 @@
 #pragma once
 
-#include <Mooncake/mooncake-store/include/client.h>
+#include <Mooncake/mooncake-store/include/client_service.h>
 #include <glog/logging.h>
 
 #include <string>
@@ -74,6 +74,7 @@ class KVCacheStore {
   uint64_t k_cache_size_per_block_ = 0;
   uint64_t v_cache_size_per_block_ = 0;
   uint64_t index_cache_size_per_block_ = 0;
+  uint64_t index_cache_scale_size_per_block_ = 0;
 
   std::shared_ptr<mooncake::Client> client_ptr_;
 };

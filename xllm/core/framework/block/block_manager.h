@@ -67,6 +67,11 @@ class BlockManager {
     // leaves are wrapped in ConcurrentBlockManagerImpl when this (or
     // enable_disagg_pd) is set.
     PROPERTY(bool, enable_kvcache_store) = false;
+    // Whether host prefix-cache offload (host_blocks_factor > 1) is enabled.
+    // The D2H offload-completion callback frees device/host blocks from a folly
+    // executor thread, so leaves are wrapped in ConcurrentBlockManagerImpl when
+    // this is set to make those mutations thread-safe against the scheduler.
+    PROPERTY(bool, enable_host_offload) = false;
     // xtensor (VMM) KV leaf parameters. When enable_xtensor is set, the KV leaf
     // is an XTensorBlockManagerImpl instead of a flat BlockManagerImpl; these
     // carry the construction args the spec builder needs.
@@ -74,6 +79,22 @@ class BlockManager {
     PROPERTY(int64_t, num_layers) = 0;
     PROPERTY(int64_t, slot_size) = 0;
     PROPERTY(std::string, model_id);
+    // Linear-state (Qwen3.5 GDN) resource leaf. When enable_linear_state is
+    // set, build_composite_leaves appends a LINEAR leaf on top of the KV
+    // family. linear_state_num_slots is the total physical slot count [0, N)
+    // for the unified slot pool. Both are ignored unless linear state is on.
+    PROPERTY(bool, enable_linear_state) = false;
+    PROPERTY(int32_t, linear_state_num_slots) = 0;
+    // Number of speculative tokens for MTP decode (passed from
+    // runtime::Options). Used by CompositeBlockManager to adjust SWA block
+    // release accounting.
+    PROPERTY(uint32_t, num_speculative_tokens) = 0;
+    // Role flag: true on the DECODE side of disaggregated PD. In that role
+    // the composite skips prefix cache on leaves whose data forward never
+    // reads before P overwrites it (SWA, LINEAR). Same predicate governs
+    // future host offload participation -- see
+    // leaf_participates_in_prefix_cache in composite_block_manager.cpp.
+    PROPERTY(bool, instance_is_decode) = false;
   };
 
   explicit BlockManager(Options options) : options_(options) {}
@@ -83,6 +104,22 @@ class BlockManager {
 
   virtual std::vector<Block> allocate(size_t num_blocks) = 0;
 
+  // Returns the shared-prefix vector for the caller's Sequence. The vector's
+  // shape is leaf-defined:
+  //   - KV / C4 / C128 return a solid prefix `[valid, valid, ..., valid]`;
+  //     length in blocks × block_size() is the matched-token count.
+  //   - SWA returns a gap-tolerant `[opt_valid, ..., valid_last]` where the
+  //     length equals last-hit-index + 1 in base blocks (attention only reads
+  //     the last swa_blocks_per_seq base blocks; the composite enforces the
+  //     tail-continuity check).
+  //   - LINEAR (constraint leaf) returns `[inv, inv, ..., deepest_valid]` at
+  //     chunk-stride granularity; the deepest slot is the class-A checkpoint
+  //     restore source, and length in chunks × block_size() is the recoverable
+  //     prefix length. The composite pulls that block out and never mounts
+  //     LINEAR blocks into the sequence's live LINEAR vector.
+  //
+  // Matched-token count is `returned.size() * block_size()`; callers derive
+  // it directly, so no separate out-param is needed.
   virtual std::vector<Block> allocate_shared(
       const Slice<int32_t>& token_ids,
       const Slice<Block>& existed_shared_blocks = {},
@@ -112,7 +149,8 @@ class BlockManager {
   // get number of slots per block
   size_t block_size() const { return options_.block_size(); }
 
-  // The block category this leaf serves (KV / SWA / C4 / C128 / SINGLE). A leaf
+  // The block category this leaf serves (KV / SWA / C4 / C128 / EMBEDDING /
+  // LINEAR). A leaf
   // reads its own held-block count from the sequence under this type, and the
   // CompositeBlockManager inserts the returned blocks into the sequence under
   // this type. Carried via Options by the spec builder.
@@ -146,11 +184,20 @@ class BlockManager {
       Sequence* seq,
       size_t num_tokens) = 0;
 
+  // State-explicit growth for hierarchy-managed Host/HBM leaves. Unlike the
+  // Sequence overload, this does not assume that blocks live in kv_state().
+  virtual std::optional<std::vector<Block>> allocate_for_sequence(
+      Sequence* seq,
+      KVCacheState& kv_state,
+      size_t num_tokens) = 0;
+
   // Sliding-window hook: release leading blocks that have slid out of the
   // window. The composite calls this on every leaf AFTER a successful
   // allocate_sequence commit; non-SWA leaves keep the empty default (no-op).
   // Running post-commit means a failed round never releases existing blocks.
   virtual void release_out_of_window(Sequence* /*seq*/) {}
+  virtual void release_out_of_window(Sequence* /*seq*/,
+                                     KVCacheState& /*kv_state*/) {}
 
   // Post-construction init hook: only the xtensor leaf needs it (KV tensors
   // must be created on the worker before VMM physical pages can be mapped to

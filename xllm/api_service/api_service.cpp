@@ -24,6 +24,7 @@ limitations under the License.
 
 #include "api_service/chat_json_parser.h"
 #include "api_service/completion_json_parser.h"
+#include "api_service/request_id.h"
 #include "api_service/service_impl_factory.h"
 #include "api_service/serving_mode.h"
 #include "call.h"
@@ -44,6 +45,7 @@ limitations under the License.
 #include "image_generation.pb.h"
 #include "models.pb.h"
 #include "service_impl_factory.h"
+#include "text_generation.pb.h"
 #include "video_generation.pb.h"
 #include "xllm_metrics.h"
 namespace xllm {
@@ -109,13 +111,15 @@ void process_typed_brpc_request(std::unique_ptr<Service>& service_impl,
 
 APIService::APIService(Master* master,
                        const std::vector<std::string>& model_names,
+                       const std::vector<std::string>& model_repository_names,
                        const std::vector<std::string>& model_versions)
     : master_(master) {
   set_model_master(model_names[0], master);
   if (::xllm::DistributedConfig::get_instance().node_rank() != 0) {
     return;
   }
-  ServiceImplFactory::create(this, master, model_names, model_versions);
+  ServiceImplFactory::create(
+      this, master, model_names, model_repository_names, model_versions);
   register_chat_completions_handler();
 }
 
@@ -196,6 +200,7 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
       google::protobuf::Arena::CreateMessage<proto::CompletionResponse>(arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
 
   auto [preprocess_status, processed_json] =
       preprocess_completion_prompt(ctrl->request_attachment().to_string());
@@ -216,8 +221,13 @@ void APIService::CompletionsHttp(::google::protobuf::RpcController* controller,
     return;
   }
 
-  std::shared_ptr<Call> call = std::make_shared<CompletionCall>(
-      ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+  std::shared_ptr<Call> call =
+      std::make_shared<CompletionCall>(ctrl,
+                                       done_guard.release(),
+                                       req_pb,
+                                       resp_pb,
+                                       arena != nullptr,
+                                       /*is_http_request=*/true);
   if (completion_service_impl_) {
     completion_service_impl_->process_async(call);
   } else if (rec_completion_service_impl_) {
@@ -269,6 +279,7 @@ void APIService::SampleHttp(::google::protobuf::RpcController* controller,
   }
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
   if (!sample_service_impl_) {
     ctrl->SetFailed(kSampleNotSupportedError);
     return;
@@ -291,8 +302,13 @@ void APIService::SampleHttp(::google::protobuf::RpcController* controller,
     return;
   }
 
-  std::shared_ptr<Call> call = std::make_shared<SampleCall>(
-      ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+  std::shared_ptr<Call> call =
+      std::make_shared<SampleCall>(ctrl,
+                                   done_guard.release(),
+                                   req_pb,
+                                   resp_pb,
+                                   arena != nullptr,
+                                   /*is_http_request=*/true);
   sample_service_impl_->process_async(call);
 }
 
@@ -359,8 +375,12 @@ void chat_completions_http_impl(std::unique_ptr<Service>& service,
     return;
   }
 
-  auto call = std::make_shared<ChatCall>(
-      ctrl, guard.release(), req_pb, resp_pb, arena != nullptr /*use_arena*/);
+  auto call = std::make_shared<ChatCall>(ctrl,
+                                         guard.release(),
+                                         req_pb,
+                                         resp_pb,
+                                         /*use_arena=*/arena != nullptr,
+                                         /*is_http_request=*/true);
   service->process_async(call);
 }
 
@@ -434,12 +454,13 @@ void APIService::ChatCompletionsHttp(
     return;
   }
 
+  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+
   if (!chat_completions_handler_) {
     LOG(ERROR) << "No chat completions handler registered";
     return;
   }
-
-  auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
   chat_completions_handler_(done_guard, ctrl, request, response);
 }
 
@@ -507,6 +528,7 @@ void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
           arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
@@ -523,8 +545,13 @@ void handle_embedding_request(std::unique_ptr<Service>& embedding_service_impl_,
     req_pb->set_encoding_format("float");
   }
 
-  std::shared_ptr<Call> call = std::make_shared<EmbeddingCall>(
-      ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+  std::shared_ptr<Call> call =
+      std::make_shared<EmbeddingCall>(ctrl,
+                                      done_guard.release(),
+                                      req_pb,
+                                      resp_pb,
+                                      arena != nullptr,
+                                      /*is_http_request=*/true);
   embedding_service_impl_->process_async(call);
 }
 }  // namespace
@@ -580,6 +607,7 @@ void APIService::ImageGenerationHttp(
           arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
@@ -591,8 +619,12 @@ void APIService::ImageGenerationHttp(
     return;
   }
   std::shared_ptr<ImageGenerationCall> call =
-      std::make_shared<ImageGenerationCall>(
-          ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+      std::make_shared<ImageGenerationCall>(ctrl,
+                                            done_guard.release(),
+                                            req_pb,
+                                            resp_pb,
+                                            arena != nullptr,
+                                            /*is_http_request=*/true);
   image_generation_service_impl_->process_async(call);
 }
 
@@ -634,6 +666,7 @@ void APIService::AudioGenerationHttp(
           arena);
 
   brpc::Controller* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
@@ -645,9 +678,72 @@ void APIService::AudioGenerationHttp(
     return;
   }
   std::shared_ptr<AudioGenerationCall> call =
-      std::make_shared<AudioGenerationCall>(
-          ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+      std::make_shared<AudioGenerationCall>(ctrl,
+                                            done_guard.release(),
+                                            req_pb,
+                                            resp_pb,
+                                            arena != nullptr,
+                                            /*is_http_request=*/true);
   audio_generation_service_impl_->process_async(call);
+}
+
+void APIService::TextGeneration(::google::protobuf::RpcController* controller,
+                                const proto::TextGenerationRequest* request,
+                                proto::TextGenerationResponse* response,
+                                ::google::protobuf::Closure* done) {
+  process_typed_brpc_request<TextGenerationCall, TextGenerationServiceImpl>(
+      text_generation_service_impl_,
+      controller,
+      request,
+      response,
+      done,
+      "TextGeneration");
+}
+
+void APIService::TextGenerationHttp(
+    ::google::protobuf::RpcController* controller,
+    const proto::HttpRequest* request,
+    proto::HttpResponse* response,
+    ::google::protobuf::Closure* done) {
+  xllm::ClosureGuard done_guard(
+      done,
+      [](void* /*unused*/) { request_in_metric(nullptr); },
+      [controller](void* /*unused*/) {
+        request_out_metric(static_cast<void*>(controller));
+      });
+  if (!request || !response || !controller) {
+    LOG(ERROR) << "brpc request | response | controller is null";
+    return;
+  }
+
+  auto arena = GetArenaWithCheck<TextGenerationCall>(response);
+  auto req_pb =
+      google::protobuf::Arena::CreateMessage<proto::TextGenerationRequest>(
+          arena);
+  auto resp_pb =
+      google::protobuf::Arena::CreateMessage<proto::TextGenerationResponse>(
+          arena);
+
+  brpc::Controller* ctrl = static_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
+  std::string error;
+  json2pb::Json2PbOptions options;
+  butil::IOBuf& buf = ctrl->request_attachment();
+  butil::IOBufAsZeroCopyInputStream iobuf_stream(buf);
+  bool st = json2pb::JsonToProtoMessage(&iobuf_stream, req_pb, options, &error);
+  if (!st) {
+    ctrl->SetFailed(error);
+    LOG(ERROR) << "parse json to proto failed: " << error;
+    return;
+  }
+  std::shared_ptr<TextGenerationCall> call =
+      std::make_shared<TextGenerationCall>(ctrl,
+                                           done_guard.release(),
+                                           req_pb,
+                                           resp_pb,
+                                           arena != nullptr,
+                                           /*is_http_request=*/true);
+  text_generation_service_impl_->process_async(call);
 }
 
 void APIService::VideoGeneration(::google::protobuf::RpcController* controller,
@@ -688,6 +784,7 @@ void APIService::VideoGenerationHttp(
           arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
@@ -699,8 +796,12 @@ void APIService::VideoGenerationHttp(
     return;
   }
   std::shared_ptr<VideoGenerationCall> call =
-      std::make_shared<VideoGenerationCall>(
-          ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+      std::make_shared<VideoGenerationCall>(ctrl,
+                                            done_guard.release(),
+                                            req_pb,
+                                            resp_pb,
+                                            arena != nullptr,
+                                            /*is_http_request=*/true);
   video_generation_service_impl_->process_async(call);
 }
 
@@ -734,6 +835,7 @@ void APIService::RerankHttp(::google::protobuf::RpcController* controller,
       google::protobuf::Arena::CreateMessage<proto::RerankResponse>(arena);
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
   std::string error;
   json2pb::Json2PbOptions options;
   butil::IOBuf& buf = ctrl->request_attachment();
@@ -745,8 +847,13 @@ void APIService::RerankHttp(::google::protobuf::RpcController* controller,
     return;
   }
 
-  std::shared_ptr<Call> call = std::make_shared<RerankCall>(
-      ctrl, done_guard.release(), req_pb, resp_pb, arena != nullptr);
+  std::shared_ptr<Call> call =
+      std::make_shared<RerankCall>(ctrl,
+                                   done_guard.release(),
+                                   req_pb,
+                                   resp_pb,
+                                   arena != nullptr,
+                                   /*is_http_request=*/true);
   rerank_service_impl_->process_async(call);
 }
 
@@ -863,8 +970,12 @@ void handle_anthropic_messages(std::unique_ptr<AnthropicServiceImpl>& service,
     return;
   }
 
-  auto call = std::make_shared<AnthropicCall>(
-      ctrl, guard.release(), req_pb, resp_pb, arena != nullptr /*use_arena*/);
+  auto call = std::make_shared<AnthropicCall>(ctrl,
+                                              guard.release(),
+                                              req_pb,
+                                              resp_pb,
+                                              /*use_arena=*/arena != nullptr,
+                                              /*is_http_request=*/true);
 
   service->process_async(call);
 }
@@ -889,6 +1000,7 @@ void APIService::AnthropicMessagesHttp(
   }
 
   auto ctrl = reinterpret_cast<brpc::Controller*>(controller);
+  api_service::ensure_http_x_request_id(ctrl);
 
   if (anthropic_service_impl_) {
     handle_anthropic_messages(

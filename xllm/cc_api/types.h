@@ -37,8 +37,8 @@ struct XLLM_CAPI_EXPORT XLLM_ChatMessage {
 struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
   bool enable_chunked_prefill = false;
 
-  // Whether to enable prefill-only sequence parallel
-  bool enable_prefill_sp = false;
+  // Context parallel size. Backend and model support is required.
+  int32_t cp_size = 1;
 
   bool enable_prefix_cache = false;
 
@@ -137,9 +137,6 @@ struct XLLM_CAPI_EXPORT XLLM_InitLLMOptions {
   // draft hf model path to the model file
   std::optional<std::string> draft_model = std::nullopt;
 
-  // Devices to run the draft model on, e.g. npu:0, npu:0,npu:1
-  std::optional<std::string> draft_devices = std::nullopt;
-
   // Index ID for internal server ID, which must be set different values
   // if the model supports multiple version or there are multiple models.
   int64_t server_idx = 0;
@@ -160,6 +157,10 @@ struct XLLM_CAPI_EXPORT XLLM_RequestParams {
 
   // Whether to skip special tokens in the output text. default = true.
   bool skip_special_tokens = true;
+
+  // Whether to include stop strings or stop tokens in the output text.
+  // default = false.
+  bool include_stop_str_in_output = false;
 
   // Number of completions to return for each prompt. default = 1
   uint32_t n = 1;
@@ -212,7 +213,6 @@ struct XLLM_CAPI_EXPORT XLLM_RequestParams {
   float temperature = 0.0;
 
   // The list of strings to stop generating further tokens.
-  // the output will contain the stop string.
   std::optional<std::vector<std::string>> stop;
 
   // The list of token ids to stop generating further tokens.

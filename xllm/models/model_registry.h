@@ -48,7 +48,8 @@ using DiTModelFactory =
 using MultimodalProcessorFactory =
     std::function<std::unique_ptr<MultimodalProcessorBase>(
         const ModelArgs& model_args,
-        std::shared_ptr<Tokenizer> tokenizer)>;
+        std::shared_ptr<Tokenizer> tokenizer,
+        const TokenizerArgs& tokenizer_args)>;
 
 using ModelArgsLoader =
     std::function<bool(const JsonReader& json, ModelArgs* args)>;
@@ -58,6 +59,13 @@ using QuantArgsLoader =
 
 using TokenizerArgsLoader =
     std::function<bool(const JsonReader& json, TokenizerArgs* args)>;
+
+// Model-advertised CP mode: NONE or NPU_MODEL (shard after embed / merge
+// before LM head).
+enum class CpShardingMode : int8_t {
+  NONE = 0,
+  NPU_MODEL = 1,
+};
 
 // TODO: add default args loader.
 struct ModelMeta {
@@ -69,6 +77,7 @@ struct ModelMeta {
   ModelArgsLoader model_args_loader;
   QuantArgsLoader quant_args_loader;
   TokenizerArgsLoader tokenizer_args_loader;
+  CpShardingMode cp_sharding_mode = CpShardingMode::NONE;
 };
 
 // Model registry is a singleton class that registers all models with the
@@ -89,6 +98,9 @@ class ModelRegistry {
   static void register_dit_model_factory(const std::string& name,
                                          DiTModelFactory factory);
 
+  static void register_model_backend(const std::string& name,
+                                     const std::string& backend);
+
   static void register_model_args_loader(const std::string& name,
                                          ModelArgsLoader loader);
 
@@ -101,6 +113,15 @@ class ModelRegistry {
   static void register_multimodal_processor_factory(
       const std::string& name,
       MultimodalProcessorFactory factory);
+
+  // Register the model-side CP sharding mode advertised by `name`. Defaults to
+  // NONE for any unregistered model.
+  static void register_cp_sharding_mode(const std::string& name,
+                                        CpShardingMode mode);
+
+  // Read-only query of the registered CP sharding mode. Returns NONE when
+  // `name` is unknown or the model did not opt into model-side CP.
+  static CpShardingMode get_cp_sharding_mode(const std::string& name);
 
   static CausalLMFactory get_causallm_factory(const std::string& name);
 
@@ -131,6 +152,13 @@ class ModelRegistry {
 bool resolve_model_registration_name(const std::string& model_type,
                                      std::string* resolved_name,
                                      std::string* error_message = nullptr);
+
+// Lazily register the NPU ATB model-side CP pipeline capability for the four
+// supported models (deepseek_v32, deepseek_v32_mtp, glm_moe_dsa,
+// glm_moe_dsa_mtp) and return whether `resolved_name` is CP-capable.
+// Idempotent. `resolved_name` must already be backend-resolved (see
+// resolve_model_registration) so qwen3_atb etc. are not misclassified.
+bool is_npu_model_cp_capable(const std::string& resolved_name);
 
 bool resolve_model_registration(const std::string& model_type,
                                 const std::string& requested_npu_kernel_backend,
@@ -207,17 +235,27 @@ std::unique_ptr<DiTModel> create_dit_model(const DiTModelContext& context);
 #define REGISTER_DIT_MODEL(ModelType, ModelClass) \
   REGISTER_DIT_MODEL_WITH_VARNAME(ModelType, ModelType, ModelClass)
 
-#define REGISTER_MULTIMODAL_PROCESSOR_WITH_VARNAME(                      \
-    VarName, ModelType, ProcessorClass)                                  \
-  const bool VarName##_multimodal_processor_registered = []() {          \
-    ModelRegistry::register_multimodal_processor_factory(                \
-        #ModelType,                                                      \
-        [](const ModelArgs& model_args,                                  \
-           std::shared_ptr<Tokenizer> tokenizer) {                       \
-          return std::make_unique<ProcessorClass>(model_args,            \
-                                                  std::move(tokenizer)); \
-        });                                                              \
+#define REGISTER_MODEL_BACKEND_WITH_VARNAME(VarName, ModelType, Backend) \
+  const bool VarName##_backend_registered = []() {                       \
+    ModelRegistry::register_model_backend(#ModelType, Backend);          \
     return true;                                                         \
+  }()
+
+#define REGISTER_MODEL_BACKEND(ModelType, Backend) \
+  REGISTER_MODEL_BACKEND_WITH_VARNAME(ModelType, ModelType, Backend)
+
+#define REGISTER_MULTIMODAL_PROCESSOR_WITH_VARNAME(              \
+    VarName, ModelType, ProcessorClass)                          \
+  const bool VarName##_multimodal_processor_registered = []() {  \
+    ModelRegistry::register_multimodal_processor_factory(        \
+        #ModelType,                                              \
+        [](const ModelArgs& model_args,                          \
+           std::shared_ptr<Tokenizer> tokenizer,                 \
+           const TokenizerArgs& tokenizer_args) {                \
+          return std::make_unique<ProcessorClass>(               \
+              model_args, std::move(tokenizer), tokenizer_args); \
+        });                                                      \
+    return true;                                                 \
   }()
 
 #define REGISTER_MULTIMODAL_PROCESSOR(ModelType, ProcessorClass) \

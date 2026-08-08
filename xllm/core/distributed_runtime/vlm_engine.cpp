@@ -26,6 +26,7 @@ limitations under the License.
 #include <chrono>
 #include <cstdlib>
 #include <memory>
+#include <optional>
 
 #include "common/device_monitor.h"
 #include "common/interruption_bus.h"
@@ -34,9 +35,10 @@ limitations under the License.
 #include "core/distributed_runtime/master.h"
 #include "core/framework/config/execution_config.h"
 #include "core/framework/config/kv_cache_config.h"
-#include "core/framework/config/service_config.h"
+#include "core/framework/config/scheduler_config.h"
 #include "framework/kv_cache/kv_cache_estimation.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/kv_cache/kv_cache_utils.h"
 #include "framework/model/model_args.h"
 #include "framework/model_loader.h"
 #include "framework/parallel_state/parallel_state.h"
@@ -256,6 +258,8 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
   KVCacheEstimateOptions estimate_options;
   estimate_options.dtype = dtype_;
   estimate_options.kv_cache_dtype = options_.kv_cache_dtype();
+  estimate_options.indexer_cache_dtype =
+      ::xllm::KVCacheConfig::get_instance().indexer_cache_dtype();
   estimate_options.cache_size_in_bytes = cache_size_in_bytes;
   estimate_options.block_size = options_.block_size();
   estimate_options.world_size = dp_local_tp_size_;
@@ -264,8 +268,8 @@ KVCacheCapacity VLMEngine::estimate_kv_cache_capacity() {
   estimate_options.n_local_linear_v_heads = n_local_linear_v_heads_;
   estimate_options.max_seqs_per_batch =
       static_cast<int64_t>(options_.max_seqs_per_batch());
-  estimate_options.max_concurrent_requests = static_cast<int64_t>(
-      ::xllm::ServiceConfig::get_instance().max_concurrent_requests());
+  estimate_options.max_linear_state_cache_slots =
+      options_.max_linear_state_cache_slots();
   estimate_options.is_draft_engine = options_.is_draft_engine();
   estimate_options.enable_prefix_cache =
       ::xllm::KVCacheConfig::get_instance().enable_prefix_cache();
@@ -290,15 +294,37 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
             << ", blocks: " << kv_cache_cap.n_blocks()
             << ", slot_size: " << kv_cache_cap.slot_size()
             << ", index_slot_size: " << kv_cache_cap.index_slot_size()
+            << ", indexer_layers: " << kv_cache_cap.num_indexer_layers()
             << ", scale_slot_size: " << kv_cache_cap.scale_slot_size()
             << ", linear_slot_size: " << kv_cache_cap.linear_slot_size()
             << ", linear_blocks: " << kv_cache_cap.num_linear_state_blocks()
+            << ", linear_state_slots: "
+            << (has_linear_attention_layers(args_)
+                    ? kv_cache_cap.num_linear_state_blocks()
+                    : 0)
+            << ", max_linear_state_cache_slots: "
+            << options_.max_linear_state_cache_slots()
             << ", reserved_linear_bytes: "
             << readable_size(kv_cache_cap.linear_cache_size_in_bytes())
             << ", n_layers: " << kv_cache_cap.n_layers()
             << ", kv_cache_dtype: " << options_.kv_cache_dtype();
 
   const int32_t block_size = static_cast<int32_t>(kv_cache_cap.block_size());
+  const bool enable_linear_attention = has_linear_attention_layers(args_);
+
+  if (options_.enable_prefix_cache() && enable_linear_attention) {
+    const auto& scheduler_config = ::xllm::SchedulerConfig::get_instance();
+    CHECK(scheduler_config.enable_chunked_prefill())
+        << "Linear-attention prefix cache requires block-aligned chunked "
+           "prefill to save matching linear states. Please set "
+           "--enable_chunked_prefill=true in your config.";
+    CHECK(scheduler_config.max_tokens_per_chunk_for_prefill() % block_size == 0)
+        << "linear-attention prefix cache saves linear-state checkpoints at "
+           "chunk-end boundaries, so max_tokens_per_chunk_for_prefill ("
+        << scheduler_config.max_tokens_per_chunk_for_prefill()
+        << ") must be a multiple of block_size (" << block_size << ").";
+  }
+
   const KVCacheShape kv_cache_shape(kv_cache_cap, args_, dp_local_tp_size_);
 
   kv_cache_shape.print_shapes();
@@ -308,12 +334,24 @@ bool VLMEngine::allocate_kv_cache(const KVCacheCapacity& kv_cache_cap) {
   options.num_blocks(kv_cache_cap.n_blocks())
       .host_num_blocks(0)  // no host cache for vlm engine currently.
       .block_size(block_size)
-      .enable_linear_state(has_linear_attention_layers(args_))
+      .enable_linear_state(enable_linear_attention)
       .enable_prefix_cache(options_.enable_prefix_cache())
       .enable_disagg_pd(options_.enable_disagg_pd())
       .hasher_type(BlockHasherType::MM)
-      .max_concurrent_requests(
-          ::xllm::ServiceConfig::get_instance().max_concurrent_requests());
+      .max_seqs_per_batch(options_.max_seqs_per_batch())
+      .num_embedding_blocks(
+          static_cast<uint32_t>(kv_cache_shape.key_cache_shape()[0]))
+      // DECODE-side prefix cache participation is per-leaf and gated by the
+      // predicate in composite_block_manager.cpp; mirror llm_engine so a
+      // linear-attention VLM decode instance disables the LINEAR prefix cache.
+      .instance_is_decode(options_.instance_role() == InstanceRole::DECODE);
+  if (enable_linear_attention) {
+    // The unified linear-state slot pool spans all physical slots [0, N);
+    // id 0 is reserved as padding and ids [1, N) serve live and checkpoint
+    // rows interchangeably under reference counting.
+    options.linear_state_num_slots(
+        static_cast<int32_t>(kv_cache_cap.num_linear_state_blocks()));
+  }
   kv_cache_manager_ = std::make_unique<BlockManagerPool>(options, dp_size_);
 
   // init kv cache for each worker in parallel
@@ -468,6 +506,7 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
   batched_inputs.reserve(dp_size_);
   // some dp related variables
   std::vector<int32_t> dp_global_token_nums(dp_size_);
+  std::vector<int32_t> dp_global_kv_max_seq_lens(dp_size_);
   std::vector<int32_t> dp_is_decode(dp_size_, 0);
   // when enable dp, we need to check the forward type of each batch
   // and set the empty forward type of each batch to the same value as the first
@@ -487,6 +526,8 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
     }
     dp_global_token_nums[dp_rank] =
         static_cast<int32_t>(batched_inputs[dp_rank].host_token_ids().numel());
+    dp_global_kv_max_seq_lens[dp_rank] =
+        batched_inputs[dp_rank].input_params.meta.kv_max_seq_len;
     if (batch_forward_type.is_empty() &&
         !batched_inputs[dp_rank]
              .input_params.meta.batch_forward_type.is_empty()) {
@@ -499,10 +540,26 @@ std::vector<ForwardInput> VLMEngine::prepare_inputs(std::vector<Batch>& batch) {
         batched_inputs[dp_rank].input_params.meta.q_max_seq_len == 1;
   }
 
+  // Empty DP ranks inherit decode below and use fake inputs in WorkerImpl.
+  if (::xllm::ExecutionConfig::get_instance().enable_graph() &&
+      batch_forward_type.is_decode()) {
+    for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      if (batched_inputs[dp_rank]
+              .input_params.meta.batch_forward_type.is_empty() &&
+          dp_global_token_nums[dp_rank] == 0) {
+        dp_is_decode[dp_rank] = 1;
+      }
+    }
+  }
+
   // update dp_global_token_nums and batch_forward_type
   for (auto dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
     batched_inputs[dp_rank].input_params.parallel.dp_global_token_nums =
         dp_global_token_nums;
+    batched_inputs[dp_rank].input_params.parallel.raw_dp_global_token_nums =
+        dp_global_token_nums;
+    batched_inputs[dp_rank].input_params.parallel.dp_global_kv_max_seq_lens =
+        dp_global_kv_max_seq_lens;
     batched_inputs[dp_rank].input_params.parallel.dp_is_decode = dp_is_decode;
     if (batched_inputs[dp_rank]
             .input_params.meta.batch_forward_type.is_empty()) {

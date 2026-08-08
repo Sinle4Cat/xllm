@@ -93,9 +93,7 @@ class LLM:
         model: str,
         task: str = "generate",
         runner: Optional[str] = None,
-        devices: str = 'npu:0',
         draft_model: Optional[str] = '',
-        draft_devices: Optional[str] = 'npu:0',
         limit_image_per_prompt: int = 8,
         block_size: int = 128,
         max_cache_size: int = 0,
@@ -111,13 +109,13 @@ class LLM:
         rank_tablefile: str = '',
         expert_parallel_degree: int = 0,
         enable_chunked_prefill: bool = True,
-        enable_prefill_sp: bool = False,
         master_node_addr: str = '',
         instance_role: str = 'DEFAULT',
         transfer_listen_port: int = 26000,
         nnodes: int = 1,
         node_rank: int = 0,
         dp_size: int = 1,
+        cp_size: int = 1,
         ep_size: int = 1,
         instance_name: str = '',
         enable_disagg_pd: bool = False,
@@ -165,9 +163,7 @@ class LLM:
         options = Options()
         options.model_path = model
         options.task_type = task
-        options.devices = devices
         options.draft_model_path = draft_model
-        options.draft_devices = draft_devices
         options.backend = backend
         options.limit_image_per_prompt = limit_image_per_prompt
         options.block_size = block_size
@@ -184,7 +180,6 @@ class LLM:
         options.rank_tablefile = rank_tablefile
         options.expert_parallel_degree = expert_parallel_degree
         options.enable_chunked_prefill = enable_chunked_prefill
-        options.enable_prefill_sp = enable_prefill_sp
         if master_node_addr:
             options.master_node_addr = master_node_addr
         else:
@@ -194,6 +189,7 @@ class LLM:
         options.nnodes = nnodes
         options.node_rank = node_rank
         options.dp_size = dp_size
+        options.cp_size = cp_size
         options.ep_size = ep_size
         options.instance_name = instance_name
         options.enable_disagg_pd = enable_disagg_pd

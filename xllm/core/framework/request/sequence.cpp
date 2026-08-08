@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/framework/config/rec_config.h"
 #include "core/framework/multimodal/embedding_output.h"
 #include "core/framework/multimodal/mm_visitor.h"
+#include "core/framework/prefix_cache/block_hasher.h"
 #include "core/framework/tokenizer/rec_tokenizer.h"
 #include "core/framework/tokenizer/tokenizer.h"
 #include "core/util/slice.h"
@@ -234,6 +235,7 @@ Sequence::Sequence(size_t index,
       latest_generate_time_(absl::Now()),
       sequence_params_(seq_params),
       decoder_(std::move(decoder)),
+      stream_output_token_offset_(decoder_.output_offset()),
       termination_flag_(std::make_shared<std::atomic<int32_t>>(INT32_MAX)),
       request_id_(seq_params.request_id) {
   if (is_onerec_model()) {
@@ -275,6 +277,8 @@ Sequence::Sequence(const Sequence& other)
     : index_(other.index_),
       kv_state_(other.kv_state_),
       host_kv_state_(other.host_kv_state_),
+      effective_restore_tokens_(other.effective_restore_tokens_),
+      host_cache_copy_units_(other.host_cache_copy_units_),
       latest_generate_time_(other.latest_generate_time_),
       time_to_first_token_latency_seconds_(
           other.time_to_first_token_latency_seconds_),
@@ -282,6 +286,7 @@ Sequence::Sequence(const Sequence& other)
       is_cache_block_for_prefill_(other.is_cache_block_for_prefill_),
       sequence_params_(other.sequence_params_),
       decoder_(other.decoder_),
+      stream_output_token_offset_(other.stream_output_token_offset_),
       tokens_(other.tokens_),
       input_embedding_(other.input_embedding_),
       mm_data_(other.mm_data_),
@@ -291,14 +296,17 @@ Sequence::Sequence(const Sequence& other)
       num_tokens_(other.num_tokens_),
       token_to_count_map_(other.token_to_count_map_),
       num_prompt_tokens_(other.num_prompt_tokens_),
-      block_hashes_(other.block_hashes_),
+      block_hashes_by_stride_(other.block_hashes_by_stride_),
       hash_block_size_(other.hash_block_size_),
+      linear_state_hashes_(other.linear_state_hashes_),
+      linear_hash_stride_(other.linear_hash_stride_),
       onerec_state_(other.onerec_state_),
       volatile_num_prompt_tokens_(other.volatile_num_prompt_tokens_),
       request_id_(other.request_id_),
       finished_(other.finished_),
       finish_status_invalidated_(other.finish_status_invalidated_),
       finish_reason_(other.finish_reason_),
+      matched_stop_token_count_(other.matched_stop_token_count_),
       closed_(other.closed_),
       dp_rank_(other.dp_rank_),
       cur_generated_token_idx_(other.cur_generated_token_idx_),
@@ -309,11 +317,16 @@ Sequence::Sequence(const Sequence& other)
   logprob_state_ = std::make_unique<LogprobState>(*other.logprob_state_);
   // A forked sequence (beam / best_of) shares the prompt KV prefix by
   // ref-counting those blocks, but its linear-state / embedding resource block
-  // is private: drop the copied Single block so this sequence allocates its own
-  // on the next allocate. Preserves the pre-map behavior where single_block_
-  // was never copied by this constructor.
-  kv_state_.erase_blocks(BlockType::SINGLE);
-  host_kv_state_.erase_blocks(BlockType::SINGLE);
+  // is private: drop the copied Embedding and Linear blocks so this sequence
+  // allocates its own on the next allocate. Preserves the pre-map behavior
+  // where the private slot was never copied by this constructor.
+  // TODO: Linear-attention beam search is not supported yet. A beam child that
+  // keeps its parent's KV progress must clone the parent's recurrent state into
+  // its newly allocated private LINEAR slot before the next forward.
+  kv_state_.erase_blocks(BlockType::EMBEDDING);
+  kv_state_.erase_blocks(BlockType::LINEAR);
+  host_kv_state_.erase_blocks(BlockType::EMBEDDING);
+  host_kv_state_.erase_blocks(BlockType::LINEAR);
 }
 
 // The first token will be only used in disagg pd mode.
@@ -362,6 +375,9 @@ void Sequence::append_token(const Token& token) {
     return;
   }
 
+  // A real token was committed (overlap-fake placeholders returned above).
+  ++generated_tokens_since_latency_;
+
   if (need_unique_tokens_) {
     token_to_count_map_[token_id]++;
   }
@@ -390,7 +406,8 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
     // This happens when the sequence was preempted during schedule_request(),
     // causing its KV cache to be deallocated (reset), but it's still in
     // last_batch_ being processed by update_last_step_result().
-    if (kv_state_.num_blocks(BlockType::KV) == 0) {
+    // Composite KV managers can have capacity without exposing local blocks.
+    if (kv_state_.current_max_tokens_capacity() == 0) {
       return;
     }
     kv_state_.incr_kv_cache_tokens_num(1);
@@ -401,11 +418,16 @@ void Sequence::update_last_step_token(const Token& token, size_t token_offset) {
     tokens_[cur_generated_token_idx_ + 1] = tokens_[cur_generated_token_idx_];
   }
 
+  // A real token is committed here (one per call, including the extra accepted
+  // MTP token when token_offset > 0); preempted MTP steps returned above.
+  ++generated_tokens_since_latency_;
+
   const int32_t token_id = static_cast<int32_t>(token.id);
   tokens_[cur_generated_token_idx_] = token_id;
   // Overlap/MTP may rewrite tokens at decode positions; drop any cached block
   // hash from this position onward so it is recomputed when next needed.
   invalidate_block_hashes_from(cur_generated_token_idx_);
+  invalidate_linear_state_hashes_from(cur_generated_token_idx_);
   if (need_unique_tokens_) {
     token_to_count_map_[token_id]++;
   }
@@ -431,6 +453,7 @@ void Sequence::update_token(size_t index, const Token& token) {
   // A rewritten token invalidates the cached hash of its block and all
   // subsequent blocks; recompute lazily on the next update_block_hashes().
   invalidate_block_hashes_from(index);
+  invalidate_linear_state_hashes_from(index);
   if (need_unique_tokens_) {
     --token_to_count_map_[origin_token_id];
     ++token_to_count_map_[token_id];
@@ -505,9 +528,14 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
     return output;
   }
 
-  // record the start index of token ids
-  const size_t start = decoder_.output_offset();
-  auto delta = decoder_.decode(ids, tokenizer);
+  // Hold back a potential multi-token stop suffix. The max with the decoder
+  // offset also keeps delayed streaming callbacks from moving it backwards.
+  const size_t decodable_token_count =
+      std::max(get_decodable_token_count(size), decoder_.output_offset());
+  const auto decodable_ids = ids.slice(0, decodable_token_count);
+
+  const size_t token_start = stream_output_token_offset_;
+  auto delta = decoder_.decode(decodable_ids, tokenizer);
   // NOTE:
   // There is a incomprehensible logic here: we use a thread pool to handle
   // request callbacks in response handler, which means that the main thread and
@@ -539,16 +567,17 @@ std::optional<SequenceOutput> Sequence::generate_streaming_output(
   // We consider both of these cases to be valid,
   // subsequent callbacks only need to skip to return tokens.
   //
-  if (delta.empty()) {
+  const size_t token_end = size;
+  if (delta.empty() && token_start == token_end) {
     return std::nullopt;
   }
 
   output.index = index_;
   output.text = std::move(delta);
-
-  const size_t end = decoder_.output_offset();
-  output.token_ids = ids.slice(start, end);
-  generate_output_tokens_logprobs(start, end, tokenizer, output.logprobs);
+  output.token_ids = ids.slice(token_start, token_end);
+  generate_output_tokens_logprobs(
+      token_start, token_end, tokenizer, output.logprobs);
+  stream_output_token_offset_ = token_end;
 
   return output;
 }
@@ -671,6 +700,8 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
     return output;
   }
 
+  const size_t decodable_token_count = get_decodable_token_count(size);
+
   // 4. generate tokens output
   output.index = index_;
   if (output_embedding_.defined()) {
@@ -685,20 +716,22 @@ SequenceOutput Sequence::generate_output(const Tokenizer& tokenizer) {
 
   // decide which position to start incremental decoding
   // leave 6 tokens for potential unfinished byte sequence
-  size_t incremental_start = size <= 6 ? 0 : size - 6;
+  size_t incremental_start =
+      decodable_token_count <= 6 ? 0 : decodable_token_count - 6;
   // at least start from the first generated token
   if (incremental_start < num_prompt_tokens_) {
     incremental_start = num_prompt_tokens_;
   }
-  // incrementally decode tokens between [incremental_start, size)
+  // incrementally decode tokens between [incremental_start,
+  // decodable_token_count)
   std::stringstream ss;
-  for (size_t end = incremental_start; end <= size; ++end) {
+  for (size_t end = incremental_start; end <= decodable_token_count; ++end) {
     ss << decoder_.decode(ids.slice(0, end), tokenizer);
   }
 
   output.text = ss.str();
 
-  const size_t end = decoder_.output_offset();
+  const size_t end = size;
   output.token_ids = ids.slice(start, end);
   generate_output_tokens_logprobs(start, end, tokenizer, output.logprobs);
 
@@ -721,10 +754,34 @@ size_t Sequence::num_prefix_cache_tokens() const {
   return cached_tokens;
 }
 
+void Sequence::set_host_cache_match(size_t restore_tokens, size_t copy_units) {
+  CHECK_GE(restore_tokens, kv_state_.kv_cache_tokens_num());
+  CHECK_GE(restore_tokens, host_kv_state_.kv_cache_tokens_num());
+  effective_restore_tokens_ = restore_tokens;
+  host_cache_copy_units_ = copy_units;
+}
+
+void Sequence::set_host_cache_restore(size_t restore_tokens,
+                                      size_t copy_units) {
+  const size_t matched_tokens = kv_cache_tokens_num();
+  CHECK_GE(restore_tokens, kv_state_.kv_cache_tokens_num());
+  CHECK_GE(restore_tokens, host_kv_state_.kv_cache_tokens_num());
+  CHECK_LE(restore_tokens, matched_tokens);
+  CHECK_LE(copy_units, host_cache_copy_units_);
+  effective_restore_tokens_ = restore_tokens;
+  host_cache_copy_units_ = copy_units;
+}
+
+void Sequence::clear_host_cache_match() {
+  effective_restore_tokens_.reset();
+  host_cache_copy_units_ = 0;
+}
+
 // release all cache blocks
 void Sequence::reset() {
   kv_state_.reset();
   host_kv_state_.reset();
+  clear_host_cache_match();
   timer_.reset();
   is_timeout_set_ = false;
   volatile_num_prompt_tokens_ = num_tokens_;
@@ -739,44 +796,78 @@ void Sequence::add_shared_host_blocks(BlockType type,
   host_kv_state_.add_shared_blocks(type, std::move(blocks), num_tokens_);
 }
 
+Slice<XXH3Key> Sequence::block_hashes() const {
+  const auto it = block_hashes_by_stride_.find(hash_block_size_);
+  if (it == block_hashes_by_stride_.end()) {
+    return {};
+  }
+  return it->second;
+}
+
 void Sequence::update_block_hashes(uint32_t block_size,
                                    BlockHasherType hasher_type) {
   if (block_size == 0) {
     return;
   }
+  // DSV4 admission probes SWA / C4 / C128 back-to-back with different strides
+  // (base / 4*base / 128*base). Each stride keeps its own chain in
+  // `block_hashes_by_stride_`, so switching strides extends that stride's chain
+  // incrementally instead of discarding and rebuilding the whole prompt chain
+  // every probe. Select this stride as the one block_hashes() returns.
   hash_block_size_ = block_size;
-
-  const size_t n_full_blocks = num_tokens_ / block_size;
-  if (n_full_blocks <= block_hashes_.size()) {
-    return;
-  }
-
-  const Slice<int32_t> tokens = this->tokens();
-  const size_t start_block = block_hashes_.size();
-  // Resume the chain from the last already-hashed block (its hash is the
-  // parent of the next block).
-  XXH3Key prev_key = start_block == 0 ? XXH3Key{} : block_hashes_.back();
-  auto hasher =
-      BlockHasher::create(hasher_type, mm_data_, start_block * block_size);
-
-  block_hashes_.reserve(n_full_blocks);
-  for (size_t b = start_block; b < n_full_blocks; ++b) {
-    const size_t i = b * block_size;
-    const uint8_t* pre_hash_value = (b == 0) ? nullptr : prev_key.data;
-    XXH3Key key;
-    hasher->compute(tokens, i, i + block_size, pre_hash_value, key);
-    block_hashes_.emplace_back(key);
-    prev_key = key;
-  }
+  extend_prefix_hashes(hasher_type,
+                       mm_data_,
+                       this->tokens(),
+                       block_size,
+                       /*boundary_blocks=*/num_tokens_ / block_size,
+                       block_hashes_by_stride_[block_size]);
 }
 
 void Sequence::invalidate_block_hashes_from(size_t token_index) {
-  if (block_hashes_.empty() || hash_block_size_ == 0) {
+  // Truncate every stride's chain at the first block the rewrite touched; each
+  // stride recomputes lazily on its next update_block_hashes().
+  for (auto& [block_size, hashes] : block_hashes_by_stride_) {
+    if (hashes.empty() || block_size == 0) {
+      continue;
+    }
+    const size_t first_stale_block = token_index / block_size;
+    if (first_stale_block < hashes.size()) {
+      hashes.resize(first_stale_block);
+    }
+  }
+}
+
+void Sequence::update_linear_state_hashes(uint32_t chunk_stride) {
+  if (chunk_stride == 0) {
     return;
   }
-  const size_t first_stale_block = token_index / hash_block_size_;
-  if (first_stale_block < block_hashes_.size()) {
-    block_hashes_.resize(first_stale_block);
+  linear_hash_stride_ = chunk_stride;
+  // Cover only whole chunks; the trailing partial chunk carries no checkpoint.
+  // Fold multimodal content into the chunk digest whenever this sequence
+  // carries it, so a linear-state checkpoint keyed on a chunk that spans image
+  // tokens cannot collide with a text-only chunk (or a different image) at the
+  // same token boundary. The digest is chosen from mm_data_ rather than an
+  // engine-bound type because the linear hash is only ever computed here, in
+  // the sequence's own context, where mm_data_ is in hand -- and with an empty
+  // mm_data_ the MM hasher is byte-identical to TEXT, so text-only sequences
+  // are unaffected.
+  const BlockHasherType hasher_type =
+      mm_data_.valid() ? BlockHasherType::MM : BlockHasherType::TEXT;
+  extend_prefix_hashes(hasher_type,
+                       mm_data_,
+                       this->tokens(),
+                       chunk_stride,
+                       /*boundary_blocks=*/num_tokens_ / chunk_stride,
+                       linear_state_hashes_);
+}
+
+void Sequence::invalidate_linear_state_hashes_from(size_t token_index) {
+  if (linear_state_hashes_.empty() || linear_hash_stride_ == 0) {
+    return;
+  }
+  const size_t first_stale_chunk = token_index / linear_hash_stride_;
+  if (first_stale_chunk < linear_state_hashes_.size()) {
+    linear_state_hashes_.resize(first_stale_chunk);
   }
 }
 
@@ -799,8 +890,10 @@ bool Sequence::finished() const {
   // reset the finish status invalidation flag
   finish_status_invalidated_ = false;
 
-  auto finish_reason =
-      sequence_params_.stopping_checker->check(tokens(), num_prompt_tokens_);
+  size_t matched_stop_token_count = 0;
+  const FinishReason finish_reason = sequence_params_.stopping_checker->check(
+      tokens(), num_prompt_tokens_, &matched_stop_token_count);
+  matched_stop_token_count_ = matched_stop_token_count;
   if (finish_reason != FinishReason::NONE) {
     finish_reason_ = finish_reason;
     finished_ = true;
@@ -809,10 +902,38 @@ bool Sequence::finished() const {
   return false;
 }
 
+size_t Sequence::get_decodable_token_count(size_t size) const {
+  CHECK_GE(size, num_prompt_tokens_);
+  if (sequence_params_.include_stop_str_in_output) {
+    return size;
+  }
+
+  const size_t num_generated_tokens = size - num_prompt_tokens_;
+  size_t withheld_token_count = matched_stop_token_count_;
+  if (!finished_) {
+    const size_t max_stop_sequence_token_count =
+        sequence_params_.stopping_checker->get_max_stop_sequence_token_count();
+    if (max_stop_sequence_token_count > 0) {
+      withheld_token_count =
+          std::min(max_stop_sequence_token_count - 1, num_generated_tokens);
+    }
+  }
+
+  CHECK_LE(withheld_token_count, num_generated_tokens);
+  return size - withheld_token_count;
+}
+
 int64_t Sequence::tbt(const absl::Time& now) {
+  return (tbt_microseconds(now) + 500) / 1000;
+}
+
+int64_t Sequence::tbt_microseconds(const absl::Time& now) {
   const int64_t latency =
-      absl::ToInt64Milliseconds(now - latest_generate_time_);
+      absl::ToInt64Microseconds(now - latest_generate_time_);
   latest_generate_time_ = now;
+  // Reset the committed-token counter so the next tbt interval amortizes only
+  // the tokens generated within that interval.
+  generated_tokens_since_latency_ = 0;
   return latency;
 }
 
@@ -885,6 +1006,7 @@ bool Sequence::update_prefetch_result(uint32_t timeout, uint32_t& success_cnt) {
 void Sequence::finish() {
   finished_ = true;
   finish_status_invalidated_ = false;
+  matched_stop_token_count_ = 0;
   if (finish_reason_ == FinishReason::NONE) {
     finish_reason_ = FinishReason::STOP;
   }
@@ -893,6 +1015,7 @@ void Sequence::finish() {
 void Sequence::reset_finish_state_for_beam_search() {
   finished_ = false;
   finish_reason_ = FinishReason::NONE;
+  matched_stop_token_count_ = 0;
   finish_status_invalidated_ = true;
   finished();
 }

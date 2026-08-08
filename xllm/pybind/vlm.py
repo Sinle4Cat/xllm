@@ -50,15 +50,14 @@ class VLM:
         self,
         model: str,
         task: str = "generate",
-        devices: str = 'npu:0',
         draft_model: Optional[str] = '',
-        draft_devices: Optional[str] = 'npu:0',
         limit_image_per_prompt: int = 8,
         block_size: int = 128,
         max_cache_size: int = 0,
         max_memory_utilization: float = 0.8,
         enable_prefix_cache: bool = True,
         max_encoder_cache_size: int = 0,
+        max_processor_cache_items: int = 256,
         max_tokens_per_batch: int = 10240,
         max_seqs_per_batch: int = 1024,
         max_tokens_per_chunk_for_prefill: int = -1,
@@ -69,12 +68,12 @@ class VLM:
         rank_tablefile: str = '',
         expert_parallel_degree: int = 0,
         enable_chunked_prefill: bool = True,
-        enable_prefill_sp: bool = False,
         instance_role: str = 'DEFAULT',
         transfer_listen_port: int = 26000,
         nnodes: int = 1,
         node_rank: int = 0,
         dp_size: int = 1,
+        cp_size: int = 1,
         ep_size: int = 1,
         instance_name: str = '',
         enable_disagg_pd: bool = False,
@@ -107,9 +106,7 @@ class VLM:
         options = Options()
         options.model_path = model
         options.task_type = task
-        options.devices = devices
         options.draft_model_path = draft_model
-        options.draft_devices = draft_devices
         options.backend ="vlm"
         options.limit_image_per_prompt = limit_image_per_prompt
         options.block_size = block_size
@@ -117,6 +114,7 @@ class VLM:
         options.max_memory_utilization = max_memory_utilization
         options.enable_prefix_cache = enable_prefix_cache
         options.max_encoder_cache_size = max_encoder_cache_size
+        options.max_processor_cache_items = max_processor_cache_items
         options.max_tokens_per_batch = max_tokens_per_batch
         options.max_seqs_per_batch = max_seqs_per_batch
         options.max_tokens_per_chunk_for_prefill = max_tokens_per_chunk_for_prefill
@@ -127,13 +125,13 @@ class VLM:
         options.rank_tablefile = rank_tablefile
         options.expert_parallel_degree = expert_parallel_degree
         options.enable_chunked_prefill = enable_chunked_prefill
-        options.enable_prefill_sp = enable_prefill_sp
         free_port = utils.get_free_port()
         options.master_node_addr = "127.0.0.1:" + str(free_port)
         options.transfer_listen_port = transfer_listen_port
         options.nnodes = nnodes
         options.node_rank = node_rank
         options.dp_size = dp_size
+        options.cp_size = cp_size
         options.ep_size = ep_size
         options.instance_name = instance_name
         options.enable_disagg_pd = enable_disagg_pd

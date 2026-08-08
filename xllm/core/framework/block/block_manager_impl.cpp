@@ -22,17 +22,6 @@ limitations under the License.
 namespace xllm {
 namespace {
 
-bool mark_used(std::vector<uint8_t>* usage_ids, int32_t block_id) {
-  CHECK(usage_ids != nullptr);
-  CHECK_GE(block_id, 0);
-  CHECK_LT(static_cast<size_t>(block_id), usage_ids->size());
-  if ((*usage_ids)[block_id] != 0) {
-    return false;
-  }
-  (*usage_ids)[block_id] = 1;
-  return true;
-}
-
 bool clear_used(std::vector<uint8_t>* usage_ids, int32_t block_id) {
   CHECK(usage_ids != nullptr);
   CHECK_GE(block_id, 0);
@@ -46,6 +35,18 @@ bool clear_used(std::vector<uint8_t>* usage_ids, int32_t block_id) {
 
 }  // namespace
 
+bool BlockManagerImpl::mark_used(std::vector<uint8_t>* usage_ids,
+                                 int32_t block_id) {
+  CHECK(usage_ids != nullptr);
+  CHECK_GE(block_id, 0);
+  CHECK_LT(static_cast<size_t>(block_id), usage_ids->size());
+  if ((*usage_ids)[block_id] != 0) {
+    return false;
+  }
+  (*usage_ids)[block_id] = 1;
+  return true;
+}
+
 BlockManagerImpl::BlockManagerImpl(const Options& options)
     : BlockManager(options) {
   CHECK_GT(options.num_blocks(), 0) << "No blocks to allocate";
@@ -53,7 +54,8 @@ BlockManagerImpl::BlockManagerImpl(const Options& options)
   if (options_.enable_prefix_cache()) {
     PrefixCache::Options prefix_cache_options;
     prefix_cache_options.block_size(options.block_size())
-        .hasher_type(options.hasher_type());
+        .hasher_type(options.hasher_type())
+        .block_type(options.block_type());
     prefix_cache_ = create_prefix_cache(prefix_cache_options);
     CHECK(prefix_cache_) << "Failed to create prefix cache!";
   }
@@ -160,7 +162,7 @@ std::vector<Block> BlockManagerImpl::allocate_shared(
     const Slice<Block>& existed_shared_blocks,
     const MMData& mm_data,
     const Slice<XXH3Key>& block_hashes) {
-  // only allocate shared blocks for prefill sequences
+  // only allocate shared blocks for prefix caching prefill sequences
   if (options_.enable_prefix_cache()) {
     AUTO_COUNTER(prefix_cache_latency_seconds_match);
 
@@ -168,9 +170,10 @@ std::vector<Block> BlockManagerImpl::allocate_shared(
         token_ids, existed_shared_blocks, mm_data, block_hashes);
 
     const size_t prefix_length =
-        shared_blocks.empty() ? 0
-                              : shared_blocks.size() * shared_blocks[0].size();
+        shared_blocks.size() * static_cast<size_t>(block_size_);
     COUNTER_ADD(prefix_cache_match_length_total, prefix_length);
+    VLOG(1) << "Prefix cache matched " << shared_blocks.size()
+            << " blocks, prefix_length=" << prefix_length;
 
     // update effective block usage
     for (const auto& block : shared_blocks) {
@@ -235,13 +238,20 @@ void BlockManagerImpl::free(int32_t block_id) {
 std::optional<std::vector<Block>> BlockManagerImpl::allocate_for_sequence(
     Sequence* seq,
     size_t num_tokens) {
+  return allocate_for_sequence(seq, seq->kv_state(), num_tokens);
+}
+
+std::optional<std::vector<Block>> BlockManagerImpl::allocate_for_sequence(
+    Sequence* seq,
+    KVCacheState& kv_state,
+    size_t num_tokens) {
   if (seq == nullptr) {
     return std::nullopt;
   }
   if (block_size_ == 0) {
     return std::vector<Block>{};
   }
-  const size_t held = seq->kv_state().num_blocks(block_type());
+  const size_t held = kv_state.num_blocks(block_type());
   const size_t num_blocks_needed = (num_tokens + block_size_ - 1) / block_size_;
   if (num_blocks_needed <= held) {
     return std::vector<Block>{};

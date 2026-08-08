@@ -153,7 +153,13 @@ ModelArgs(const std::string& path, int32_t num_layers = 12);
 // Good
 ModelOutput forward(torch::Tensor tokens, ...) override;
 
-// Bad
+// Bad – missing override
+ModelOutput forward(torch::Tensor tokens, ...);
+
+// Bad – redundant virtual on override
+virtual ModelOutput forward(torch::Tensor tokens, ...) override;
+
+// Bad – missing override (virtual-only in derived class)
 virtual ModelOutput forward(torch::Tensor tokens, ...);
 ```
 
@@ -329,6 +335,20 @@ def load_model(path, device="cuda"):
 ```
 
 - **Private helpers**: prefix with `_` (see Section 6).
+- **Prefer absolute imports** rooted at the top-level package for project code.
+  - A single-dot relative import (`from .module import Name`) is acceptable for a sibling module in the same package, especially for package-local implementation details and `__init__.py` re-exports.
+  - Avoid parent-relative imports (`from ..module import Name`) and deeper relative imports. Use an absolute import from `xllm` instead so the dependency remains clear when code moves between packages.
+
+```python
+# Preferred across packages
+from xllm.python.attention.backend import AttentionBackend
+
+# Acceptable within the same package
+from .backend import AttentionBackend
+
+# Avoid
+from ..attention.backend import AttentionBackend
+```
 
 ---
 

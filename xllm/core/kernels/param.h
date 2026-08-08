@@ -21,6 +21,10 @@ limitations under the License.
 #include <string>
 #include <vector>
 
+namespace xllm {
+class ProcessGroup;
+}  // namespace xllm
+
 namespace xllm::layer {
 struct AttentionMetadata;
 }  // namespace xllm::layer
@@ -130,14 +134,14 @@ struct ReshapePagedCacheParams {
   // Last two dimensions must be contiguous: stride(-1)==1,
   // stride(-2)==head_dim. Must have same device and dtype as other tensors.
   std::optional<torch::Tensor> value;
-  // Key cache tensor in paged format. Shape: [num_blocks, num_heads,
-  // block_size, head_dim]. Must be contiguous. Must have same device and dtype
+  // Key cache tensor in paged format. Shape: [num_blocks, block_size,
+  // num_heads, head_dim]. Must be contiguous. Must have same device and dtype
   // as key and value.
   torch::Tensor k_cache;
-  // Optional value cache tensor in paged format. Shape: [num_blocks, num_heads,
-  // block_size, head_dim]. If provided, value must also be provided (and vice
-  // versa). Must be contiguous. Must have same device and dtype as other
-  // tensors.
+  // Optional value cache tensor in paged format. Shape: [num_blocks,
+  // block_size, num_heads, head_dim]. If provided, value must also be provided
+  // (and vice versa). Must be contiguous. Must have same device and dtype as
+  // other tensors.
   std::optional<torch::Tensor> v_cache;
   // Slot mapping tensor. Shape: [num_tokens]. Type must be int32.
   // Maps each token to its corresponding slot in the cache. Must be contiguous.
@@ -265,6 +269,8 @@ struct FusedLayerNormParams {
   std::string mode;
   // Epsilon value for numerical stability in normalization computation.
   double eps;
+  // Apply the Gemma/Qwen3.5 gamma offset inside NPU residual RMSNorm.
+  bool add_gamma_offset = false;
   // Whether to store output before normalization to residual_out.
   // Not supported when both bias and residual are not provided.
   bool store_output_before_norm = false;
@@ -275,6 +281,27 @@ struct FusedLayerNormParams {
   // When true, uses per-token quantization scheme; otherwise uses per-channel
   // if quant_scale provided.
   bool dynamic_quant = false;
+};
+
+// Fused adaptive LayerNorm parameters.
+// Computes: LayerNorm(x) * (1 + scale) + shift in a single fused kernel.
+struct AdaLayerNormParams {
+  // Input tensor [B, S, H]. Last dimension is hidden_size.
+  torch::Tensor input;
+  // Scale modulation. Shape [B, H] or [B, 1, H] (broadcast over sequence)
+  // or [B, S, H] (token-wise). The (1 + scale) is applied inside the kernel,
+  // so pass the raw scale.
+  torch::Tensor scale;
+  // Shift modulation. Same shape constraints as scale.
+  torch::Tensor shift;
+  // Optional affine weight (gamma) [H]. Only used when elementwise_affine.
+  std::optional<torch::Tensor> weight;
+  // Optional affine bias (beta) [H]. Only used when elementwise_affine.
+  std::optional<torch::Tensor> bias;
+  // Output tensor. Same shape as input. Written back by the kernel.
+  torch::Tensor output;
+  // Epsilon for numerical stability.
+  double eps = 1e-6;
 };
 
 struct RmsNormDynamicQuantParams {
@@ -310,6 +337,27 @@ struct MatmulParams {
   // Scaling factor for tensor c (if provided). Default: 0.0
   // Result: alpha * (a @ b) + beta * c (if c provided)
   double beta = 0.0;
+};
+
+struct MatmulReduceScatterParams {
+  torch::Tensor a;
+  torch::Tensor b;
+  std::optional<torch::Tensor> bias;
+  ProcessGroup* process_group = nullptr;
+
+  std::string reduce_op = "sum";
+  int64_t comm_turn = 0;
+  std::string comm_mode = "aiv";
+
+  // Optional per-token activation dequant scale, shape (m, 1), float32.
+  // When both x1_scale and x2_scale are set, the int8 quantized MMRS path is
+  // used (FC1 w8a8_dynamic): a/b are int8 and output is dequantized.
+  std::optional<torch::Tensor> x1_scale;
+  // Optional per-channel weight dequant scale, shape (1, n), float32.
+  std::optional<torch::Tensor> x2_scale;
+  // Optional output dtype for the quantized path (bf16/fp16). Ignored by the
+  // non-quant path.
+  std::optional<at::ScalarType> output_dtype;
 };
 
 // Quantized matmul parameters (NPU aclnnQuantMatmulV4 path).
@@ -985,10 +1033,16 @@ struct MaskedIndexerSelectPagedKVParams {
   // Query quantization scale tensor. Must be contiguous.
   // - Required (numel > 0) when query dtype is int8 or fp8
   // - Must be empty (numel == 0) when query dtype is bfloat16 or half
+  // - INT8 prefill shape: [total_q, head_num, 1]
+  // - INT8 decode shape: [batch, seq_q, head_num, 1]
   std::optional<torch::Tensor> q_scale;
   // Key cache quantization scale tensor. Must be contiguous.
   // - Required (numel > 0) when k_cache dtype is int8 or fp8
   // - Must be empty (numel == 0) when k_cache dtype is bfloat16 or half
+  // - Paged INT8 K scale is the cache scale shape with a trailing dim added
+  //   before select.
+  // - Dense INT8 K scale keeps the layout returned by
+  //   scaled_quantize(k.unsqueeze(-2)).
   std::optional<torch::Tensor> k_scale_cache;
   // New sparse block table output tensor. Must be contiguous.
   // - Prefill mode: 2D [total_seq_q, kv_cache_max_blkn]
@@ -1550,8 +1604,10 @@ struct FusedSigmoidGatingDeltaRuleUpdateParams {
   torch::Tensor initial_state_source;
   torch::Tensor initial_state_indices;
   torch::Tensor cu_seqlens;
+  std::optional<torch::Tensor> num_accepted_tokens = std::nullopt;
   std::optional<float> scale = std::nullopt;
   bool use_qk_l2norm_in_kernel = false;
+  bool is_kda = false;
   float softplus_beta = 1.0f;
   float softplus_threshold = 20.0f;
 };
@@ -1608,6 +1664,8 @@ struct GemmaRMSNormParams {
   torch::Tensor x;
   torch::Tensor gamma;
   double epsilon;
+  std::optional<torch::Tensor> residual;
+  std::optional<torch::Tensor> residual_out;
   torch::Tensor rstd_out;
   torch::Tensor norm_out;
 };
@@ -1881,6 +1939,60 @@ struct NpuInplacePartialRotaryMulParams {
   torch::Tensor r2;
   std::string rotary_mode = "interleave";
   std::vector<int64_t> partial_slice;
+};
+
+// Parameters for the fused expert-parallel mega MoE kernel.
+// Wraps the NPU apply_npu_mega_moe op: dispatch + grouped GEMM (gate/up) +
+// activation + combine grouped GEMM (down) + combine, in one fused call.
+struct MegaMoeParams {
+  // HCCL context tensor that carries the communicator handle.
+  torch::Tensor context;
+  // Input hidden states. Shape: [num_tokens, hidden_size].
+  torch::Tensor x;
+  // Routed expert ids. Shape: [num_tokens, topk], dtype int32.
+  torch::Tensor topk_ids;
+  // Router top-k weights. Shape: [num_tokens, topk], dtype fp32.
+  torch::Tensor topk_weights;
+  // First expert weights as TensorList (gate/up projection).
+  torch::TensorList weight1;
+  // Second expert weights as TensorList (down projection).
+  torch::TensorList weight2;
+  // Total number of experts across all ranks.
+  int64_t moe_expert_num = 0;
+  // Expert-parallel world size.
+  int64_t ep_world_size = 1;
+  // HCCL communication buffer size in bytes.
+  int64_t ccl_buffer_size = 0;
+  // Optional W8A8/int8 weight scales for weight1.
+  std::optional<torch::TensorList> weight_scales1 = std::nullopt;
+  // Optional W8A8/int8 weight scales for weight2.
+  std::optional<torch::TensorList> weight_scales2 = std::nullopt;
+  // Optional bias list added to the first matmul output.
+  std::optional<torch::TensorList> bias1 = std::nullopt;
+  // Optional bias list added to the second matmul output.
+  std::optional<torch::TensorList> bias2 = std::nullopt;
+  // Optional active token mask. Shape: [num_tokens], dtype int8/bool.
+  std::optional<torch::Tensor> x_active_mask = std::nullopt;
+  // Maximum number of tokens that can be received from remote ranks.
+  int64_t max_recv_token_num = 0;
+  // Dispatch communication quantization mode.
+  int64_t dispatch_quant_mode = 0;
+  // Combine communication quantization mode.
+  int64_t combine_quant_mode = 0;
+  // HCCL communication algorithm name.
+  std::string comm_alg = "";
+  // Maximum number of tokens per rank for the all-to-all buffer.
+  int64_t num_max_tokens_per_rank = 0;
+  // Activation function name for the gated MLP.
+  std::string activation = "swiglu";
+  // Clamp limit applied to the activation output.
+  float activation_clamp = std::numeric_limits<float>::max();
+  // Output dtype used by dispatch quantization.
+  int64_t dispatch_quant_out_dtype = 0;
+  // Topology type for the expert-parallel communication.
+  int64_t topo_type = 0;
+  // Number of ranks per server node.
+  int64_t rank_num_per_server = 2;
 };
 
 }  // namespace xllm::kernel

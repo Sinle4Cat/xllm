@@ -40,9 +40,7 @@ PYBIND11_MODULE(xllm_export, m) {
   py::class_<Options>(m, "Options")
       .def(py::init())
       .def_readwrite("model_path", &Options::model_path_)
-      .def_readwrite("devices", &Options::devices_)
       .def_readwrite("draft_model_path", &Options::draft_model_path_)
-      .def_readwrite("draft_devices", &Options::draft_devices_)
       .def_readwrite("backend", &Options::backend_)
       .def_readwrite("limit_image_per_prompt",
                      &Options::limit_image_per_prompt_)
@@ -53,6 +51,8 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("enable_prefix_cache", &Options::enable_prefix_cache_)
       .def_readwrite("max_encoder_cache_size",
                      &Options::max_encoder_cache_size_)
+      .def_readwrite("max_processor_cache_items",
+                     &Options::max_processor_cache_items_)
       .def_readwrite("max_tokens_per_batch", &Options::max_tokens_per_batch_)
       .def_readwrite("max_seqs_per_batch", &Options::max_seqs_per_batch_)
       .def_readwrite("max_tokens_per_chunk_for_prefill",
@@ -69,11 +69,16 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("task_type", &Options::task_type_)
       .def_readwrite("enable_chunked_prefill",
                      &Options::enable_chunked_prefill_)
-      .def_readwrite("enable_prefill_sp", &Options::enable_prefill_sp_)
+      .def_readwrite("enable_flashcomm1", &Options::enable_flashcomm1_)
+      .def_readwrite("flashcomm1_min_prefill_tokens",
+                     &Options::flashcomm1_min_prefill_tokens_)
+      .def_readwrite("enable_mmrs_fusion", &Options::enable_mmrs_fusion_)
+      .def_readwrite("mmrs_comm_mode", &Options::mmrs_comm_mode_)
       .def_readwrite("master_node_addr", &Options::master_node_addr_)
       .def_readwrite("nnodes", &Options::nnodes_)
       .def_readwrite("node_rank", &Options::node_rank_)
       .def_readwrite("dp_size", &Options::dp_size_)
+      .def_readwrite("cp_size", &Options::cp_size_)
       .def_readwrite("ep_size", &Options::ep_size_)
       .def_readwrite("instance_name", &Options::instance_name_)
       .def_readwrite("enable_disagg_pd", &Options::enable_disagg_pd_)
@@ -233,6 +238,8 @@ PYBIND11_MODULE(xllm_export, m) {
       .def_readwrite("logprobs", &RequestParams::logprobs)
       .def_readwrite("top_logprobs", &RequestParams::top_logprobs)
       .def_readwrite("skip_special_tokens", &RequestParams::skip_special_tokens)
+      .def_readwrite("include_stop_str_in_output",
+                     &RequestParams::include_stop_str_in_output)
       .def_readwrite("ignore_eos", &RequestParams::ignore_eos)
       .def_readwrite("is_embeddings", &RequestParams::is_embeddings)
       .def_readwrite("stop", &RequestParams::stop)

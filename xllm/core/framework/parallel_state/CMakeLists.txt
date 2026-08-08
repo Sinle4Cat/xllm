@@ -5,8 +5,7 @@ cc_library(
     parallel_state
   HDRS
     mapping_npu.h
-    npu_cp_ep_padding.h
-    npu_cp_prepare.h
+    npu_cp_plan.h
     npu_dp_ep_padding.h
     dit_mapping.h
     rank_generator.h
@@ -22,10 +21,10 @@ cc_library(
     collective_communicator_base.h
     collective_communicator.h
     dit_collective_communicator.h
+    $<$<BOOL:${USE_NPU}>:mega_moe_comm_resource.h>
   SRCS
     mapping_npu.cpp
-    npu_cp_ep_padding.cpp
-    npu_cp_prepare.cpp
+    npu_cp_plan.cpp
     npu_dp_ep_padding.cpp
     dit_mapping.cpp
     parallel_state.cpp
@@ -33,6 +32,7 @@ cc_library(
     process_group.cpp
     $<$<BOOL:${USE_NPU}>:npu_rank_table_env.cpp>
     $<$<BOOL:${USE_NPU}>:npu_process_group.cpp>
+    $<$<BOOL:${USE_NPU}>:mega_moe_comm_resource.cpp>
     collective_communicator.cpp
     dit_collective_communicator.cpp
   DEPS

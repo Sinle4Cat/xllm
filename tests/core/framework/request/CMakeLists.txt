@@ -24,6 +24,16 @@ cc_test(
 
 cc_test(
   NAME
+    dit_request_params_test
+  SRCS
+    dit_request_params_test.cpp
+  DEPS
+    :request
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     stopping_checker_test
   SRCS
     stopping_checker_test.cpp
@@ -95,5 +105,49 @@ target_link_libraries(sequence_mtp_bootstrap_test
                       $<$<BOOL:${USE_NPU}>:c_sec>
                       $<$<BOOL:${USE_NPU}>:nnopbase>)
 target_link_options(sequence_mtp_bootstrap_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_generated_tokens_test
+  SRCS
+    sequence_generated_tokens_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_generated_tokens_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_generated_tokens_test
+                    PRIVATE
+                    $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)
+
+cc_test(
+  NAME
+    sequence_stop_output_test
+  SRCS
+    sequence_stop_output_test.cpp
+  DEPS
+    :request
+    $<$<BOOL:${USE_MLU}>:torch_mlu>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+    GTest::gtest_main
+)
+target_link_libraries(sequence_stop_output_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>
+                      $<$<BOOL:${USE_NPU}>:c_sec>
+                      $<$<BOOL:${USE_NPU}>:nnopbase>)
+target_link_options(sequence_stop_output_test
                     PRIVATE
                     $<$<BOOL:${USE_MLU}>:-Wl,--no-as-needed>)

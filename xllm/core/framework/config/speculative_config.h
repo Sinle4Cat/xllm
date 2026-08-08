@@ -18,6 +18,7 @@ limitations under the License.
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
 #include <string>
+#include <string_view>
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
@@ -33,6 +34,26 @@ class SpeculativeConfig final {
 
   static SpeculativeConfig& get_instance();
 
+  // Whether a speculative algorithm requires the target model to capture
+  // intermediate-layer aux hidden states to drive the draft (Eagle3 and
+  // DFlash). Centralizes the algorithm-string classification in one place. The
+  // worker consults it to decide whether to populate the target's
+  // layers_to_capture; the model then keys off that list alone, never the
+  // algorithm string. Takes the algorithm explicitly so a spawned worker
+  // process, which reads its own Options rather than this global config, can
+  // classify without an initialized singleton.
+  static bool requires_aux_hidden_capture(std::string_view algorithm) {
+    return algorithm == "Eagle3" || algorithm == "DFlash" ||
+           algorithm == "DSpark";
+  }
+
+  static bool is_mtp_algorithm(std::string_view algorithm) {
+    return algorithm.size() == 3 &&
+           (algorithm[0] == 'M' || algorithm[0] == 'm') &&
+           (algorithm[1] == 'T' || algorithm[1] == 't') &&
+           (algorithm[2] == 'P' || algorithm[2] == 'p');
+  }
+
   void from_flags();
   void from_json(const JsonReader& json);
   void append_config_json(nlohmann::ordered_json& config_json) const;
@@ -42,7 +63,6 @@ class SpeculativeConfig final {
     static const OptionCategory kOptionCategory = {
         "SPECULATIVE OPTIONS",
         {"draft_model",
-         "draft_devices",
          "num_speculative_tokens",
          "speculative_algorithm",
          "speculative_suffix_cache_max_depth",
@@ -52,13 +72,12 @@ class SpeculativeConfig final {
          "speculative_suffix_max_cached_requests",
          "speculative_suffix_use_tree_spec",
          "enable_opt_validate_probs",
+         "enable_mtp_draft_body_tp1",
          "enable_atb_spec_kernel"}};
     return kOptionCategory;
   }
 
   PROPERTY(std::string, draft_model);
-
-  PROPERTY(std::string, draft_devices) = "";
 
   PROPERTY(int32_t, num_speculative_tokens) = 0;
 
@@ -77,6 +96,8 @@ class SpeculativeConfig final {
   PROPERTY(bool, speculative_suffix_use_tree_spec) = false;
 
   PROPERTY(bool, enable_opt_validate_probs) = false;
+
+  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
 
   PROPERTY(bool, enable_atb_spec_kernel) = false;
 };

@@ -94,9 +94,15 @@ class MooncakeTransferEngineCore {
       stub_map_;
 };
 
-class MooncakeTransferEngine final {
+class MooncakeTransferEngine {
  public:
   enum class MoveOpcode { READ = 0, WRITE = 1 };
+
+  struct BufferTransferMapping {
+    int64_t buf_id = 0;
+    std::vector<uint64_t> local_ids;
+    std::vector<uint64_t> remote_ids;
+  };
 
   MooncakeTransferEngine(const uint16_t listen_port,
                          const torch::Device& device);
@@ -104,9 +110,9 @@ class MooncakeTransferEngine final {
 
   std::string initialize();
 
-  bool register_memory(std::vector<void*> addrs,
-                       std::vector<size_t> lens,
-                       std::vector<uint64_t> buf_bytes);
+  virtual bool register_memory(std::vector<void*> addrs,
+                               std::vector<size_t> lens,
+                               std::vector<uint64_t> buf_bytes);
 
   bool move_memory_blocks(const std::string& remote_addr,
                           const std::vector<uint64_t>& src_blocks,
@@ -114,15 +120,20 @@ class MooncakeTransferEngine final {
                           const std::vector<int64_t>& buf_ids,
                           MoveOpcode move_opcode);
 
-  bool pull_memory_blocks(const std::string& remote_addr,
-                          const std::vector<uint64_t>& src_blocks,
-                          const std::vector<uint64_t>& dst_blocks,
-                          const std::vector<int64_t>& buf_ids);
+  virtual bool move_memory_groups(
+      const std::string& remote_addr,
+      const std::vector<BufferTransferMapping>& mappings,
+      MoveOpcode move_opcode);
 
-  bool push_memory_blocks(const std::string& remote_addr,
-                          const std::vector<uint64_t>& src_blocks,
-                          const std::vector<uint64_t>& dst_blocks,
-                          const std::vector<int64_t>& buf_ids);
+  virtual bool pull_memory_blocks(const std::string& remote_addr,
+                                  const std::vector<uint64_t>& src_blocks,
+                                  const std::vector<uint64_t>& dst_blocks,
+                                  const std::vector<int64_t>& buf_ids);
+
+  virtual bool push_memory_blocks(const std::string& remote_addr,
+                                  const std::vector<uint64_t>& src_blocks,
+                                  const std::vector<uint64_t>& dst_blocks,
+                                  const std::vector<int64_t>& buf_ids);
 
   // XTensor mode uses raw offsets in the GlobalXTensor region in buffer[0].
   bool move_memory_by_global_offsets(const std::string& remote_addr,
@@ -150,17 +161,17 @@ class MooncakeTransferEngineService
  public:
   MooncakeTransferEngineService() = default;
 
-  virtual ~MooncakeTransferEngineService() = default;
+  ~MooncakeTransferEngineService() override = default;
 
-  virtual void OpenSession(google::protobuf::RpcController* controller,
-                           const proto::SessionInfo* request,
-                           proto::Status* response,
-                           google::protobuf::Closure* done) override;
+  void OpenSession(google::protobuf::RpcController* controller,
+                   const proto::SessionInfo* request,
+                   proto::Status* response,
+                   google::protobuf::Closure* done) override;
 
-  virtual void CloseSession(google::protobuf::RpcController* controller,
-                            const proto::SessionInfo* request,
-                            proto::Status* response,
-                            google::protobuf::Closure* done) override;
+  void CloseSession(google::protobuf::RpcController* controller,
+                    const proto::SessionInfo* request,
+                    proto::Status* response,
+                    google::protobuf::Closure* done) override;
 };
 
 }  // namespace xllm

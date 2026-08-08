@@ -43,6 +43,64 @@ torch::TensorOptions int32_options_like(const torch::Tensor& preferred,
   return torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
 }
 
+void materialize_linear_state_validity(
+    const ModelInputParams& params,
+    const std::optional<torch::Device>& device,
+    AttentionMetadata& attn_metadata) {
+  const bool needs_initial_states =
+      attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
+  if (!needs_initial_states) {
+    return;
+  }
+
+  const int64_t mask_rows =
+      static_cast<int64_t>(params.linear_state_validity_mask.size());
+  // Dense (non-linear) models still emit one linear_state_ids row per batch
+  // entry to keep row alignment for downstream consumers, but every slot is
+  // the invalid sentinel (-1); see BatchInputBuilder::append_linear_state_row.
+  // A canonical validity mask is only required when at least one row carries a
+  // real (non-negative) linear-state slot, so mirror has_linear_state_slot()
+  // rather than treating a placeholder-only container as linear state.
+  const bool has_linear_state_rows =
+      std::any_of(params.embedding.linear_state_ids.begin(),
+                  params.embedding.linear_state_ids.end(),
+                  [](int32_t linear_state_id) { return linear_state_id >= 0; });
+  if (!attn_metadata.is_dummy && mask_rows == 0) {
+    CHECK(!has_linear_state_rows)
+        << "linear-state metadata requires a canonical validity mask";
+    return;
+  }
+
+  if (!(attn_metadata.is_dummy && mask_rows == 0)) {
+    int64_t metadata_rows = mask_rows;
+    if (!params.embedding.linear_state_ids.empty()) {
+      metadata_rows =
+          static_cast<int64_t>(params.embedding.linear_state_ids.size());
+    } else if (params.embedding.linear_state_indices.defined()) {
+      metadata_rows = params.embedding.linear_state_indices.numel();
+    }
+    CHECK_EQ(mask_rows, metadata_rows)
+        << "linear state mask row count mismatch: mask_rows=" << mask_rows
+        << ", metadata_rows=" << metadata_rows;
+  }
+
+  torch::TensorOptions options;
+  if (params.embedding.linear_state_indices.defined()) {
+    options = params.embedding.linear_state_indices.options();
+  } else if (params.attention.device.q_seq_lens.defined()) {
+    options = params.attention.device.q_seq_lens.options();
+  } else {
+    CHECK(device.has_value())
+        << "linear state metadata requires a target device";
+    options = torch::TensorOptions().device(device.value());
+  }
+  options = options.dtype(torch::kBool);
+  attn_metadata.has_initial_states =
+      attn_metadata.is_dummy && mask_rows == 0
+          ? torch::zeros({1}, options)
+          : torch::tensor(params.linear_state_validity_mask, options);
+}
+
 AttentionMetadata build_attention_metadata(
     const ModelInputParams& params,
     bool enable_mla,
@@ -184,6 +242,7 @@ AttentionMetadata build_attention_metadata(
       params.meta.batch_forward_type.is_mixed() ||
       params.meta.batch_forward_type.is_chunked_prefill();
   attn_metadata.is_prefill = params.meta.batch_forward_type.is_prefill();
+  attn_metadata.prefill_without_cache = params.prefill_without_cache;
 
   // MLA-family MLU paths require per-sequence q/kv lengths during prefill.
   if (!attn_metadata.is_prefill || enable_mla) {
@@ -232,13 +291,22 @@ AttentionMetadata build_attention_metadata(
              "undefined";
       options = options.device(device.value());
     }
-    attn_metadata.slot_mapping = torch::tensor({1}, options);
+    attn_metadata.slot_mapping = torch::tensor({0}, options);
     attn_metadata.q_cu_seq_lens = torch::tensor({0, 1}, options);
+    attn_metadata.kv_cu_seq_lens = torch::tensor({0, 1}, options);
     attn_metadata.q_seq_lens = torch::tensor({1}, options);
     attn_metadata.kv_seq_lens = torch::tensor({1}, options);
+    attn_metadata.q_seq_lens_vec = {0, 1};
+    attn_metadata.kv_seq_lens_vec = {0, 1};
+    attn_metadata.paged_kv_indptr = torch::tensor({0, 1}, options);
+    attn_metadata.paged_kv_indices = torch::tensor({0}, options);
+    attn_metadata.paged_kv_last_page_len = torch::tensor({1}, options);
+    attn_metadata.block_table = torch::zeros({1, 1}, options);
     attn_metadata.max_query_len = 1;
     attn_metadata.max_seq_len = std::max<int64_t>(attn_metadata.max_seq_len, 1);
+    attn_metadata.total_kv_len = 1;
   }
+  materialize_linear_state_validity(params, device, attn_metadata);
 
   // Set is_causal: true for prefill (causal attention), false for decode
   // (non-causal) Default to true (causal) if not explicitly set

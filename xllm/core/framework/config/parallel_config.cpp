@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "core/framework/config/parallel_config.h"
 
+#include <glog/logging.h>
+
 #include "core/common/global_flags.h"
 #include "core/framework/config/config_utils.h"
 
@@ -42,14 +44,14 @@ DEFINE_int64(cfg_size,
 
 DEFINE_int64(vae_size, 1, "Vae patch parallelism size");
 
+DEFINE_int64(text_encoder_tp_size,
+             1,
+             "Text encoder tensor parallelism size for DiT model.");
+
 DEFINE_string(
     communication_backend,
     "hccl",
     "NPU communication backend.(e.g. lccl, hccl). When enable dp, use hccl.");
-
-DEFINE_bool(enable_prefill_sp,
-            false,
-            "Whether to enable prefill-only sequence parallel.");
 
 DEFINE_bool(enable_mm_encoder_dp,
             false,
@@ -82,8 +84,8 @@ void ParallelConfig::from_flags() {
   XLLM_CONFIG_ASSIGN_FROM_FLAG(sp_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(cfg_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(vae_size);
+  XLLM_CONFIG_ASSIGN_FROM_FLAG(text_encoder_tp_size);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(communication_backend);
-  XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_prefill_sp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_mm_encoder_dp);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_FLAG(micro_batch_num);
@@ -98,8 +100,8 @@ void ParallelConfig::from_json(const JsonReader& json) {
   XLLM_CONFIG_ASSIGN_FROM_JSON(sp_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(cfg_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(vae_size);
+  XLLM_CONFIG_ASSIGN_FROM_JSON(text_encoder_tp_size);
   XLLM_CONFIG_ASSIGN_FROM_JSON(communication_backend);
-  XLLM_CONFIG_ASSIGN_FROM_JSON(enable_prefill_sp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_mm_encoder_dp);
   XLLM_CONFIG_ASSIGN_FROM_JSON(enable_multi_stream_parallel);
   XLLM_CONFIG_ASSIGN_FROM_JSON(micro_batch_num);
@@ -119,9 +121,9 @@ void ParallelConfig::append_config_json(
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, vae_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, communication_backend);
+      config_json, default_config, text_encoder_tp_size);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
-      config_json, default_config, enable_prefill_sp);
+      config_json, default_config, communication_backend);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(
       config_json, default_config, enable_mm_encoder_dp);
   APPEND_CONFIG_JSON_VALUE_IF_NOT_DEFAULT(

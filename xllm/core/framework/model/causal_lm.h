@@ -69,6 +69,8 @@ class CausalLM : public torch::nn::Module {
 
   virtual bool is_hybrid_linear_attention() { return false; }
 
+  virtual bool supports_mla_graph_kv_bucketing() const { return false; }
+
   virtual std::unique_ptr<ModelGraphMetadataState>
   create_graph_forward_metadata_state() {
     return nullptr;
@@ -113,7 +115,16 @@ class CausalLM : public torch::nn::Module {
   virtual void prepare_expert_weight(
       int32_t layer_id,
       const std::vector<int32_t>& expert_ids) = 0;
+  virtual void start_expert_weight_transfer(int32_t /*layer_id*/) {}
   virtual void update_expert_weight(int32_t layer_id) = 0;
+
+  // Returns whether the last prepare_expert_weight() call for the given layer
+  // succeeded. Default is true so models that do not fail-report keep the old
+  // behavior; DSV4 (npu_torch) overrides this to expose real prepare status
+  // so EplbExecutor does not advance ready_layer_id on silent failures.
+  virtual bool last_prepare_expert_weight_ok(int32_t /*layer_id*/) const {
+    return true;
+  }
 
   virtual const torch::TensorOptions& options() const = 0;
 
@@ -156,6 +167,29 @@ class CausalLM : public torch::nn::Module {
     NOT_IMPLEMENTED();
   }
 
+  // DFlash-specific interface. Attention-free scatter-only pass that projects
+  // target hidden into the draft's per-layer KV cache. Not part of forward()
+  // because it has no attention and its shape doesn't match forward's decode
+  // graph; sits outside the executor to avoid a per-flag branch in the eager
+  // gate. Default: NOT_IMPLEMENTED. Overridden by DFlashDraftModel.
+  virtual ModelOutput write_context_kv(const torch::Tensor& target_hidden,
+                                       const torch::Tensor& positions,
+                                       const torch::Tensor& device_cache_slots,
+                                       std::vector<KVCache>& kv_caches,
+                                       const ModelInputParams& input_params) {
+    NOT_IMPLEMENTED();
+    return {};
+  }
+
+  // DSpark-specific low-rank Markov projection. The draft worker owns the
+  // sequential sampling lifecycle; the model owns only the trained weights and
+  // bias computation.
+  virtual torch::Tensor dspark_markov_bias(
+      const torch::Tensor& previous_token_ids) {
+    NOT_IMPLEMENTED();
+    return {};
+  }
+
   virtual void lazy_load_model(std::unique_ptr<ModelLoader> loader) {
     NOT_IMPLEMENTED();
   }
@@ -194,6 +228,13 @@ class CausalLMImpl : public CausalLM {
     } else {
       return CausalLM::is_hybrid_linear_attention();
     }
+  }
+
+  bool supports_mla_graph_kv_bucketing() const override {
+    if constexpr (detail::has_supports_mla_graph_kv_bucketing<Model>::value) {
+      return model_->supports_mla_graph_kv_bucketing();
+    }
+    return CausalLM::supports_mla_graph_kv_bucketing();
   }
 
   std::unique_ptr<ModelGraphMetadataState> create_graph_forward_metadata_state()
@@ -238,6 +279,34 @@ class CausalLMImpl : public CausalLM {
     model_->load_model(std::move(loader));
   }
 
+  ModelOutput write_context_kv(const torch::Tensor& target_hidden,
+                               const torch::Tensor& positions,
+                               const torch::Tensor& device_cache_slots,
+                               std::vector<KVCache>& kv_caches,
+                               const ModelInputParams& input_params) override {
+    if constexpr (detail::has_write_context_kv<Model>::value) {
+      return model_->write_context_kv(target_hidden,
+                                      positions,
+                                      device_cache_slots,
+                                      kv_caches,
+                                      input_params);
+    } else {
+      return CausalLM::write_context_kv(target_hidden,
+                                        positions,
+                                        device_cache_slots,
+                                        kv_caches,
+                                        input_params);
+    }
+  }
+
+  torch::Tensor dspark_markov_bias(
+      const torch::Tensor& previous_token_ids) override {
+    if constexpr (detail::has_dspark_markov_bias<Model>::value) {
+      return model_->dspark_markov_bias(previous_token_ids);
+    }
+    return CausalLM::dspark_markov_bias(previous_token_ids);
+  }
+
   void lazy_load_model(std::unique_ptr<ModelLoader> loader) override {
     if constexpr (detail::has_lazy_load_model<Model>::value) {
       model_->lazy_load_model(std::move(loader));
@@ -270,14 +339,27 @@ class CausalLMImpl : public CausalLM {
     }
   }
 
-  virtual void prepare_expert_weight(
-      int32_t layer_id,
-      const std::vector<int32_t>& expert_ids) override {
+  void prepare_expert_weight(int32_t layer_id,
+                             const std::vector<int32_t>& expert_ids) override {
     return model_->prepare_expert_weight(layer_id, expert_ids);
   }
 
-  virtual void update_expert_weight(int32_t layer_id) {
+  void start_expert_weight_transfer(int32_t layer_id) override {
+    if constexpr (detail::has_start_expert_weight_transfer<Model>::value) {
+      model_->start_expert_weight_transfer(layer_id);
+    }
+  }
+
+  void update_expert_weight(int32_t layer_id) override {
     return model_->update_expert_weight(layer_id);
+  }
+
+  bool last_prepare_expert_weight_ok(int32_t layer_id) const override {
+    if constexpr (detail::has_last_prepare_expert_weight_ok<Model>::value) {
+      return model_->last_prepare_expert_weight_ok(layer_id);
+    } else {
+      return CausalLM::last_prepare_expert_weight_ok(layer_id);
+    }
   }
 
 #if defined(USE_NPU)

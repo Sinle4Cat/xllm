@@ -51,6 +51,8 @@ void Request::create_sequences_group() {
   SequenceParams sequence_params;
   sequence_params.seq_capacity = state_.seq_capacity;
   sequence_params.skip_special_tokens = state_.skip_special_tokens;
+  sequence_params.include_stop_str_in_output =
+      state_.include_stop_str_in_output;
   sequence_params.echo = state_.echo;
   sequence_params.logprobs = state_.logprobs;
   sequence_params.n = state_.n;
@@ -187,7 +189,12 @@ void Request::record_num_prefix_cache_tokens() {
   for (const auto& seq : sequences()) {
     current_max = std::max(current_max, seq->num_prefix_cache_tokens());
   }
-  num_prefix_cache_tokens_ = std::max(num_prefix_cache_tokens_, current_max);
+  record_num_prefix_cache_tokens(current_max);
+}
+
+void Request::record_num_prefix_cache_tokens(size_t num_prefix_cache_tokens) {
+  num_prefix_cache_tokens_ =
+      std::max(num_prefix_cache_tokens_, num_prefix_cache_tokens);
 }
 
 void Request::update_connection_status() {

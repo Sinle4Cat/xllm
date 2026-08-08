@@ -21,11 +21,13 @@ limitations under the License.
 #include <tuple>
 #include <vector>
 
+#if defined(USE_NPU)
 #include "core/kernels/npu/npu_ops_api.h"
+#endif
 
 namespace xllm::dit {
 
-struct RainFusionConfig {
+struct SparseAttnConfig {
   float sparsity = 0.5;
   int64_t pool_size = 128;
   int64_t sparse_start_step = 0;  // skip_timesteps
@@ -37,7 +39,7 @@ struct RainFusionConfig {
 };
 
 // Per-request dynamic state for sparse / RainFusion attention.
-struct RainFusionState {
+struct SparseAttnState {
   int64_t current_step = 0;
   std::vector<int64_t> latent_shape = {1, 1, 1};
   int64_t seq_len = -1;
@@ -105,6 +107,7 @@ inline torch::Tensor avgpool(const torch::Tensor& input,
 //  Internal helpers live in the rain_fusion namespace to scope
 //  preprocessing from the sparse_attention variant.
 // =========================================================================
+#if defined(USE_NPU)
 namespace rain_fusion {
 
 // Layout helpers: merge B*N for NPU 8-dim compliance.
@@ -357,8 +360,8 @@ inline std::tuple<torch::Tensor, torch::Tensor> attention(
     const torch::Tensor& query,
     const torch::Tensor& key,
     const torch::Tensor& value,
-    const RainFusionConfig& config,
-    RainFusionState& state) {
+    const SparseAttnConfig& config,
+    SparseAttnState& state) {
   CHECK(query.dim() == 4) << "query must be 4D [B, N, S, D]";
   CHECK(query.dtype() == torch::kHalf || query.dtype() == torch::kBFloat16)
       << "query must be fp16 or bf16";
@@ -719,8 +722,8 @@ inline std::tuple<torch::Tensor, torch::Tensor> attention(
     const torch::Tensor& query,
     const torch::Tensor& key,
     const torch::Tensor& value,
-    const RainFusionConfig& config,
-    RainFusionState& state) {
+    const SparseAttnConfig& config,
+    SparseAttnState& state) {
   CHECK(query.dim() == 4) << "query must be 4D [B, N, S, D]";
   int64_t tq = state.latent_shape[0], hq = state.latent_shape[1],
           wq = state.latent_shape[2];
@@ -777,5 +780,6 @@ inline std::tuple<torch::Tensor, torch::Tensor> attention(
 }
 
 }  // namespace sparse_attention
+#endif  // defined(USE_NPU)
 
 }  // namespace xllm::dit

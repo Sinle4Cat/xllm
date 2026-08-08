@@ -15,10 +15,13 @@ limitations under the License.
 
 #include "device.h"
 
+#include "core/framework/config/model_config.h"
 #include "core/platform/platform.h"
 #if defined(USE_NPU)
 #include <torch_npu/csrc/aten/NPUGeneratorImpl.h>
 #include <torch_npu/csrc/core/npu/NPUCachingAllocator.h>
+#include <torch_npu/csrc/core/npu/NPUFunctions.h>
+#include <torch_npu/csrc/libs/init_npu.h>
 #elif defined(USE_MLU)
 #include <cn_api.h>
 #include <framework/core/caching_allocator.h>
@@ -41,14 +44,14 @@ limitations under the License.
 namespace xllm {
 
 Device::Device(const torch::Device& device) : device_(device) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_MUSA)
   Platform::init_capabilities(device.index());
 #endif
 }
 
 Device::Device(const int32_t device_index)
     : device_(torch::Device(Platform::type_torch(), device_index)) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_MUSA)
   Platform::init_capabilities(device_index);
 #endif
 }
@@ -94,7 +97,14 @@ int32_t Device::index() const { return device_.index(); }
 // set device before init device context
 void Device::init_device_context() const {
 #if defined(USE_NPU)
-  torch_npu::init_npu(index());
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    // Python path: full NPU runtime already initialized in main() via
+    // aclInit + torch_npu._C._npu_init(). Only switch device here.
+    c10_npu::SetDevice(index());
+  } else {
+    torch_npu::init_npu(index());
+  }
 #endif
 }
 

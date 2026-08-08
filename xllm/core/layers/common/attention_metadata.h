@@ -85,6 +85,8 @@ struct AttentionMetadata {
   std::string compute_dtype;
   bool is_prefill;
   bool is_chunked_prefill;
+  // Run prefill attention without writing key/value tensors to paged cache.
+  bool prefill_without_cache = false;
   bool is_dummy;
   // Whether to apply causal mask. Default: true.
   bool is_causal = true;
@@ -161,6 +163,8 @@ struct AttentionMetadata {
   torch::Tensor chunk_indices;
   torch::Tensor batch;
   torch::Tensor token_block_offset;
+  // Per-sequence recurrent-state validity for prefill/chunked-prefill only.
+  // Decode advances already-initialized states selected by linear state ids.
   torch::Tensor has_initial_states;
   int32_t tot = 0;
 

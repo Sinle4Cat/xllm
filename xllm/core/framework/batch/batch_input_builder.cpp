@@ -22,6 +22,8 @@ limitations under the License.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iterator>
+#include <limits>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -45,6 +47,15 @@ limitations under the License.
 namespace xllm {
 namespace {
 
+// Minimum estimated total query tokens in a batch before process_sequences
+// takes the multithreaded path. Below this, the fixed thread-dispatch plus
+// O(total-tokens) serial-merge overhead outweighs the parallel savings, so the
+// single-threaded path is faster (measured: decode batches of thousands of
+// 1-token sequences and small prefill batches all regress under threading;
+// only large prefill workloads above this range benefit). Chosen conservatively
+// so decode always stays single-threaded while large prefill still fans out.
+constexpr size_t kMultithreadTokenThreshold = 65536;
+
 uint32_t get_sample_source_position(const SampleSlot& sample_slot) {
   if (sample_slot.token_position == 0) {
     return 0;
@@ -54,6 +65,7 @@ uint32_t get_sample_source_position(const SampleSlot& sample_slot) {
 
 void append_xtensor_offsets(TransferKVInfo* info,
                             const TransferKVInfo& full_info,
+                            size_t remote_id_count,
                             const std::vector<size_t>& remote_idxs) {
   if (full_info.dst_xtensor_layer_offsets.empty()) {
     return;
@@ -63,8 +75,8 @@ void append_xtensor_offsets(TransferKVInfo* info,
       full_info.dst_xtensor_layer_offsets.size());
   for (const XTensorLayerOffsets& full_layer :
        full_info.dst_xtensor_layer_offsets) {
-    CHECK_EQ(full_layer.k_offsets.size(), full_info.remote_blocks_ids.size());
-    CHECK_EQ(full_layer.v_offsets.size(), full_info.remote_blocks_ids.size());
+    CHECK_EQ(full_layer.k_offsets.size(), remote_id_count);
+    CHECK_EQ(full_layer.v_offsets.size(), remote_id_count);
     XTensorLayerOffsets layer;
     layer.k_offsets.reserve(remote_idxs.size());
     layer.v_offsets.reserve(remote_idxs.size());
@@ -169,6 +181,23 @@ torch::Tensor build_pinned_int_tensor(const std::vector<int32_t>& values) {
                            .pinned_memory(true));
 }
 
+// Whether the current prefill step end should hold a linear-state checkpoint.
+// Checkpoints are saved at prefill step ends that land on a chunk-end boundary
+// (stride = max_tokens_per_chunk_for_prefill). The linear-state cache is a
+// sparse per-chunk overlay: KV may cache every block boundary while
+// linear-state saves only at chunk ends.
+bool should_save_linear_checkpoint(Sequence* sequence,
+                                   uint32_t boundary_tokens,
+                                   uint32_t chunk_stride) {
+  if (sequence == nullptr || !sequence->is_prefill_stage()) {
+    return false;
+  }
+  if (boundary_tokens == 0 || chunk_stride == 0) {
+    return false;
+  }
+  return boundary_tokens % chunk_stride == 0;
+}
+
 }  // namespace
 
 BatchInputBuilder::BatchInputBuilder(
@@ -191,7 +220,7 @@ BatchInputBuilder::BatchInputBuilder(
       num_sequences_(sequences.size()),
       swap_block_transfer_infos_(swap_block_transfer_infos),
       batch_id_(batch_id),
-      cp_size_(std::max(1, cp_size)) {
+      cp_size_(1) {
   // Reserve space for better performance
   const size_t reserve_size = 1024;
   state_.flatten_tokens_vec.reserve(reserve_size);
@@ -211,71 +240,159 @@ BatchInputBuilder::BatchInputBuilder(
 
 TransferKVInfo BatchInputBuilder::build_step_transfer_info(
     const TransferKVInfo& full_info,
-    const std::vector<uint64_t>& local_block_ids,
-    size_t next_transfer_block_idx,
+    Sequence* sequence,
     uint32_t seq_len,
-    uint32_t block_size,
-    size_t* advanced_transfer_block_idx) {
-  CHECK(advanced_transfer_block_idx != nullptr);
-  *advanced_transfer_block_idx = next_transfer_block_idx;
+    uint32_t kv_split_size) {
+  CHECK(sequence != nullptr);
 
   TransferKVInfo info;
   info.request_id = full_info.request_id;
   info.dp_rank = full_info.dp_rank;
   info.remote_instance_info = full_info.remote_instance_info;
-  info.local_linear_state_ids = full_info.local_linear_state_ids;
-  info.remote_linear_state_ids = full_info.remote_linear_state_ids;
+  info.dst_xtensor_layer_offsets.clear();
 
-  if (block_size == 0 || local_block_ids.empty()) {
-    return info;
-  }
+  for (const KVTransferMapping& full_mapping : full_info.mappings) {
+    const std::optional<BlockType> block_type =
+        block_type_from_cache_group_id(full_mapping.group_id);
+    if (!block_type.has_value()) {
+      LOG(ERROR) << "Unknown KV cache transfer group: "
+                 << full_mapping.group_id;
+      continue;
+    }
 
-  const size_t local_size = local_block_ids.size();
-  const size_t remote_size = full_info.remote_blocks_ids.size();
-  const size_t win_begin = next_transfer_block_idx;
-  const size_t win_end =
-      static_cast<size_t>(util::ceil_div(seq_len, block_size));
-  const size_t map_end = std::min(win_end, local_size);
-  const size_t remote_stride =
-      static_cast<size_t>(util::kv_split_size_effective());
-  const size_t remote_end = map_end * remote_stride;
-  CHECK_GE(util::align_up(remote_size, remote_stride), remote_end)
-      << "remote block coverage shortage, request_id=" << full_info.request_id
-      << ", remote_size=" << remote_size << ", remote_end=" << remote_end
-      << ", remote_stride=" << remote_stride;
+    KVTransferMapping step_mapping;
+    step_mapping.group_id = full_mapping.group_id;
+    step_mapping.remote_shared_num = full_mapping.remote_shared_num;
+    if (block_type.value() == BlockType::LINEAR ||
+        block_type.value() == BlockType::EMBEDDING) {
+      const int32_t local_id = block_type.value() == BlockType::LINEAR
+                                   ? sequence->get_linear_state_slot_id()
+                                   : sequence->get_embedding_block_id();
+      if (local_id < 0 || full_mapping.remote_ids.empty()) {
+        info.mappings.emplace_back(std::move(step_mapping));
+        continue;
+      }
+      CHECK_EQ(full_mapping.remote_ids.size(), static_cast<size_t>(1))
+          << "Sequence-scoped KV mapping must contain exactly one remote id, "
+          << "group_id=" << full_mapping.group_id;
+      step_mapping.local_ids.emplace_back(static_cast<uint64_t>(local_id));
+      step_mapping.remote_ids = full_mapping.remote_ids;
+      info.mappings.emplace_back(std::move(step_mapping));
+      continue;
+    }
 
-  const size_t stable_end = static_cast<size_t>(seq_len / block_size);
-  *advanced_transfer_block_idx =
-      std::max(next_transfer_block_idx, std::min(stable_end, map_end));
+    const Slice<Block> blocks = sequence->kv_state().blocks(block_type.value());
+    if (blocks.empty() || full_mapping.remote_ids.empty()) {
+      info.mappings.emplace_back(std::move(step_mapping));
+      continue;
+    }
+    uint32_t block_size = 0;
+    std::vector<int32_t> local_ids;
+    local_ids.reserve(blocks.size());
+    for (const Block& block : blocks) {
+      local_ids.emplace_back(block.id());
+      if (block.is_valid()) {
+        block_size = block.size();
+      }
+    }
+    if (block_size == 0) {
+      info.mappings.emplace_back(std::move(step_mapping));
+      continue;
+    }
 
-  if (win_begin >= map_end) {
-    return info;
-  }
+    const bool is_flat_kv = block_type.value() == BlockType::KV;
+    const size_t next_transfer_idx =
+        is_flat_kv ? sequence->kv_state().next_transfer_block_idx()
+                   : sequence->kv_state().next_group_transfer_block_idx(
+                         block_type.value());
+    const size_t win_end =
+        static_cast<size_t>(util::ceil_div(seq_len, block_size));
+    const size_t map_end = std::min(win_end, local_ids.size());
+    const size_t remote_stride =
+        is_flat_kv ? static_cast<size_t>(kv_split_size) : 1;
+    CHECK_GT(remote_stride, static_cast<size_t>(0));
+    const size_t remote_shared_num =
+        static_cast<size_t>(full_mapping.remote_shared_num);
+    CHECK_GE(next_transfer_idx, remote_shared_num)
+        << "P transfer cursor slid below D-side shared prefix, request_id="
+        << full_info.request_id << ", group_id=" << full_mapping.group_id
+        << ", next_transfer_idx=" << next_transfer_idx
+        << ", remote_shared_num=" << remote_shared_num;
 
-  std::vector<size_t> remote_idxs;
-  const size_t block_cnt = map_end - win_begin;
-  info.local_blocks_ids.reserve(block_cnt);
-  info.remote_blocks_ids.reserve(block_cnt * remote_stride);
-  remote_idxs.reserve(block_cnt * remote_stride);
-  for (size_t local_idx = win_begin; local_idx < map_end; ++local_idx) {
-    info.local_blocks_ids.emplace_back(local_block_ids[local_idx]);
-    for (size_t offset = 0; offset < remote_stride; ++offset) {
-      const size_t remote_idx = local_idx * remote_stride + offset;
-      if (remote_idx >= full_info.remote_blocks_ids.size()) {
-        if (remote_stride > 1) {
+    // Flat KV responses omit D-side shared blocks, while grouped responses
+    // preserve their full logical tables (including SWA placeholders).
+    const size_t remote_origin = is_flat_kv ? remote_shared_num : 0;
+    const size_t remote_end =
+        map_end > remote_origin ? (map_end - remote_origin) * remote_stride : 0;
+    CHECK_GE(util::align_up(full_mapping.remote_ids.size(), remote_stride),
+             remote_end)
+        << "KV remote id coverage shortage, request_id=" << full_info.request_id
+        << ", group_id=" << full_mapping.group_id
+        << ", remote_size=" << full_mapping.remote_ids.size()
+        << ", remote_end=" << remote_end << ", remote_stride=" << remote_stride
+        << ", remote_shared_num=" << remote_shared_num;
+
+    const size_t stable_end = static_cast<size_t>(seq_len / block_size);
+    const size_t advanced_transfer_idx =
+        std::max(next_transfer_idx, std::min(stable_end, map_end));
+    if (is_flat_kv) {
+      sequence->kv_state().advance_transfer_block_idx(advanced_transfer_idx);
+    } else {
+      sequence->kv_state().advance_group_transfer_block_idx(
+          block_type.value(), advanced_transfer_idx);
+    }
+    if (next_transfer_idx >= map_end || map_end <= remote_origin) {
+      info.mappings.emplace_back(std::move(step_mapping));
+      continue;
+    }
+
+    const size_t block_count = map_end - next_transfer_idx;
+    step_mapping.local_ids.reserve(block_count);
+    step_mapping.remote_ids.reserve(block_count * remote_stride);
+    std::vector<size_t> remote_idxs;
+    remote_idxs.reserve(block_count * remote_stride);
+    for (size_t local_idx = next_transfer_idx; local_idx < map_end;
+         ++local_idx) {
+      if (local_ids[local_idx] < 0) {
+        continue;
+      }
+      const size_t remote_ids_begin = step_mapping.remote_ids.size();
+      const size_t remote_idxs_begin = remote_idxs.size();
+      bool has_remote_sentinel = false;
+      for (size_t offset = 0; offset < remote_stride; ++offset) {
+        const size_t remote_idx =
+            (local_idx - remote_origin) * remote_stride + offset;
+        if (remote_idx >= full_mapping.remote_ids.size()) {
+          CHECK_GT(remote_stride, static_cast<size_t>(1));
           break;
         }
-        LOG(FATAL) << "Out of bound access: remote_idx=" << remote_idx
-                   << ", remote_blocks_ids.size()="
-                   << full_info.remote_blocks_ids.size();
+        if (full_mapping.remote_ids[remote_idx] ==
+            std::numeric_limits<uint64_t>::max()) {
+          has_remote_sentinel = true;
+          break;
+        }
+        step_mapping.remote_ids.emplace_back(
+            full_mapping.remote_ids[remote_idx]);
+        remote_idxs.emplace_back(remote_idx);
       }
-      info.remote_blocks_ids.emplace_back(
-          full_info.remote_blocks_ids[remote_idx]);
-      remote_idxs.emplace_back(remote_idx);
+      if (has_remote_sentinel) {
+        step_mapping.remote_ids.resize(remote_ids_begin);
+        remote_idxs.resize(remote_idxs_begin);
+        continue;
+      }
+      step_mapping.local_ids.emplace_back(
+          static_cast<uint64_t>(local_ids[local_idx]));
     }
+    if (step_mapping.local_ids.empty()) {
+      info.mappings.emplace_back(std::move(step_mapping));
+      continue;
+    }
+    if (is_flat_kv) {
+      append_xtensor_offsets(
+          &info, full_info, full_mapping.remote_ids.size(), remote_idxs);
+    }
+    info.mappings.emplace_back(std::move(step_mapping));
   }
-
-  append_xtensor_offsets(&info, full_info, remote_idxs);
   return info;
 }
 
@@ -289,7 +406,26 @@ ForwardInput BatchInputBuilder::build_forward_input(
 }
 
 void BatchInputBuilder::process_sequences() {
-  if (thread_pool_ && num_sequences_ >= thread_pool_->size()) {
+  // Multithreading only helps when the parallelized per-sequence work is large
+  // enough to amortize the fixed thread-dispatch cost plus the serial merge of
+  // per-thread states (which is O(total tokens)). Decode batches carry ~1 query
+  // token per sequence, so even thousands of sequences stay far below that
+  // break-even and run faster single-threaded. Gate on the estimated total
+  // query-token workload, not just the sequence count. The estimate mirrors the
+  // q_seq_len computed in process_single_sequence and uses only O(1) accessors.
+  bool use_multithread = thread_pool_ && num_sequences_ >= thread_pool_->size();
+  if (use_multithread) {
+    size_t total_query_tokens = 0;
+    for (int32_t i = 0; i < num_sequences_; ++i) {
+      const Sequence* sequence = sequences_[i];
+      const size_t need_compute = sequence->num_need_compute_tokens();
+      total_query_tokens +=
+          std::min(need_compute, static_cast<size_t>(allowed_max_tokens_[i]));
+    }
+    use_multithread = total_query_tokens >= kMultithreadTokenThreshold;
+  }
+
+  if (use_multithread) {
     process_sequences_multithreaded();
   } else {
     for (int32_t i = 0; i < num_sequences_; ++i) {
@@ -313,6 +449,21 @@ void BatchInputBuilder::process_sequences_multithreaded() {
 
   for (auto& thread_state : thread_builder_states) {
     thread_state.batch_forward_type = state_.batch_forward_type;
+    // Reserve per-thread scratch so parallel processing does not repeatedly
+    // reallocate (which serializes on the allocator and erodes the speedup).
+    thread_state.block_tables_vec.reserve(sequences_per_thread);
+    thread_state.new_token_slot_ids.reserve(sequences_per_thread);
+    thread_state.kv_cache_tokens_nums.reserve(sequences_per_thread);
+#if defined(USE_NPU) || defined(USE_MUSA)
+    thread_state.seq_lens.reserve(sequences_per_thread);
+    thread_state.q_seq_lens.reserve(sequences_per_thread);
+#endif
+    thread_state.embedding_ids.reserve(sequences_per_thread);
+    thread_state.linear_state_ids.reserve(sequences_per_thread);
+    thread_state.linear_restore_src_blocks.reserve(sequences_per_thread);
+    thread_state.request_ids.reserve(sequences_per_thread);
+    thread_state.extra_token_ids.reserve(sequences_per_thread);
+    thread_state.scheduled_mm_data_vec.reserve(sequences_per_thread);
   }
 
   // parallel processing function
@@ -352,8 +503,47 @@ void BatchInputBuilder::process_sequences_multithreaded() {
   // Wait for all tasks to complete
   counter.wait();
 
-  // Merge results from all threads
+  // Pre-reserve the destination vectors to their exact final sizes so the
+  // serial merge does a single allocation per field instead of growing
+  // geometrically across thread states. The merge is O(total work) and runs
+  // single-threaded, so realloc churn here directly caps the achievable
+  // multithreaded speedup.
+  size_t total_tokens = 0;
+  size_t total_seqs = 0;
+  size_t total_slots = 0;
+  size_t total_paged_indices = 0;
+  size_t total_linear_restore_sources = 0;
   for (const auto& state : thread_builder_states) {
+    total_tokens += state.flatten_tokens_vec.size();
+    total_seqs += state.block_tables_vec.size();
+    total_slots += state.new_token_slot_ids.size();
+    total_paged_indices += state.paged_kv_indices.size();
+    total_linear_restore_sources += state.linear_restore_src_blocks.size();
+  }
+  state_.flatten_tokens_vec.reserve(total_tokens);
+  if (!use_mrope_) {
+    state_.flatten_positions_vec.reserve(total_tokens);
+  } else {
+    state_.mrope_positions_vec.reserve(total_seqs);
+  }
+  state_.block_tables_vec.reserve(total_seqs);
+  state_.new_token_slot_ids.reserve(total_slots);
+  state_.kv_cache_tokens_nums.reserve(total_seqs);
+#if defined(USE_NPU) || defined(USE_MUSA)
+  state_.seq_lens.reserve(total_seqs);
+  state_.q_seq_lens.reserve(total_seqs);
+#endif
+  state_.embedding_ids.reserve(total_seqs);
+  state_.linear_state_ids.reserve(total_seqs);
+  state_.linear_restore_src_blocks.reserve(total_linear_restore_sources);
+  state_.request_ids.reserve(total_seqs);
+  state_.extra_token_ids.reserve(total_seqs);
+  state_.paged_kv_indices.reserve(total_paged_indices);
+  state_.paged_kv_indptr.reserve(total_seqs + 1);
+  state_.paged_kv_last_page_len.reserve(total_seqs);
+
+  // Merge results from all threads
+  for (auto& state : thread_builder_states) {
     state_.flatten_tokens_vec.insert(state_.flatten_tokens_vec.end(),
                                      state.flatten_tokens_vec.begin(),
                                      state.flatten_tokens_vec.end());
@@ -431,6 +621,13 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.linear_state_ids.insert(state_.linear_state_ids.end(),
                                    state.linear_state_ids.begin(),
                                    state.linear_state_ids.end());
+    state_.linear_state_cache_ops.insert(state_.linear_state_cache_ops.end(),
+                                         state.linear_state_cache_ops.begin(),
+                                         state.linear_state_cache_ops.end());
+    state_.linear_restore_src_blocks.insert(
+        state_.linear_restore_src_blocks.end(),
+        std::make_move_iterator(state.linear_restore_src_blocks.begin()),
+        std::make_move_iterator(state.linear_restore_src_blocks.end()));
     state_.request_ids.insert(state_.request_ids.end(),
                               state.request_ids.begin(),
                               state.request_ids.end());
@@ -450,6 +647,9 @@ void BatchInputBuilder::process_sequences_multithreaded() {
     state_.transfer_kv_infos.insert(state_.transfer_kv_infos.end(),
                                     state.transfer_kv_infos.begin(),
                                     state.transfer_kv_infos.end());
+    state_.scheduled_mm_data_vec.insert(state_.scheduled_mm_data_vec.end(),
+                                        state.scheduled_mm_data_vec.begin(),
+                                        state.scheduled_mm_data_vec.end());
 
     // for flashinfer
     // we skip the first '0' element
@@ -503,14 +703,7 @@ void BatchInputBuilder::process_single_sequence(
   CHECK(allowed_max_tokens_[seq_index] > 0);
   const uint32_t q_seq_len =
       std::min(n_tokens - n_kv_cache_tokens, allowed_max_tokens_[seq_index]);
-  uint32_t padded_q_seq_len = q_seq_len;
-  // Continuous scheduler can enlarge token budget for CP prefill padding.
-  // Keep physical q_len aligned to 2 * cp_size to match later cp_partition.
-  if (cp_size_ > 1 && state.batch_forward_type.no_decode()) {
-    const uint32_t aligned_q_seq_len =
-        xllm::util::align_up(q_seq_len, cp_size_ * 2);
-    padded_q_seq_len = aligned_q_seq_len;
-  }
+  const uint32_t padded_q_seq_len = q_seq_len;
   const uint32_t logical_seq_len = q_seq_len + n_kv_cache_tokens;
   const uint32_t seq_len = padded_q_seq_len + n_kv_cache_tokens;
 
@@ -537,10 +730,11 @@ void BatchInputBuilder::process_single_sequence(
   state.q_seq_lens.push_back(state.q_seq_lens.back() + padded_q_seq_len);
 #endif
   // Process multi-modal input
-  process_multi_modal_inputs(sequence, n_kv_cache_tokens, q_seq_len, seq_index);
+  process_multi_modal_inputs(
+      sequence, n_kv_cache_tokens, q_seq_len, seq_index, state_ptr);
   // Process tokens and positions
   extract_tokens_and_positions(
-      sequence, n_kv_cache_tokens, logical_seq_len, seq_len, state_ptr);
+      sequence, n_kv_cache_tokens, logical_seq_len, state_ptr);
 
   // Setup KV cache
   setup_kv_cache_info(sequence,
@@ -560,7 +754,6 @@ void BatchInputBuilder::process_single_sequence(
 void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
                                                      uint32_t n_kv_cache_tokens,
                                                      uint32_t seq_len,
-                                                     uint32_t padded_seq_len,
                                                      BuilderState* state_ptr) {
   BuilderState& state = state_ptr ? *state_ptr : state_;
   const size_t seq_token_begin = state.flatten_tokens_vec.size();
@@ -608,20 +801,7 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
     }
   }
 
-  // Right padding for CP prefill: append physical tokens only for cache/layout.
-  if (padded_seq_len > seq_len) {
-    const int32_t pad_token_id = args_ ? args_->pad_token_id() : 0;
-    for (uint32_t j = seq_len; j < padded_seq_len; ++j) {
-      state.flatten_tokens_vec.emplace_back(pad_token_id);
-      if (!use_mrope_) {
-        state.flatten_positions_vec.push_back(static_cast<int32_t>(j));
-      }
-    }
-  }
-
-  // `linear_state_ids` is sequence-scoped metadata and must stay aligned with
-  // logical batch rows even for non-terminal chunked-prefill slices.
-  state.linear_state_ids.emplace_back(sequence->get_single_block_id());
+  append_linear_state_row(sequence, n_kv_cache_tokens, seq_len, state);
 
   // Add extra token id
   int32_t extra_token_id = -1;
@@ -629,7 +809,7 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
     // last chunk of prefill and decode
     // add -1 as extra token id
     state.extra_token_ids.emplace_back(-1);
-    state.embedding_ids.emplace_back(sequence->get_single_block_id());
+    state.embedding_ids.emplace_back(sequence->get_embedding_block_id());
     state.request_ids.emplace_back(sequence->request_id());
     torch::Tensor mtp_bootstrap = sequence->get_mtp_bootstrap_embedding();
     if (state.batch_forward_type.is_decode() && mtp_bootstrap.defined()) {
@@ -660,28 +840,94 @@ void BatchInputBuilder::extract_tokens_and_positions(Sequence* sequence,
     extra_token_id = token_ids[seq_len];
     state.extra_token_ids.emplace_back(extra_token_id);
   }
+}
 
-  // Build MTP shifted token ids for both pure prefill and chunked-prefill
-  // (no_decode) when CP is enabled. The shift-by-1 layout is required by the
-  // CP-aware MTP loss computation across both layouts; using is_prefill()
-  // here (upstream default) would miss chunked-prefill chunks and produce
-  // mis-aligned logits when CP > 1.
-  if (cp_size_ > 1 && state.batch_forward_type.no_decode()) {
-    const uint32_t q_len = seq_len - n_kv_cache_tokens;
-    if (q_len > 1) {
-      state.mtp_shifted_token_ids.insert(
-          state.mtp_shifted_token_ids.end(),
-          state.flatten_tokens_vec.begin() + seq_token_begin + 1,
-          state.flatten_tokens_vec.begin() + seq_token_begin + q_len);
-    }
-    state.mtp_shifted_token_ids.emplace_back(extra_token_id);
-    if (padded_seq_len > seq_len) {
-      const int32_t pad_token_id = args_ ? args_->pad_token_id() : 0;
-      state.mtp_shifted_token_ids.insert(state.mtp_shifted_token_ids.end(),
-                                         padded_seq_len - seq_len,
-                                         pad_token_id);
+void BatchInputBuilder::append_linear_state_row(Sequence* sequence,
+                                                uint32_t n_kv_cache_tokens,
+                                                uint32_t seq_len,
+                                                BuilderState& state) {
+  // linear_state_ids must stay aligned with logical batch rows even when the
+  // model has no linear-attention layers, because downstream consumers index by
+  // batch row. GDN models always hold a dedicated LINEAR slot, so read it
+  // directly; non-linear models emit -1 and return early below.
+  const bool has_linear_attention =
+      args_ && has_linear_attention_layers(*args_);
+  int32_t linear_state_id = sequence->get_linear_state_slot_id();
+  state.linear_state_ids.emplace_back(linear_state_id);
+  if (!has_linear_attention) {
+    return;
+  }
+
+  LinearStateCacheOp linear_state_cache_op;
+  linear_state_cache_op.linear_state_id = state.linear_state_ids.back();
+  linear_state_cache_op.reset_requested = n_kv_cache_tokens == 0;
+  // Linear-state checkpoints live on chunk-end boundaries, so the prefix hash
+  // is chained per chunk (stride = max_tokens_per_chunk_for_prefill), not per
+  // KV block. The engine enforces this stride is a positive multiple of
+  // block_size when linear prefix cache is on (llm_engine.cpp); guard against
+  // an unset (<= 0) stride so a misconfigured run simply skips cache ops.
+  const int32_t chunk_stride = ::xllm::SchedulerConfig::get_instance()
+                                   .max_tokens_per_chunk_for_prefill();
+  // Cold-start restore: emit a restore hash only when a restore source
+  // checkpoint is mounted on this sequence -- class A at admission
+  // (allocate_shared_for_sequence) or class B at the previous step's
+  // save-rotation (allocate_for_sequence) -- AND the reused prefix lands
+  // on a chunk-end boundary, where the recurrent state lives in a checkpoint.
+  // A mounted source is present exactly on a slot that is cold and needs
+  // copy-in; continued forwards keep their live slot warm with no source
+  // mounted, so they emit no restore and are not reset to cold by the worker.
+  // The source slot id is taken from that mounted block below.
+  const bool needs_restore_hash = sequence->has_linear_restore_src_block() &&
+                                  n_kv_cache_tokens > 0 && chunk_stride > 0 &&
+                                  n_kv_cache_tokens % chunk_stride == 0;
+  // Exit-boundary save: persist the live state only when this prefill step
+  // lands on a chunk-end boundary, so the linear-state cache stays a sparse
+  // per-chunk overlay on top of the per-block KV cache.
+  const bool needs_save_hash =
+      should_save_linear_checkpoint(sequence, seq_len, chunk_stride);
+  // Refresh the sequence's cached chunk hashes to cover this step's deepest
+  // boundary, then read them back. The cache is chained and incremental, so
+  // this only hashes chunks not seen on a previous step; the match probe and
+  // this builder now share the one hash source instead of each recomputing.
+  Slice<XXH3Key> linear_state_hashes;
+  if (needs_restore_hash || needs_save_hash) {
+    sequence->update_linear_state_hashes(static_cast<uint32_t>(chunk_stride));
+    linear_state_hashes = sequence->linear_state_hashes();
+  }
+  // Restore source (block-carried): allocate_shared_for_sequence mounts the
+  // deepest-hit checkpoint at admission (class A); allocate_for_sequence
+  // mounts the slot it just checkpointed at the previous step's save-rotation
+  // (class B). Take it unconditionally so unused matches are released in this
+  // build. A source used by a restore descriptor moves into builder state and
+  // then the owning Batch, which pins it until the worker result is consumed.
+  std::optional<Block> mounted_restore_src =
+      sequence->take_linear_restore_src_block();
+  if (needs_restore_hash) {
+    const size_t restore_chunk_idx =
+        static_cast<size_t>(n_kv_cache_tokens) / chunk_stride - 1;
+    CHECK_LT(restore_chunk_idx, linear_state_hashes.size())
+        << "mounted linear-state checkpoint must have a matching chunk hash";
+    CHECK(mounted_restore_src.has_value())
+        << "linear-state restore must resolve its checkpoint slot before "
+           "building worker input";
+    linear_state_cache_op.restore_requested = true;
+    linear_state_cache_op.restore_src_slot_id = mounted_restore_src->id();
+    state.linear_restore_src_blocks.emplace_back(
+        std::move(*mounted_restore_src));
+  }
+  if (needs_save_hash) {
+    const size_t save_chunk_idx =
+        static_cast<size_t>(seq_len) / chunk_stride - 1;
+    if (save_chunk_idx < linear_state_hashes.size()) {
+      // Record the boundary hash on the sequence. The LINEAR leaf executes
+      // the save at the next step's allocate_for_sequence, after this step's
+      // forward writes the boundary state into the live slot. Writing only
+      // the sequence's own pending-save field keeps this safe inside the
+      // parallel build loop.
+      sequence->set_pending_linear_save(linear_state_hashes[save_chunk_idx]);
     }
   }
+  state.linear_state_cache_ops.emplace_back(std::move(linear_state_cache_op));
 }
 
 void BatchInputBuilder::handle_sampling_parameters(Sequence* sequence,
@@ -768,6 +1014,24 @@ void BatchInputBuilder::setup_kv_cache_info(
       }
       state.multi_block_tables[m].emplace_back(std::move(block_ids));
     }
+    const std::optional<TransferKVInfo>& transfer_kv_info =
+        sequence->kv_state().transfer_kv_info();
+    if (transfer_kv_info.has_value()) {
+      TransferKVInfo step_info = build_step_transfer_info(
+          transfer_kv_info.value(),
+          sequence,
+          seq_len,
+          static_cast<uint32_t>(util::kv_split_size_effective()));
+      const bool has_transfer =
+          std::any_of(step_info.mappings.begin(),
+                      step_info.mappings.end(),
+                      [](const KVTransferMapping& mapping) {
+                        return !mapping.local_ids.empty();
+                      });
+      if (has_transfer) {
+        state.transfer_kv_infos.emplace_back(std::move(step_info));
+      }
+    }
     return;
   }
 
@@ -785,14 +1049,11 @@ void BatchInputBuilder::setup_kv_cache_info(
       state.new_token_slot_ids.end(), slot_ids.begin(), slot_ids.end());
 
   std::vector<int32_t> block_ids;
-  std::vector<uint64_t> local_block_ids;
   block_ids.reserve(blocks.size());
-  local_block_ids.reserve(blocks.size());
   int32_t block_size = 0;
   for (const auto& block : blocks) {
     block_size = block.size();
     block_ids.push_back(block.id());
-    local_block_ids.emplace_back(static_cast<uint64_t>(block.id()));
     state.paged_kv_indices.push_back(block.id());
   }
   state.paged_kv_indptr.push_back(state.paged_kv_indptr.back() + blocks.size());
@@ -810,19 +1071,17 @@ void BatchInputBuilder::setup_kv_cache_info(
 
   auto& transfer_kv_info = sequence->kv_state().transfer_kv_info();
   if (transfer_kv_info.has_value()) {
-    const size_t next_transfer_block_idx =
-        sequence->kv_state().next_transfer_block_idx();
-    size_t advanced_transfer_block_idx = next_transfer_block_idx;
     TransferKVInfo step_info = BatchInputBuilder::build_step_transfer_info(
         transfer_kv_info.value(),
-        local_block_ids,
-        next_transfer_block_idx,
+        sequence,
         seq_len,
-        static_cast<uint32_t>(block_size),
-        &advanced_transfer_block_idx);
-    sequence->kv_state().advance_transfer_block_idx(
-        advanced_transfer_block_idx);
-    if (!step_info.local_blocks_ids.empty()) {
+        static_cast<uint32_t>(util::kv_split_size_effective()));
+    const bool has_transfer = std::any_of(step_info.mappings.begin(),
+                                          step_info.mappings.end(),
+                                          [](const KVTransferMapping& mapping) {
+                                            return !mapping.local_ids.empty();
+                                          });
+    if (has_transfer) {
       state.transfer_kv_infos.emplace_back(std::move(step_info));
     }
   }
@@ -928,7 +1187,11 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
       torch::tensor(state_.paged_kv_last_page_len, torch::kInt);
 
   // Setup multimodal data
-  input_params.multimodal.mm_data.batch(mm_data_vec_);
+  std::vector<MMData> batch_mm_data_vec = mm_data_vec_;
+  batch_mm_data_vec.insert(batch_mm_data_vec.end(),
+                           state_.scheduled_mm_data_vec.begin(),
+                           state_.scheduled_mm_data_vec.end());
+  input_params.multimodal.mm_data.batch(batch_mm_data_vec);
 
   // Setup block tables
   util::pad_2d_vector(state_.block_tables_vec, /*pad_value=*/0);
@@ -937,7 +1200,7 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   input_params.attention.host.block_tables =
       input_params.attention.device.block_tables;
 
-  // Setup multi block tables for DeepSeek V4
+  // Setup grouped cache block tables.
   for (auto& mgr_tables : state_.multi_block_tables) {
     util::pad_2d_vector(mgr_tables, /*pad_value=*/-1);
     input_params.multi_block_tables.push_back(
@@ -950,6 +1213,8 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
 
   input_params.embedding.embedding_ids = std::move(state_.embedding_ids);
   input_params.embedding.linear_state_ids = std::move(state_.linear_state_ids);
+  input_params.linear_state_cache_ops =
+      std::move(state_.linear_state_cache_ops);
   if (!input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);
@@ -959,8 +1224,8 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   if (!state_.mtp_shifted_token_ids.empty()) {
     // Write both the upstream "root" path (consumed by non-CP MTP code paths
     // and by the existing shm serializer) and the CP-specific embedding path
-    // (consumed by cp_input_partition + mtp_worker_impl). Both tensors share
-    // storage via from_blob; the cost is one extra tensor handle, not a copy.
+    // (consumed by mtp_worker_impl). Both tensors share storage via from_blob;
+    // the cost is one extra tensor handle, not a copy.
     auto mtp_tensor = torch::tensor(state_.mtp_shifted_token_ids, torch::kInt);
     input_params.embedding.mtp_shifted_token_ids = mtp_tensor;
     input_params.mtp_shifted_token_ids = mtp_tensor;
@@ -1050,7 +1315,9 @@ void BatchInputBuilder::process_swap_block_infos(ForwardInput& forward_input) {
 void BatchInputBuilder::process_multi_modal_inputs(Sequence* sequence,
                                                    uint32_t n_kv_cache_tokens,
                                                    uint32_t q_seq_len,
-                                                   int32_t seq_index) {
+                                                   int32_t seq_index,
+                                                   BuilderState* state_ptr) {
+  BuilderState& state = state_ptr ? *state_ptr : state_;
   MMData& mm_data = sequence->mutable_mm_data();
   if ((sequence->stage() != SequenceStage::DECODE) && mm_data.valid()) {
     UpdateMMItemScheduleStateVisitor visitor(
@@ -1061,7 +1328,7 @@ void BatchInputBuilder::process_multi_modal_inputs(Sequence* sequence,
     }
     MMData scheduled_mm_data(visitor.scheduled_type_,
                              std::move(visitor.mm_data_items_));
-    mm_data_vec_.emplace_back(std::move(scheduled_mm_data));
+    state.scheduled_mm_data_vec.emplace_back(std::move(scheduled_mm_data));
   }
 }
 }  // namespace xllm

@@ -48,6 +48,12 @@ BUILD_TEST_FILE: bool = True
 BUILD_EXPORT: bool = True
 
 
+def _ensure_torch_npu_ready() -> None:
+    from scripts.deps.torch_npu_install import ensure_torch_npu_ready
+
+    ensure_torch_npu_ready()
+
+
 def _ensure_tilelang_ascend_ready(target_platform: str, arch: str) -> None:
     compiler_parent = os.path.join(get_base_dir(), "xllm")
     if compiler_parent not in sys.path:
@@ -83,6 +89,43 @@ def _maybe_compile_tilelang_kernels(device: str, jobs: int | str | None = None) 
         cmd.extend(["--jobs", str(jobs)])
     logger.info("compiling TileLang kernels via source-tree launcher")
     subprocess.check_call(cmd, cwd=base_dir, env=env)
+
+
+def _stage_python_kernel_package(py_pkg_src: str, py_pkg_dst: str, device: str) -> None:
+    """Stage the device's kernel package, leaving its peers out of the wheel.
+
+    ``xllm/python/`` holds one peer package per hardware platform
+    (``kernels_cuda``, ``kernels_npu``, ...). The peers share no code, never
+    import each other, and export the same names. ``xllm/python/__init__.py``
+    binds the one matching the active platform as ``xllm.python.kernels``, so
+    only that package has to reach the wheel.
+
+    The Python model executor covers fewer platforms than ``--device`` does, so
+    a device without a peer package is not a build error: the rest of
+    ``xllm.python`` still ships, and ``xllm/python/__init__.py`` rejects the
+    platform at import, which only happens once the executor is selected.
+    """
+    source = os.path.join(py_pkg_src, f"kernels_{device}")
+    if not os.path.isdir(source):
+        available = sorted(
+            name[len("kernels_"):]
+            for name in os.listdir(py_pkg_src)
+            if name.startswith("kernels_")
+            and os.path.isdir(os.path.join(py_pkg_src, name))
+        )
+        logger.info(
+            f"No Python kernel package for --device {device}; the Python model "
+            f"executor stays unavailable in this wheel (packages exist for "
+            f"{', '.join(available)}). To support it, add "
+            f"xllm/python/kernels_{device}/ exporting the same names as its "
+            "peers."
+        )
+        return
+    shutil.copytree(
+        source,
+        os.path.join(py_pkg_dst, f"kernels_{device}"),
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
 
 
 def _stage_triton_npu_runtime_binaries(base_dir: str, extdir: str, device: str) -> None:
@@ -226,6 +269,35 @@ def _stage_triton_jit_scripts(base_dir: str, extdir: str) -> None:
 
     logger.info(f"Staged triton_jit compile script into {dest_dir}")
 
+def _stage_auto_tuning_config(base_dir: str, extdir: str) -> None:
+    """Stage the per-model-type auto-tuning profiles into the wheel.
+
+    ``xllm/auto_config`` ships one ``<model_type>.json`` base config plus one
+    ``<model_type>.py`` tuning module per supported model type. The launcher
+    (``xllm/launch_server.py``) resolves this directory relative to its own
+    location, so it must land under the installed ``xllm`` package as
+    ``xllm/auto_config``. ``extdir`` already points at that package dir; do NOT
+    add another ``xllm`` segment (see ``_stage_mlu_triton_kernels`` for the
+    collision rationale).
+    """
+    source_dir = os.path.join(base_dir, "xllm", "auto_config")
+    if not os.path.isdir(source_dir):
+        raise RuntimeError(
+            f"auto-tuning config directory does not exist: {source_dir}\n"
+            "Hint: Ensure the source tree is intact (xllm/auto_config must exist)."
+        )
+
+    dest_dir = os.path.join(extdir, "auto_config")
+    if os.path.isdir(dest_dir):
+        shutil.rmtree(dest_dir)
+    shutil.copytree(
+        source_dir,
+        dest_dir,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+
+    logger.info(f"Staged auto-tuning config into {dest_dir}")
+
 class CMakeExtension(Extension):
     def __init__(self, name: str, path: str, sourcedir: str = "") -> None:
         super().__init__(name, sources=[])
@@ -335,6 +407,20 @@ class ExtBuild(build_ext):
         elif self.device == "mlu":
             cmake_args += ["-DUSE_MLU=ON"]
             set_mlu_envs()
+        elif self.device == "musa":
+            torch_cuda_architectures = os.getenv("TORCH_CUDA_ARCH_LIST")
+            if not torch_cuda_architectures:
+                torch_cuda_architectures = "9.0"
+            cmake_args += [
+                "-DUSE_MUSA=ON",
+                "-DUSE_CUDA=ON",
+                f"-DTORCH_CUDA_ARCH_LIST={torch_cuda_architectures}",
+                "-DCMAKE_CUDA_ARCHITECTURES=90",
+                "-DBUILD_TESTING=OFF",
+            ]
+            set_musa_envs()
+            global BUILD_TEST_FILE
+            BUILD_TEST_FILE = False
         elif self.device == "cuda":
             torch_cuda_architectures = os.getenv("TORCH_CUDA_ARCH_LIST")
             if not torch_cuda_architectures:
@@ -375,6 +461,12 @@ class ExtBuild(build_ext):
                 aiter_cpp_api_lib = os.getenv("AITER_CPP_API_LIB")
                 if aiter_cpp_api_lib:
                     cmake_args += [f"-DAITER_CPP_API_LIB={aiter_cpp_api_lib}"]
+
+                aiter_moe_c_kernel_lib = os.getenv("AITER_MOE_C_KERNEL_LIB")
+                if aiter_moe_c_kernel_lib:
+                    cmake_args += [
+                        f"-DAITER_MOE_C_KERNEL_LIB={aiter_moe_c_kernel_lib}"
+                    ]
             else:
                 raise RuntimeError(
                     "DCU build requires a HIP/ROCm PyTorch environment. "
@@ -394,11 +486,6 @@ class ExtBuild(build_ext):
         elif self.device == "ilu":
             cmake_args += ["-DUSE_ILU=ON"]
             set_ilu_envs()
-        elif self.device == "musa":
-            cmake_args += ["-DUSE_MUSA=ON"]
-            set_musa_envs()
-            global BUILD_TEST_FILE
-            BUILD_TEST_FILE = False
         else:
             raise ValueError("Please set --device to npu, mlu, cuda, dcu, ilu, musa or maca.")
 
@@ -455,11 +542,33 @@ class ExtBuild(build_ext):
             os.path.join(os.path.dirname(cmake_dir), "xllm/core/server/"),
         )
 
+        # Stage the Python model-executor package into the wheel as the
+        # ``xllm.python`` subpackage (xllm/python/...). The installed ``xllm``
+        # package is a regular package, so ``import xllm.python`` resolves
+        # straight from site-packages with no sys.path manipulation;
+        # --python_model_path / XLLM_PYTHON_MODEL_PATH only overrides the
+        # directory containing the ``xllm`` package (e.g. source-tree runs).
+        # The per-platform ``kernels_*`` packages are excluded here so that only
+        # the one matching --device is staged right after.
+        py_pkg_src = os.path.join(self.base_dir, "xllm", "python")
+        if os.path.isdir(py_pkg_src):
+            py_pkg_dst = os.path.join(extdir, "python")
+            if os.path.isdir(py_pkg_dst):
+                shutil.rmtree(py_pkg_dst)
+            shutil.copytree(
+                py_pkg_src,
+                py_pkg_dst,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "kernels_*"),
+            )
+            _stage_python_kernel_package(py_pkg_src, py_pkg_dst, self.device)
+
         _stage_triton_npu_runtime_binaries(self.base_dir, extdir, self.device)
 
         _stage_mlu_triton_kernels(self.base_dir, extdir, self.device)
 
         _stage_triton_jit_scripts(self.base_dir, extdir)
+
+        _stage_auto_tuning_config(self.base_dir, extdir)
 
         if BUILD_EXPORT:
             # build export module
@@ -593,8 +702,11 @@ class BuildDistWheel(bdist_wheel):
         logger.info("🔨 build project...")
         self.run_command('build')
 
-        logger.info("🧪 testing UT...")
-        self.run_command('test')
+        if "SKIP_TEST" in os.environ:
+            logger.info("⏭️ skipping UT because SKIP_TEST is set")
+        else:
+            logger.info("🧪 testing UT...")
+            self.run_command('test')
 
         if self.arch == 'arm':
             ext_path = get_base_dir() + f"/build/lib.linux-aarch64-cpython-{get_python_version()}/"
@@ -890,6 +1002,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Build xllm with CPU arch: {arch} and target device: {device}")
 
     if device == "npu":
+        _ensure_torch_npu_ready()
         _ensure_tilelang_ascend_ready(target_platform, arch)
     pre_build(device)
 

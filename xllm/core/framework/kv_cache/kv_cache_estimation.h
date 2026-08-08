@@ -19,8 +19,9 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
-#include "framework/kv_cache/kv_cache_utils.h"
+#include "framework/kv_cache/kv_cache_capacity.h"
 
 namespace xllm {
 
@@ -29,6 +30,7 @@ class ModelArgs;
 struct KVCacheEstimateOptions {
   torch::ScalarType dtype = torch::kBFloat16;
   std::string kv_cache_dtype = "auto";
+  std::string indexer_cache_dtype = "auto";
   int64_t cache_size_in_bytes = 0;
   int64_t block_size = 0;
   int64_t world_size = 1;
@@ -38,7 +40,7 @@ struct KVCacheEstimateOptions {
   int64_t max_seqs_per_batch = 0;
   int64_t num_speculative_tokens = 0;
   int64_t max_tokens_per_batch = 0;
-  int64_t max_concurrent_requests = 0;
+  int64_t max_linear_state_cache_slots = 0;
   bool is_draft_engine = false;
   bool enable_prefix_cache = false;
   const ModelArgs* draft_model_args = nullptr;
@@ -54,8 +56,18 @@ struct Dsv4KVCacheEstimateCost {
   int64_t manager_blocks_per_unit = 1;
 };
 
+std::vector<bool> resolve_indexer_cache_enabled_layers(
+    const ModelArgs& model_args,
+    int64_t num_cache_layers);
+
 KVCacheCapacity estimate_kv_cache_capacity(
     const ModelArgs& model_args,
     const KVCacheEstimateOptions& options);
+
+int64_t estimate_speculative_kv_cache_blocks(
+    const KVCacheCapacity& target_kv_cache_cap,
+    const KVCacheCapacity& draft_kv_cache_cap,
+    bool share_device,
+    bool draft_body_uses_tp1 = false);
 
 }  // namespace xllm

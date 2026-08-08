@@ -130,6 +130,7 @@ std::shared_ptr<Request> DisaggPDServiceImpl::generate_request(
                          scheduler_->enable_schedule_overlap(),
                          output_callback,
                          batch_output_callback);
+  req_state.include_stop_str_in_output = req.include_stop_str_in_output();
 
   auto new_request = std::make_shared<Request>(req.req_id(),
                                                req.x_request_id(),
@@ -175,18 +176,66 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
 
       auto dp_rank = sequence->dp_rank();
       resp->set_dp_rank(dp_rank);
-      resp->set_linear_state_id(sequence->get_single_block_id());
 
-      size_t shared_num = sequence->kv_state().shared_blocks_num(BlockType::KV);
-      auto blocks = sequence->kv_state().blocks(BlockType::KV);
-
-      // Collect block IDs
       std::vector<int32_t> block_ids;
-      block_ids.reserve(blocks.size() - shared_num);
-      for (size_t i = shared_num; i < blocks.size(); i++) {
-        int32_t block_id = blocks[i].id();
-        *(resp->mutable_blocks_ids()->Add()) = block_id;
-        block_ids.push_back(block_id);
+      if (sequence->kv_state().has_multi_block_export()) {
+        const auto export_view = sequence->kv_state().multi_block_export_view();
+        for (const auto& [block_type, blocks_ptr] : export_view) {
+          proto::KVTransferGroup* group = resp->add_groups();
+          group->set_group_id(cache_group_id(block_type));
+          // D-side shared count for this group. P advances its per-group
+          // transfer cursor to this value so it starts pushing at the first
+          // block D actually needs. SWA / LINEAR under DECODE role return
+          // 0 (prefix cache off), which is a no-op advance and reproduces
+          // the pre-existing "push everything" behavior. C4 / C128 may
+          // return >0 and let P skip the leading shared blocks.
+          group->set_remote_shared_num(static_cast<uint32_t>(
+              sequence->kv_state().shared_blocks_num(block_type)));
+          group->mutable_ids()->Reserve(blocks_ptr->size());
+          for (const auto& block : *blocks_ptr) {
+            // Invalid placeholders are legitimate for SWA: the sliding
+            // window release loop leaves moved-from Blocks in place so
+            // positional indexing stays stable, and both P and D produce
+            // the same invalid pattern for the slid-out window. Ship them
+            // as max-uint64 sentinels; BatchInputBuilder skips
+            // positions where the local block id is negative, so the
+            // remote id at those positions is never dereferenced. The
+            // CHECK below only refuses invalid blocks under types where
+            // slide-out cannot produce them (C4 / C128), preserving the
+            // guard for genuine allocation bugs.
+            const int64_t block_id = block.is_valid() ? block.id() : -1;
+            if (!block.is_valid()) {
+              CHECK(block_type == BlockType::SWA)
+                  << "Decode allocated an invalid grouped KV block under a "
+                  << "non-SWA leaf, group_id=" << cache_group_id(block_type);
+            }
+            group->mutable_ids()->Add(static_cast<uint64_t>(block_id));
+          }
+        }
+      } else {
+        const size_t shared_num =
+            sequence->kv_state().shared_blocks_num(BlockType::KV);
+        const auto blocks = sequence->kv_state().blocks(BlockType::KV);
+
+        // Collect block IDs
+        block_ids.reserve(blocks.size() - shared_num);
+        proto::KVTransferGroup* group = resp->add_groups();
+        group->set_group_id(cache_group_id(BlockType::KV));
+        group->set_remote_shared_num(static_cast<uint32_t>(shared_num));
+        group->mutable_ids()->Reserve(blocks.size() - shared_num);
+        for (size_t i = shared_num; i < blocks.size(); i++) {
+          int32_t block_id = blocks[i].id();
+          group->mutable_ids()->Add(block_id);
+          block_ids.push_back(block_id);
+        }
+      }
+      if (has_linear_attention_layers(engine_->model_args())) {
+        const int32_t linear_state_id = sequence->get_linear_state_slot_id();
+        CHECK_GE(linear_state_id, 0)
+            << "Decode did not allocate a linear-state slot.";
+        proto::KVTransferGroup* group = resp->add_groups();
+        group->set_group_id(cache_group_id(BlockType::LINEAR));
+        group->add_ids(static_cast<uint64_t>(linear_state_id));
       }
       // XTensor mode: calculate and return GlobalXTensor offsets
       if (::xllm::KVCacheConfig::get_instance().enable_xtensor() &&
@@ -239,9 +288,15 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
     std::vector<uint64_t> cluster_ids(gen.cluster_ids().begin(),
                                       gen.cluster_ids().end());
     std::vector<std::string> addrs(gen.addrs().begin(), gen.addrs().end());
-    std::vector<uint64_t> block_ids(gen.block_ids().begin(),
-                                    gen.block_ids().end());
-    int32_t linear_state_id = gen.linear_state_id();
+    std::vector<KVTransferMapping> source_mappings;
+    source_mappings.reserve(gen.source_groups_size());
+    for (const proto::KVTransferGroup& proto_group : gen.source_groups()) {
+      KVTransferMapping mapping;
+      mapping.group_id = proto_group.group_id();
+      mapping.remote_ids.assign(proto_group.ids().begin(),
+                                proto_group.ids().end());
+      source_mappings.emplace_back(std::move(mapping));
+    }
     torch::Tensor mtp_bootstrap_embedding;
     if (gen.has_mtp_bootstrap_embedding()) {
       mtp_bootstrap_embedding =
@@ -259,11 +314,12 @@ void DisaggPDServiceImpl::decode_recv_first_generation(
         gen.kv_cache_transfer_mode(),
         std::move(cluster_ids),
         std::move(addrs),
-        std::move(block_ids),
-        linear_state_id,
+        std::move(source_mappings),
         gen.dp_size(),
         gen.dp_rank(),
-        mtp_bootstrap_embedding);
+        gen.heterogeneous_pd(),
+        mtp_bootstrap_embedding,
+        gen.num_cached_tokens());
     if (!success) {
       response->set_ok(false);
       return;

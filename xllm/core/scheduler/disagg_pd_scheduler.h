@@ -27,26 +27,24 @@ limitations under the License.
 #include "framework/request/request.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "runtime/xservice_client.h"
-#include "scheduler/chunked_prefill_scheduler.h"
+#include "scheduler/continuous_scheduler.h"
 #include "server/xllm_server_registry.h"
 #include "util/blockingconcurrentqueue.h"
 #include "util/threadpool.h"
 
 namespace xllm {
 
-class DisaggPDScheduler : public ChunkedPrefillScheduler {
+class DisaggPDScheduler : public ContinuousScheduler {
  public:
   DisaggPDScheduler(Engine* engine, const Options& options);
 
-  virtual ~DisaggPDScheduler();
+  ~DisaggPDScheduler() override;
 
-  virtual uint32_t get_waiting_requests_num() const override {
-    return waiting_priority_queue_->size();
+  uint32_t get_waiting_requests_num() const override {
+    return prefill_queue_->size();
   };
 
   void step(const absl::Duration& timeout) override;
-
-  std::vector<Batch> prepare_batch() override;
 
   bool add_request(std::shared_ptr<Request>& request) override;
 
@@ -70,11 +68,12 @@ class DisaggPDScheduler : public ChunkedPrefillScheduler {
       const std::string& kv_cache_transfer_mode,
       std::vector<uint64_t> src_cluster_ids,
       std::vector<std::string> src_addrs,
-      std::vector<uint64_t> src_block_ids,
-      int32_t src_linear_state_id,
+      std::vector<KVTransferMapping> source_mappings,
       int32_t src_dp_size,
       int32_t src_dp_rank,
-      torch::Tensor mtp_bootstrap_embedding = torch::Tensor());
+      bool heterogeneous_pd = false,
+      torch::Tensor mtp_bootstrap_embedding = torch::Tensor(),
+      int32_t num_cached_tokens = 0);
 
   // decode allocate blocks with prefix cache.
   bool try_allocate(Sequence* sequence);
@@ -82,7 +81,7 @@ class DisaggPDScheduler : public ChunkedPrefillScheduler {
   bool enable_schedule_overlap() { return options_.enable_schedule_overlap(); };
 
   void get_latency_metrics(std::vector<int64_t>& ttft,
-                           std::vector<int64_t>& tbt);
+                           std::vector<int64_t>& tbt) override;
 
   bool link_instance(const std::string& instance_name,
                      const std::vector<uint64_t>& cluster_ids,

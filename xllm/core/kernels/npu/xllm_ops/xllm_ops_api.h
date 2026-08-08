@@ -62,6 +62,31 @@ void replace_token(torch::Tensor& dst,
                    torch::Tensor& src,
                    bool synchronize_stream = true);
 
+// Laser attention (MindIE-SD kernel tuned for Wan2.2). q/k/v in BNSD layout;
+// returns attention output in BNSD layout, cast back to the input dtype.
+torch::Tensor laser_attention(const torch::Tensor& q_bnsd,
+                              const torch::Tensor& k_bnsd,
+                              const torch::Tensor& v_bnsd,
+                              double scale_value,
+                              int64_t head_num);
+
+struct MtpPrepareNextDraftOutput {
+  torch::Tensor token_ids;
+  torch::Tensor embeddings;
+  torch::Tensor positions;
+  torch::Tensor kv_seq_lens;
+  torch::Tensor cache_slots;
+};
+
+std::optional<MtpPrepareNextDraftOutput> try_mtp_prepare_next_draft(
+    const torch::Tensor& accepted_tokens,
+    const torch::Tensor& accepted_embeddings,
+    const torch::Tensor& embedding_placeholder,
+    const torch::Tensor& base_positions,
+    const torch::Tensor& base_kv_seq_lens,
+    const torch::Tensor& block_tables,
+    int64_t block_size);
+
 void beam_search_rec(const torch::Tensor& logprobs,
                      const torch::Tensor& top_tokens,
                      const torch::Tensor& top_logprobs,
@@ -170,7 +195,29 @@ std::tuple<at::Tensor, at::Tensor> quant_lightning_indexer(
     int64_t next_tokens,
     int64_t cmp_ratio,
     bool return_value);
+
+torch::Tensor lightning_indexer(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& weights,
+    const c10::optional<torch::Tensor>& query_seq_lengths,
+    const c10::optional<torch::Tensor>& key_seq_lengths,
+    const c10::optional<torch::Tensor>& block_table,
+    c10::string_view layout_query,
+    c10::string_view layout_key,
+    int64_t selected_count,
+    int64_t sparse_mode,
+    int64_t pre_tokens,
+    int64_t next_tokens,
+    bool return_value);
 at::Tensor hc_pre_inv_rms(const at::Tensor& x, double epsilon);
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(
+    const torch::Tensor& x1,
+    const torch::Tensor& x2,
+    const torch::Tensor& gamma,
+    double epsilon,
+    bool add_gamma_offset);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> hc_pre_sinkhorn(
     const at::Tensor& mixes,
@@ -363,6 +410,12 @@ void scatter_nd_update(torch::Tensor& var,
                        const torch::Tensor& indices,
                        const torch::Tensor& updates);
 
+void reshape_and_cache_a5(const torch::Tensor& key,
+                          const torch::Tensor& value,
+                          torch::Tensor& key_cache,
+                          torch::Tensor& value_cache,
+                          const torch::Tensor& slot_mapping);
+
 std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     torch::Tensor& q,
     torch::Tensor& k,
@@ -377,4 +430,14 @@ std::pair<torch::Tensor, torch::Tensor> npu_mega_chunk_gdn(
     bool use_qk_l2norm_in_kernel = false,
     bool defer_output_scale = false,
     bool defer_final_state_cast = false);
+
+torch::Tensor layer_norm_fwd_aclnn(
+    const torch::Tensor& x,
+    const torch::Tensor& weight,
+    const torch::Tensor& bias,
+    double eps,
+    const std::optional<torch::Tensor>& z = std::nullopt,
+    int64_t group_size = -1,
+    bool norm_before_gate = true,
+    bool is_rms_norm = false);
 }  // namespace xllm::kernel::npu

@@ -61,6 +61,16 @@ cc_test(
 
 cc_test(
   NAME
+    request_id_test
+  SRCS
+    request_id_test.cpp
+  DEPS
+    api_service
+    GTest::gtest_main
+)
+
+cc_test(
+  NAME
     anthropic_json_test
   SRCS
     anthropic_json_test.cpp
@@ -104,6 +114,17 @@ cc_test(
   DEPS
     api_service
     GTest::gtest_main
+)
+
+cc_test(
+  NAME
+    models_service_impl_test
+  SRCS
+    models_service_impl_test.cpp
+  DEPS
+    api_service
+    GTest::gtest_main
+    nlohmann_json::nlohmann_json
 )
 
 # Integration smoke tests for OpenAI-compatible endpoints. These require a

@@ -24,7 +24,7 @@ extern "C" {
 
 const XLLM_InitOptions XLLM_INIT_LLM_OPTIONS_DEFAULT = {
     .enable_chunked_prefill = false,
-    .enable_prefill_sp = false,
+    .cp_size = 1,
     .enable_prefix_cache = false,
     .enable_disagg_pd = false,
     .enable_pd_ooc = false,
@@ -58,7 +58,6 @@ const XLLM_InitOptions XLLM_INIT_LLM_OPTIONS_DEFAULT = {
     .kv_cache_transfer_mode = "PUSH",
     .log_dir = "",
     .draft_model = "",
-    .draft_devices = "",
     .cpu_affinity = ""};
 
 const XLLM_RequestParams XLLM_LLM_REQUEST_PARAMS_DEFAULT = {
@@ -86,7 +85,7 @@ const XLLM_RequestParams XLLM_LLM_REQUEST_PARAMS_DEFAULT = {
 
 const XLLM_InitOptions XLLM_INIT_REC_OPTIONS_DEFAULT = {
     .enable_chunked_prefill = false,
-    .enable_prefill_sp = false,
+    .cp_size = 1,
     .enable_prefix_cache = false,
     .enable_disagg_pd = false,
     .enable_pd_ooc = false,
@@ -132,7 +131,6 @@ const XLLM_InitOptions XLLM_INIT_REC_OPTIONS_DEFAULT = {
     .kv_cache_transfer_mode = "PUSH",
     .log_dir = "",
     .draft_model = "",
-    .draft_devices = "",
     .cpu_affinity = ""};
 
 const XLLM_RequestParams XLLM_REC_REQUEST_PARAMS_DEFAULT = {

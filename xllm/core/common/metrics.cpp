@@ -74,6 +74,21 @@ DEFINE_COUNTER(detokenization_latency_seconds_non_stream,
 DEFINE_COUNTER(num_model_execution_total_eager,
                "Total number of model execution");
 
+DEFINE_COUNTER(mooncake_transfer_completed_total_read,
+               "Total number of completed MoonCake READ transfers");
+DEFINE_COUNTER(mooncake_transfer_completed_total_write,
+               "Total number of completed MoonCake WRITE transfers");
+DEFINE_COUNTER(mooncake_transfer_bytes_total_read,
+               "Total bytes completed by MoonCake READ transfers");
+DEFINE_COUNTER(mooncake_transfer_bytes_total_write,
+               "Total bytes completed by MoonCake WRITE transfers");
+DEFINE_COUNTER(mooncake_transfer_failed_total,
+               "Total number of failed MoonCake transfers");
+DEFINE_HISTOGRAM(mooncake_transfer_latency_microseconds_read,
+                 "MoonCake READ transfer latency in microseconds");
+DEFINE_HISTOGRAM(mooncake_transfer_latency_microseconds_write,
+                 "MoonCake WRITE transfer latency in microseconds");
+
 // worker metrics
 DEFINE_COUNTER(execution_latency_seconds_model,
                "Latency of model execution in seconds");
@@ -125,6 +140,8 @@ DEFINE_HISTOGRAM(time_to_first_token_latency_milliseconds,
 // inter token latency histogram
 DEFINE_HISTOGRAM(inter_token_latency_milliseconds,
                  "Histogram of inter token latency in milliseconds");
+DEFINE_HISTOGRAM(inter_token_latency_microseconds,
+                 "Histogram of inter token latency in microseconds");
 
 // response metrics
 DEFINE_COUNTER(responsing_latency_seconds_stream,
@@ -166,6 +183,9 @@ DEFINE_COUNTER(speculative_num_accepted_tokens_total,
                "Total number of accepted tokens in validation");
 DEFINE_COUNTER(speculative_num_draft_tokens_total,
                "Total number of draft tokens");
+DEFINE_GAUGE(speculative_mean_tokens_per_decode_step,
+             "Batch-mean tokens committed per decode step, i.e. the TPOT "
+             "speedup factor (1.0 without speculative decoding)");
 
 // proto metrics
 DEFINE_COUNTER(proto_latency_seconds_proto2i,

@@ -92,7 +92,7 @@ class BlockCapacityGuard {
   KVCacheManager* kv_cache_manager_;
 
   std::vector<Sequence*> candidate_sequences_;
-  std::vector<Sequence*> running_queue_;
+  std::vector<Sequence*> decode_queue_;
   std::vector<Sequence*> running_sequences_;
 
   uint32_t num_reserved_block_for_prefill_;
@@ -101,7 +101,7 @@ class BlockCapacityGuard {
 class ZeroEvictionScheduler final : public ContinuousScheduler {
  public:
   ZeroEvictionScheduler(Engine* engine, const Options& options);
-  virtual ~ZeroEvictionScheduler();
+  ~ZeroEvictionScheduler() override;
 
  private:
   void handle_prefill_requests(

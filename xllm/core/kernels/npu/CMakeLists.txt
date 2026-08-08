@@ -14,7 +14,9 @@ cc_library(
     active.cpp
     attention.cpp
     fused_layernorm.cpp
+    npu_adalayernorm.cpp
     matmul.cpp
+    matmul_reduce_scatter.cpp
     npu_causal_conv1d.cpp
     npu_fused_infer_attention.cpp
     npu_gemma_rms_norm.cpp
@@ -24,6 +26,7 @@ cc_library(
     npu_qwen35_gdn_prefill_super_op.cpp
     npu_grouped_matmul.cpp
     npu_moe_gating_topk_softmax.cpp
+    npu_mega_moe.cpp
     npu_dispatch_ffn_combine.cpp
     npu_dispatch_gmm_combine_decode.cpp
     npu_moe_distribute_combine_v2.cpp
@@ -35,9 +38,12 @@ cc_library(
     utils.cpp
     w4a8_dynamic_moe_preprocess.cpp
     rec_constrained_topk.cpp
+    npu_ops_library.cpp
   DEPS
     :torch_npu_kernels
     :tilelang_kernels
     xllm_ops
+    nnopbase
     opapi
+    platform_npu
 )

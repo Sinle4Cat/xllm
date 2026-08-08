@@ -44,9 +44,8 @@ class EmbeddingCache final {
     // current real position from this offset.
     int32_t token_id = -1;
     int32_t position_offset = 0;
-    // Store detached views into target outputs instead of cloning. The views
-    // keep their storage alive until replaced, trading short-lived HBM
-    // retention for avoiding per-step embedding copies.
+    // Store detached copies of target outputs. The MTP cache is consumed by
+    // later overlapped steps, so it must not depend on producer output storage.
     torch::Tensor embedding;
 
     // Previous accepted target token. Its position is derived as
@@ -100,7 +99,8 @@ class EmbeddingCache final {
       const std::vector<int32_t>& embedding_ids,
       const std::vector<std::string>& request_ids) const;
   std::vector<int32_t> read_accepted_prefix_lengths(
-      const std::vector<int32_t>& embedding_ids) const;
+      const std::vector<int32_t>& embedding_ids,
+      const std::vector<std::string>& request_ids) const;
 
   void clear(const std::vector<int32_t>& embedding_ids);
 

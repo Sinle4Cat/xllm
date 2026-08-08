@@ -28,12 +28,14 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/metrics.h"
 #include "common/types.h"
-#include "core/common/global_flags.h"
 #include "core/framework/config/beam_search_config.h"
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kv_cache_config.h"
 #include "core/framework/config/load_config.h"
+#include "core/framework/config/model_config.h"
 #include "framework/kv_cache/kv_cache.h"
+#include "framework/kv_cache/linear_state_restore.h"
+#include "framework/kv_cache_transfer/kv_transfer_completion.h"
 #include "framework/model/model_input_params.h"
 #include "framework/state_dict/state_dict.h"
 #if defined(USE_CUDA) || defined(USE_ILU) || defined(USE_MUSA)
@@ -69,16 +71,20 @@ LLMWorkerImpl::LLMWorkerImpl(const ParallelArgs& parallel_args,
     : WorkerImpl(parallel_args, device, options) {
   device_.set_device();
 #if defined(USE_CUDA) || defined(USE_MUSA)
-  threadpool_.schedule([this]() mutable {
-    // initialize flashinfer workspace
-    ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
-        device_);
-  });
+  const auto& model_config = ModelConfig::get_instance();
+  if (!ModelConfig::is_python_model_impl(model_config.model_impl())) {
+    threadpool_.schedule([this]() mutable {
+      // initialize flashinfer workspace
+      ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance().initialize(
+          device_);
+    });
+  }
 #endif
 }
 
 bool LLMWorkerImpl::init_model(ModelContext& context) {
   CHECK(model_ == nullptr) << "Model is already initialized.";
+  const auto& model_config = ModelConfig::get_instance();
 
 #if defined(USE_CUDA)
   // Ensure FlashinferWorkspace is initialized on the calling thread before
@@ -89,13 +95,20 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
   // FlashinferWorkspace is thread_local, so T_MTP's instance must be
   // explicitly initialized here; otherwise FlashInferAttentionImpl captures
   // an undefined int_workspace_buffer_ and crashes at prefill time.
-  auto& ws = ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance();
-  if (!ws.get_int_workspace_buffer().defined()) {
-    ws.initialize(device_);
+  //
+  // Skip when model_impl=python: Python executor uses flashinfer's Python API
+  // directly; initializing the C++ workspace would conflict with Python-side
+  // TVM-FFI type registration.
+  if (!ModelConfig::is_python_model_impl(model_config.model_impl())) {
+    auto& ws = ::xllm::layer::flashinfer::FlashinferWorkspace::get_instance();
+    if (!ws.get_int_workspace_buffer().defined()) {
+      ws.initialize(device_);
+    }
   }
 #endif
 
   // Try to create a causal LM model
+  context.set_model_impl(model_config.model_impl());
   model_ = create_llm_model(context);
 
   // Dont find model in causal models
@@ -104,7 +117,7 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
       model_.get(), context.get_model_args(), device_, options_);
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    eplb_executor_ = std::make_unique<EplbExecutor>(model_.get(), device_);
+    eplb_executor_ = std::make_unique<EplbExecutor>(*model_, device_);
   }
 
   if (::xllm::BeamSearchConfig::get_instance().enable_beam_search_kernel()) {
@@ -112,6 +125,17 @@ bool LLMWorkerImpl::init_model(ModelContext& context) {
   }
   return true;
 }
+
+#if defined(USE_NPU)
+bool LLMWorkerImpl::prepare_static_mtp_graph_tasks(
+    const SpecVerifyGraphTaskSignal& signal,
+    const Stream& signal_stream) {
+  if (model_executor_ == nullptr) {
+    return false;
+  }
+  return model_executor_->prepare_static_mtp_graph_tasks(signal, signal_stream);
+}
+#endif
 
 std::optional<ForwardOutput> LLMWorkerImpl::step_no_sync(
     const ForwardInput& input) {
@@ -123,7 +147,8 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_no_sync(
 
 std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
     const ForwardInput& input,
-    Stream& compute_stream) {
+    Stream& compute_stream,
+    bool record_ready_event) {
   const ForwardSyncPolicy sync_policy = ForwardSyncPolicy::NO_SYNC;
   c10::StreamGuard stream_guard = compute_stream.set_stream_guard();
   if (::xllm::LoadConfig::get_instance().enable_manual_loader()) {
@@ -135,19 +160,19 @@ std::optional<ForwardOutput> LLMWorkerImpl::execute_no_sync_on_stream(
           const_cast<atb::Context*>(context_.get_atb_context());
       atb_context->SetExecuteStream(current_acl_stream);
       wait_input_ready_events(input, compute_stream);
-      return step_internal(input, sync_policy);
+      return step_internal(input, sync_policy, record_ready_event);
     } else {
       SET_ATB_EXECUTE_STREAM((&compute_stream), device_, context_);
       wait_input_ready_events(input, compute_stream);
-      return step_internal(input, sync_policy);
+      return step_internal(input, sync_policy, record_ready_event);
     }
 #else
     wait_input_ready_events(input, compute_stream);
-    return step_internal(input, sync_policy);
+    return step_internal(input, sync_policy, record_ready_event);
 #endif
   }
   wait_input_ready_events(input, compute_stream);
-  return step_internal(input, sync_policy);
+  return step_internal(input, sync_policy, record_ready_event);
 }
 
 std::optional<ForwardOutput> LLMWorkerImpl::step(const ForwardInput& input) {
@@ -198,6 +223,20 @@ LLMWorkerImpl::step_async_no_sync(const ForwardInput& input) {
 
 std::optional<ForwardOutput> LLMWorkerImpl::step_for_schedule_overlap(
     const ForwardInput& input) {
+  // Restore live recurrent-state slots from saved checkpoints here (worker
+  // thread, on compute_stream_) instead of in prepare_work_before_execute on
+  // prepare_stream_. The single-threaded worker pool guarantees the previous
+  // chunk's forward kernels are already enqueued on compute_stream_ before
+  // this task runs, so the restore copy is automatically stream-ordered
+  // after those writes without needing a cross-stream barrier.
+  if (has_linear_attention_layers(context_.get_model_args())) {
+    c10::StreamGuard restore_guard = compute_stream_->set_stream_guard();
+    ModelInputParams& mutable_params =
+        const_cast<ModelInputParams&>(input.input_params);
+    restore_linear_state_slots(kv_caches_,
+                               mutable_params.linear_state_cache_ops,
+                               mutable_params.linear_state_validity_mask);
+  }
   return execute_no_sync_on_stream(input, *compute_stream_);
 }
 
@@ -212,13 +251,14 @@ LLMWorkerImpl::update_input_by_last_step_output_for_schedule_overlap(
 
 std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const ForwardInput& input,
-    ForwardSyncPolicy sync_policy) {
+    ForwardSyncPolicy sync_policy,
+    bool record_ready_event) {
   MULTI_MODEL_STEP_LOCK(::xllm::KVCacheConfig::get_instance().enable_xtensor());
 
   Timer timer;
   auto& sampling_params = input.sampling_params;
 
-  std::vector<folly::SemiFuture<bool>> futures;
+  KVTransferCompletion kv_transfers;
 
   if (options_.kv_cache_transfer_mode() == "PUSH" &&
       !input.transfer_kv_infos.empty()) {
@@ -239,26 +279,32 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     const_cast<ModelInputParams*>(&(input.input_params))
         ->parallel.layer_synchronizer = layer_synchronizer;
 
-    futures.emplace_back(
+    kv_transfers.add(
         kv_cache_transfer_->push_kv_blocks_async(input.transfer_kv_infos,
                                                  context_.get_parallel_args(),
                                                  layer_synchronizer,
                                                  is_spec_draft_));
 #endif
   }
+  auto wait_kv_push = [&kv_transfers]() {
+    CHECK(kv_transfers.wait()) << "KV cache push failed";
+  };
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    eplb_executor_->eplb_execute(input.input_params.expert.eplb_info);
+    eplb_executor_->start_eplb_step(input.input_params.expert.eplb_info);
   }
 
   // call model executor forward to get hidden states
   auto model_output = model_executor_->forward(
       input.token_ids, input.positions, kv_caches_, input.input_params);
+  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
+    eplb_executor_->finish_eplb_step();
+  }
   if (!model_output.hidden_states.defined()) {
+    wait_kv_push();
     return std::nullopt;
   }
 
   torch::Tensor logits;
-  torch::Tensor selected_hidden_from_lm_head;
   if (sampling_params.selected_token_idxes.defined()) {
     torch::Tensor selected_token_idxes = sampling_params.selected_token_idxes;
     if (model_output.hidden_states.defined() &&
@@ -268,46 +314,26 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
                                      /*non_blocking=*/false)
                                  .contiguous();
     }
-    if (options_.cp_size() > 1) {
-      logits = model_->logits(model_output.hidden_states,
-                              selected_token_idxes,
-                              selected_hidden_from_lm_head);
-    } else {
-      logits = model_->logits(model_output.hidden_states, selected_token_idxes);
-    }
+    logits = model_->logits(model_output.hidden_states, selected_token_idxes);
   }
 
   ForwardOutput output;
-  output.dsa_topk_indices = model_output.dsa_topk_indices;
+  output.mtp_topk_state = std::move(model_output.mtp_topk_state);
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     output.expert_load_data = expert_load_data_;
-    output.prepared_layer_id = eplb_executor_->get_ready_layer_id();
-    if (output.prepared_layer_id != -1) {
-      eplb_executor_->reset_ready_layer_id();
-    }
+    output.prepared_token = eplb_executor_->consume_ready_prepare_token();
   }
 
   if (!enable_schedule_overlap() && !driver_ && !dp_driver_ &&
       !options_.enable_speculative_decode()) {
     MULTI_MODEL_STEP_UNLOCK();
     if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+      wait_kv_push();
       return std::nullopt;
     }
     int ret = device_.synchronize_default_stream();
-    // in p-d disaggregation scene, all micro batches should be in same
-    // prefill/decode stage, so, to judge transfer_kv_infos.empty,
-    if (options_.kv_cache_transfer_mode() == "PUSH" &&
-        !input.transfer_kv_infos.empty()) {
-      auto results =
-          folly::collectAll(futures).within(std::chrono::seconds(60)).get();
-      for (const auto& result : results) {
-        // TODO: Add error handling
-        if (!result.value()) {
-          LOG(ERROR) << "kv_cache_transfer_ failed";
-          break;
-        }
-      }
-    }
+    CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
+    wait_kv_push();
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       return output;
     }
@@ -350,26 +376,11 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     }
     if (!input.input_params.meta.batch_forward_type.is_decode() &&
         !is_spec_draft_) {
-      // Target prefill keeps the full hidden in `embeddings` for the draft
-      // input_embedding. Under CP this is the LOCAL token shard, whose rows
-      // cannot be indexed by the CP all-gather-space selected_token_idxes.
-      // Expose the LmHead-gathered per-sequence hidden (rows = num_seq)
-      // separately so the embedding cache stores it without re-selecting on
-      // the local shard.
+      // Target prefill: keep full embeddings (global-real under model-side CP).
       output.sample_output.embeddings = embeddings;
-      if (options_.cp_size() > 1 && selected_hidden_from_lm_head.defined()) {
-        output.sample_output.selected_embeddings = selected_hidden_from_lm_head;
-      }
     } else if (sampling_params.selected_token_idxes.defined()) {
-      if (options_.cp_size() > 1) {
-        CHECK(selected_hidden_from_lm_head.defined())
-            << "selected_hidden_from_lm_head must be defined when "
-               "selected_token_idxes is defined.";
-        output.sample_output.embeddings = selected_hidden_from_lm_head;
-      } else {
-        output.sample_output.embeddings = embeddings.index_select(
-            /*dim=*/0, sampling_params.selected_token_idxes);
-      }
+      output.sample_output.embeddings = embeddings.index_select(
+          /*dim=*/0, sampling_params.selected_token_idxes);
     }
   }
 
@@ -380,8 +391,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
       !can_skip_npu_graph_decode_sync(input.input_params);
 #endif
   if (sync_policy == ForwardSyncPolicy::NO_SYNC) {
+    wait_kv_push();
     output.retained_input = std::make_shared<ForwardInput>(input);
-    if (enable_schedule_overlap()) {
+    if (enable_schedule_overlap() && record_ready_event) {
       output.ready_event = record_current_stream_event(device_);
     }
     return output;
@@ -391,18 +403,7 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_internal(
     CHECK_EQ(ret, 0) << "synchronize_default_stream failed";
   }
 
-  if (options_.kv_cache_transfer_mode() == "PUSH" &&
-      !input.transfer_kv_infos.empty()) {
-    auto results =
-        folly::collectAll(futures).within(std::chrono::seconds(60)).get();
-    for (const auto& result : results) {
-      // TODO: Add error handling
-      if (!result.value()) {
-        LOG(ERROR) << "kv_cache_transfer_ failed";
-        break;
-      }
-    }
-  }
+  wait_kv_push();
 
   COUNTER_ADD(execution_latency_seconds_model, timer.elapsed_seconds());
   if (should_sync_default_stream) {

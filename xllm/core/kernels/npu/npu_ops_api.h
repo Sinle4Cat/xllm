@@ -23,6 +23,10 @@ limitations under the License.
 
 #include "custom_functions_npu/atb_common.h"
 
+namespace xllm {
+class ProcessGroup;
+}  // namespace xllm
+
 namespace xllm::kernel::npu {
 
 void reshape_paged_cache(torch::Tensor& key,
@@ -47,6 +51,12 @@ void batch_decode(const torch::Tensor& query,
                   const torch::Tensor& seq_lens,
                   torch::Tensor& output);
 
+void apply_rotary(torch::Tensor& query,
+                  torch::Tensor& key,
+                  const torch::Tensor& cos,
+                  const torch::Tensor& sin,
+                  const std::string& input_layout);
+
 std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -61,7 +71,8 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
     int64_t block_size,
     int64_t sparse_mode,
     const std::string& input_layout,
-    bool softmax_lse_flag = false);
+    bool softmax_lse_flag = false,
+    bool is_causal = true);
 
 void batch_chunked_paged_prefill(const torch::Tensor& query,
                                  const torch::Tensor& k_cache,
@@ -88,6 +99,18 @@ void batch_decode_acl_graph(const torch::Tensor& query,
 torch::Tensor matmul(const torch::Tensor& a,
                      const torch::Tensor& b,
                      const std::optional<torch::Tensor>& bias);
+
+torch::Tensor matmul_reduce_scatter(
+    const torch::Tensor& a,
+    const torch::Tensor& b,
+    const std::optional<torch::Tensor>& bias,
+    ProcessGroup* process_group,
+    const std::string& reduce_op,
+    int64_t comm_turn,
+    const std::string& comm_mode,
+    const std::optional<torch::Tensor>& x1_scale = std::nullopt,
+    const std::optional<torch::Tensor>& x2_scale = std::nullopt,
+    const std::optional<at::ScalarType>& output_dtype = std::nullopt);
 
 torch::Tensor active(const torch::Tensor& input, const std::string& act_mode);
 
@@ -142,6 +165,23 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> add_rms_norm(
     const torch::Tensor& x2,
     const torch::Tensor& gamma,
     double epsilon);
+
+/// @brief Fused adaptive LayerNorm: LayerNorm(x, weight, bias) * (1 + scale) +
+///        shift. Calls aclnnAdaLayerNorm under the hood.
+///        The (1 + scale) is applied inside the kernel, so pass the raw scale.
+/// @param input  Input tensor [B, L, C]
+/// @param scale  Raw scale modulation factor [B, C] (kernel applies +1)
+/// @param shift  Shift modulation factor [B, C]
+/// @param weight Optional affine weight [C]
+/// @param bias   Optional affine bias [C]
+/// @param eps    Epsilon for numerical stability
+/// @return Normalized and modulated output [B, L, C]
+torch::Tensor fused_adalayer_norm(const torch::Tensor& input,
+                                  const torch::Tensor& scale,
+                                  const torch::Tensor& shift,
+                                  std::optional<torch::Tensor> weight,
+                                  std::optional<torch::Tensor> bias,
+                                  double eps);
 
 void apply_rotary(torch::Tensor& q,
                   torch::Tensor& k,
@@ -385,7 +425,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> causal_conv1d_qkv(
     const torch::Tensor& conv_state,
     const torch::IntArrayRef query_start_loc_opt,
     const torch::IntArrayRef cache_indices_opt,
-    const torch::IntArrayRef initial_state_mode_opt);
+    const torch::IntArrayRef initial_state_mode_opt,
+    int64_t num_qk_heads,
+    int64_t num_v_heads,
+    int64_t head_k_dim,
+    int64_t head_v_dim);
 
 void causal_conv1d_out(const torch::Tensor& output,
                        const torch::Tensor& x,
@@ -399,4 +443,32 @@ void causal_conv1d_out(const torch::Tensor& output,
                        int64_t activation_mode,
                        int64_t pad_slot_id,
                        int64_t run_mode);
+
+bool has_mega_moe();
+
+std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
+    const torch::Tensor& context,
+    const torch::Tensor& x,
+    const torch::Tensor& topk_ids,
+    const torch::Tensor& topk_weights,
+    const torch::TensorList weight1,
+    const torch::TensorList weight2,
+    int64_t moe_expert_num,
+    int64_t ep_world_size,
+    int64_t ccl_buffer_size,
+    const std::optional<torch::TensorList>& weight_scales1 = std::nullopt,
+    const std::optional<torch::TensorList>& weight_scales2 = std::nullopt,
+    const std::optional<torch::TensorList>& bias1 = std::nullopt,
+    const std::optional<torch::TensorList>& bias2 = std::nullopt,
+    const std::optional<torch::Tensor>& x_active_mask = std::nullopt,
+    int64_t max_recv_token_num = 0,
+    int64_t dispatch_quant_mode = 0,
+    int64_t combine_quant_mode = 0,
+    const std::string& comm_alg = "",
+    int64_t num_max_tokens_per_rank = 0,
+    const std::string& activation = "swiglu",
+    float activation_clamp = std::numeric_limits<float>::max(),
+    int64_t dispatch_quant_out_dtype = 0,
+    int64_t topo_type = 0,
+    int64_t rank_num_per_server = 2);
 }  // namespace xllm::kernel::npu

@@ -13,27 +13,27 @@ cc_library(
 )
 
 cc_library(
-  NAME 
+  NAME
     block
   HDRS
     block.h
     block_manager.h
-    single_block_manager.h
+    embedding_block_manager.h
     block_manager_pool.h
+    linear_state_block_manager.h
     block_manager_impl.h
     concurrent_block_manager_impl.h
-    # hierarchy temporarily disabled during the block-manager refactor
-    # hierarchy_block_manager_pool.h
+    hierarchy_block_manager_pool.h
     sliding_window_block_manager.h
     composite_block_manager.h
   SRCS
     block.cpp
-    single_block_manager.cpp
+    embedding_block_manager.cpp
     block_manager_pool.cpp
+    linear_state_block_manager.cpp
     concurrent_block_manager_impl.cpp
     block_manager_impl.cpp
-    # hierarchy temporarily disabled during the block-manager refactor
-    # hierarchy_block_manager_pool.cpp
+    hierarchy_block_manager_pool.cpp
     sliding_window_block_manager.cpp
     composite_block_manager.cpp
   DEPS

@@ -441,10 +441,20 @@ void RecWorkerImpl::RecWorkPipeline::prepare_work_before_execute(
             .device(torch::kCPU)
             .dtype(torch::kInt32)
             .pinned_memory(true));
+    const auto& raw_dp_token_nums =
+        processed_inputs.input_params.parallel.raw_dp_global_token_nums;
+    torch::Tensor raw_token_size_per_dp_group =
+        raw_dp_token_nums.empty() ? torch::Tensor()
+                                  : torch::tensor(raw_dp_token_nums,
+                                                  torch::TensorOptions()
+                                                      .device(torch::kCPU)
+                                                      .dtype(torch::kInt32)
+                                                      .pinned_memory(true));
     bool is_prefill =
         processed_inputs.input_params.meta.batch_forward_type.is_prefill();
     DpEpPadding dp_ep_padding(
         token_size_per_dp_group,
+        raw_token_size_per_dp_group,
         runtime_.context->get_model_args().num_experts_per_tok(),
         runtime_.context->get_parallel_args().mapping_data(),
         runtime_.worker.device(),
@@ -492,7 +502,8 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
   }
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    runtime_.eplb_executor->eplb_execute(input.input_params.expert.eplb_info);
+    runtime_.eplb_executor->start_eplb_step(
+        input.input_params.expert.eplb_info);
   }
 
   // temporarily use [0], will be adapted in next pr
@@ -501,6 +512,9 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
                                                  input.positions,
                                                  runtime_.worker.kv_caches_,
                                                  input.input_params);
+  if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
+    runtime_.eplb_executor->finish_eplb_step();
+  }
   if (!model_output.hidden_states.defined()) {
     return std::nullopt;
   }
@@ -514,10 +528,8 @@ std::optional<ForwardOutput> RecWorkerImpl::RecWorkPipeline::step(
   ForwardOutput output;
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
     output.expert_load_data = runtime_.expert_load_data;
-    output.prepared_layer_id = runtime_.eplb_executor->get_ready_layer_id();
-    if (output.prepared_layer_id != -1) {
-      runtime_.eplb_executor->reset_ready_layer_id();
-    }
+    output.prepared_token =
+        runtime_.eplb_executor->consume_ready_prepare_token();
   }
 
   if (!runtime_.worker.driver_ && !runtime_.worker.dp_driver_ &&
@@ -3028,7 +3040,7 @@ bool RecWorkerImpl::init_model(ModelContext& context) {
 
     if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
       runtime.eplb_executor = std::make_unique<EplbExecutor>(
-          runtime.model.get(), runtime.worker.device());
+          *runtime.model, runtime.worker.device());
     }
 
     work_pipelines_.emplace_back(create_pipeline(pipeline_type, runtime));
@@ -3085,7 +3097,7 @@ bool RecWorkerImpl::init_onerec_model(ModelContext& context) {
       model_.get(), context.get_model_args(), device_, options_);
 
   if (::xllm::EPLBConfig::get_instance().enable_eplb()) {
-    eplb_executor_ = std::make_unique<EplbExecutor>(model_.get(), device_);
+    eplb_executor_ = std::make_unique<EplbExecutor>(*model_, device_);
   }
   return true;
 }

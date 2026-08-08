@@ -37,11 +37,11 @@ DECLARE_string(model);
 
 DECLARE_string(backend);
 
+DECLARE_string(model_impl);
+
+DECLARE_string(python_model_path);
+
 DECLARE_string(task);
-
-DECLARE_string(devices);
-
-DECLARE_int32(device_id);
 
 DECLARE_int32(limit_image_per_prompt);
 
@@ -52,6 +52,7 @@ DECLARE_int32(block_size);
 DECLARE_int64(max_cache_size);
 DECLARE_double(max_memory_utilization);
 DECLARE_string(kv_cache_dtype);
+DECLARE_string(indexer_cache_dtype);
 DECLARE_int64(max_linear_state_cache_slots);
 
 DECLARE_bool(enable_prefix_cache);
@@ -59,6 +60,8 @@ DECLARE_bool(enable_prefix_cache);
 DECLARE_bool(enable_in_batch_prefix_cache);
 
 DECLARE_int64(max_encoder_cache_size);
+
+DECLARE_int64(max_processor_cache_items);
 
 DECLARE_uint32(xxh3_128bits_seed);
 
@@ -71,13 +74,13 @@ DECLARE_int32(max_tokens_per_chunk_for_prefill);
 // --- speculative inference config ---
 DECLARE_string(draft_model);
 
-DECLARE_string(draft_devices);
-
 DECLARE_int32(num_speculative_tokens);
 
 DECLARE_string(speculative_algorithm);
 
 DECLARE_bool(enable_opt_validate_probs);
+
+DECLARE_bool(enable_mtp_draft_body_tp1);
 
 DECLARE_int32(speculative_suffix_cache_max_depth);
 
@@ -112,7 +115,7 @@ DECLARE_int64(cfg_size);
 
 DECLARE_int64(vae_size);
 
-DECLARE_bool(enable_prefill_sp);
+DECLARE_int64(text_encoder_tp_size);
 
 DECLARE_bool(enable_mm_encoder_dp);
 
@@ -150,6 +153,8 @@ DECLARE_bool(enable_graph_vmm_pool);
 DECLARE_int32(max_tokens_for_graph_mode);
 
 DECLARE_int32(acl_graph_decode_batch_size_limit);
+
+DECLARE_string(python_graph_backend);
 
 DECLARE_bool(enable_chunked_prefill);
 
@@ -208,7 +213,7 @@ DECLARE_int32(max_decode_token_per_sequence);
 
 DECLARE_string(priority_strategy);
 
-DECLARE_bool(use_mix_scheduler);
+DECLARE_bool(enable_mix_batch);
 
 DECLARE_bool(enable_online_preempt_offline);
 
@@ -374,6 +379,8 @@ DECLARE_string(dit_sparse_attention_version);
 
 DECLARE_int64(dit_sparse_attention_mask_refresh_steps);
 
+DECLARE_bool(dit_laser_attention_enabled);
+
 DECLARE_bool(use_audio_in_video);
 
 // --- kernel config ---
@@ -393,9 +400,29 @@ DECLARE_bool(enable_split_rmsnorm_rope);
 DECLARE_bool(enable_aclnn_matmul);
 
 DECLARE_bool(enable_aclnn_swiglu);
+
+DECLARE_bool(enable_flashcomm1);
+
+DECLARE_int32(flashcomm1_min_prefill_tokens);
+
+DECLARE_bool(enable_mmrs_fusion);
+
+DECLARE_string(mmrs_comm_mode);
 #endif
 
 // --- chat template config ---
 DECLARE_bool(use_cpp_chat_template);
 
 DECLARE_int32(health_check_interval_ms);
+
+// --- verbose trace logging config ---
+DECLARE_bool(enable_verbose_trace_log);
+
+DECLARE_string(verbose_trace_log_path);
+
+DECLARE_int32(verbose_trace_log_max_size_mb);
+
+DECLARE_int32(verbose_trace_log_max_files);
+
+// --- flux2 text encoder tokenizer config ---
+DECLARE_int32(max_sequence_length);

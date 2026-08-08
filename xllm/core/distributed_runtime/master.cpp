@@ -26,6 +26,7 @@ limitations under the License.
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -36,7 +37,9 @@ limitations under the License.
 #include "core/framework/config/eplb_config.h"
 #include "core/framework/config/kernel_config.h"
 #include "core/framework/config/kv_cache_config.h"
+#include "core/framework/config/model_config.h"
 #include "core/framework/config/parallel_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "dit_master.h"
 #if defined(USE_NPU)
 #include "framework/parallel_state/npu_rank_table_env.h"
@@ -47,6 +50,7 @@ limitations under the License.
 #include "llm_engine.h"
 #include "llm_master.h"
 #include "models/model_registry.h"
+#include "platform/platform.h"
 #include "rec_engine.h"
 #include "rec_master.h"
 #include "speculative_engine.h"
@@ -64,6 +68,130 @@ DECLARE_bool(graceful_quit_on_sighup);
 
 namespace xllm {
 namespace {
+
+std::optional<std::string> validate_model_cp(const Options& options,
+                                             EngineType engine_type,
+                                             const std::string& model_type,
+                                             int32_t global_world_size) {
+  if (options.cp_size() < 1) {
+    return "cp_size must be greater than or equal to 1";
+  }
+  if (options.cp_size() == 1) {
+    return std::nullopt;
+  }
+
+  if (Platform::is_mlu()) {
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "MLU CP supports only LLM text generation";
+    }
+    if (options.task_type() != "generate") {
+      return "MLU CP supports only the generate task";
+    }
+    if (engine_type == EngineType::SSM &&
+        options.speculative_algorithm() != "Suffix") {
+      return "Current MLU model-side CP does not support MTPWorkerImpl-based "
+             "speculative algorithms such as MTP or Eagle3; disable CP, "
+             "disable the speculative algorithm, or wait for MLU worker-side "
+             "CP";
+    }
+    if (model_type != "deepseek_v32" && model_type != "glm_moe_dsa") {
+      return "MLU CP does not support model_type=" + model_type;
+    }
+    if (options.instance_role() != InstanceRole::DEFAULT &&
+        options.instance_role() != InstanceRole::PREFILL) {
+      return "MLU CP supports only DEFAULT or PREFILL roles";
+    }
+    if (options.dp_size() != 1) {
+      return "MLU CP requires dp_size == 1";
+    }
+    if (options.cp_size() != global_world_size) {
+      return "MLU CP requires cp_size == global world size";
+    }
+    if (ParallelConfig::get_instance().kv_split_size() != 1) {
+      return "MLU CP requires kv_split_size == 1";
+    }
+    if (options.ep_size() != 1 && options.ep_size() != global_world_size) {
+      return "MLU CP requires ep_size == 1 or global world size";
+    }
+    return std::nullopt;
+  }
+
+  if (Platform::is_npu()) {
+    if (engine_type != EngineType::LLM && engine_type != EngineType::SSM) {
+      return "Model-side CP supports only LLM text generation";
+    }
+    if (options.task_type() != "generate") {
+      return "Model-side CP supports only the generate task";
+    }
+    if (engine_type == EngineType::SSM &&
+        SpeculativeConfig::requires_aux_hidden_capture(
+            options.speculative_algorithm())) {
+      return "Current model-side CP does not support aux-hidden-capture "
+             "speculative algorithms (Eagle3/DFlash); disable CP or disable "
+             "the speculative algorithm. MTP and Suffix are supported.";
+    }
+    // enable_graph is compatible with CP because the two are phase-disjoint:
+    // CP only engages on batch_forward_type.no_decode() (both the model-owned
+    // split in deepseek_v4 and NpuCpPlan::prepare return early on decode),
+    // while ACL graph only captures/replays pure decode -- AclGraphExecutorImpl
+    // ::run() falls back to eager for anything else, and params.enable_graph is
+    // set only by the decode capture path. Graph-mode decode therefore runs
+    // with CP inactive, which is the same non-CP decode CP already relies on.
+    //
+    // The one batch that satisfies both gates is spec-verify chunked prefill.
+    // The graph executor only takes it for hybrid-linear-attention models, and
+    // no CP-capable model is one, so it falls back to eager today; the guard in
+    // AclGraphExecutorImpl::run() keeps that true if a future model is both.
+    if (options.instance_role() != InstanceRole::DEFAULT &&
+        options.instance_role() != InstanceRole::PREFILL) {
+      return "Model-side CP supports only DEFAULT or PREFILL roles";
+    }
+
+    // Require registered NPU model-side CP capability. The backend is not
+    // constrained: ATB models drive CP through NpuCpPlan, while TORCH models
+    // (deepseek_v4) own their CP split inside the model. Both rely on the
+    // orthogonal dp * cp * attn_tp == world layout validated below.
+    std::string effective_backend;
+    std::string resolved_name;
+    std::string resolve_error;
+    // Runtime platform branches are type-checked in every platform build.
+    const std::string requested_backend = options.npu_kernel_backend();
+    if (!resolve_model_registration(model_type,
+                                    requested_backend,
+                                    &effective_backend,
+                                    &resolved_name,
+                                    &resolve_error)) {
+      return "Model-side CP rejected model_type=" + model_type + ": " +
+             resolve_error;
+    }
+    if (!is_npu_model_cp_capable(resolved_name)) {
+      return "NPU model-side CP does not support model_type=" + model_type +
+             " (resolved=" + resolved_name +
+             "); only deepseek_v32, deepseek_v32_mtp, deepseek_v4, "
+             "deepseek_v4_mtp, glm_moe_dsa, glm_moe_dsa_mtp are registered as "
+             "CP-capable.";
+    }
+    if (global_world_size % (options.dp_size() * options.cp_size()) != 0) {
+      return "NPU CP requires world_size divisible by dp_size * cp_size "
+             "(orthogonal CP x TP layout)";
+    }
+    const int32_t attn_tp_size =
+        global_world_size / (options.dp_size() * options.cp_size());
+    if (attn_tp_size < 1) {
+      return "NPU CP requires attn_tp_size >= 1";
+    }
+    const int32_t kv_split =
+        ParallelConfig::get_instance().kv_split_size_effective();
+    if (kv_split < 1 || options.cp_size() % kv_split != 0) {
+      return "NPU CP requires kv_split_size effective value to be a positive "
+             "divisor of cp_size";
+    }
+    return std::nullopt;
+  }
+
+  return "cp_size > 1 is only supported on platforms with model-side CP "
+         "(MLU/NPU); disable CP (cp_size=1) or use MLU/NPU.";
+}
 
 void print_startup_banner(const std::filesystem::path& model_path,
                           const std::string& backend,
@@ -123,6 +251,17 @@ void resolve_npu_kernel_backend_for_options(Options* options) {
     return;
   }
 
+  // Python model executor builds the compute graph in Python (torch/torch_npu),
+  // bypassing ATB C++ kernels entirely — force TORCH backend so that kernel
+  // dispatch picks pure-torch implementations for reshape_and_cache etc.
+  if (ModelConfig::is_python_model_impl(
+          ModelConfig::get_instance().model_impl())) {
+    options->npu_kernel_backend("TORCH");
+    KernelConfig::get_instance().npu_kernel_backend("TORCH");
+    LOG(INFO) << "Forced npu_kernel_backend=TORCH for python model_impl";
+    return;
+  }
+
   const std::string model_type =
       util::get_model_type(options->model_path(), options->backend());
   std::string effective_backend;
@@ -151,22 +290,45 @@ Master::Master(const Options& options, EngineType type)
       master_status_(options.master_status()) {
   const auto model_path =
       std::filesystem::path(options_.model_path()).lexically_normal();
-  if (options_.enable_prefix_cache() && options_.backend() == "llm") {
-    const std::string model_type = util::get_model_type(model_path);
-    if (util::is_deepseek_v4_model_type(model_type)) {
-      LOG(WARNING) << model_type
-                   << " does not support prefix cache with "
-                      "CompositeBlockManager yet, fallback to "
-                      "enable_prefix_cache=false";
-      options_.enable_prefix_cache(false);
-      KVCacheConfig::get_instance().enable_prefix_cache(false);
-    }
+  // Multi-process serving runs one worker per process. Select one runtime
+  // logical device from the process-visible devices while keeping node_rank as
+  // the global distributed identity.
+  const int32_t visible_device_count = Platform::device_count();
+  const int32_t device_idx = DeviceNameUtils::get_device_idx(
+      options_.node_rank(), options_.nnodes(), visible_device_count);
+  const auto visible_devices = DeviceNameUtils::parse_devices("auto");
+  const std::vector<torch::Device> devices = {visible_devices[device_idx]};
+  // World size is the node count (one worker per process).
+  const int32_t global_world_size = options_.nnodes();
+  std::string model_type;
+  if ((options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
+      (ModelConfig::is_python_model_impl(
+           ModelConfig::get_instance().model_impl()) &&
+       options_.num_speculative_tokens() > 0)) {
+    model_type = util::get_model_type(model_path, options_.backend());
   }
+  const std::optional<std::string> speculative_error =
+      ModelConfig::validate_python_speculative_decode(
+          ModelConfig::get_instance().model_impl(),
+          model_type,
+          options_.num_speculative_tokens());
+  CHECK(!speculative_error.has_value()) << speculative_error.value();
+  const std::optional<std::string> cp_error =
+      validate_model_cp(options_, type, model_type, global_world_size);
+  CHECK(!cp_error.has_value()) << cp_error.value();
   options_.enable_mla(util::should_enable_mla(model_path, options_.backend()));
   print_startup_banner(model_path, options_.backend(), options_.node_rank());
   LOG(INFO) << "Master init options: " << options_.to_string();
-  ParallelConfig::get_instance().enable_prefill_sp(
-      options_.enable_prefill_sp());
+  ParallelConfig::get_instance().cp_size(options_.cp_size());
+  // cp_size <= 1 -> "disabled", otherwise "model" (model-side CP).
+  const char* cp_sharding_stage =
+      options_.cp_size() <= 1 ? "disabled" : "model";
+  LOG(INFO) << "Resolved CP config: cp_size=" << options_.cp_size()
+            << ", world_size=" << global_world_size
+            << ", dp_size=" << options_.dp_size()
+            << ", ep_size=" << options_.ep_size()
+            << ", cp_sharding_stage=" << cp_sharding_stage
+            << ", instance_role=" << options_.instance_role().to_string();
 
   // Allow brpc receive SIGTREM and SIGINT signal.
   brpc::FLAGS_graceful_quit_on_sigterm = true;
@@ -210,8 +372,6 @@ Master::Master(const Options& options, EngineType type)
         << "Multi-stream parallel is refactoring now, will be supported later.";
   }
   // construct engine
-  const auto devices =
-      DeviceNameUtils::parse_devices(options_.devices().value_or("auto"));
   LOG(INFO) << "Creating engine with devices: "
             << DeviceNameUtils::to_string(devices);
 
@@ -236,10 +396,17 @@ Master::Master(const Options& options, EngineType type)
         .max_memory_utilization(options.max_memory_utilization())
         .enable_prefix_cache(options.enable_prefix_cache())
         .max_encoder_cache_size(options.max_encoder_cache_size())
+        .max_processor_cache_items(options.max_processor_cache_items())
         .max_linear_state_cache_slots(options.max_linear_state_cache_slots())
         .task_type(options.task_type())
         .enable_mla(options_.enable_mla())
-        .enable_prefill_sp(options_.enable_prefill_sp())
+        .enable_flashcomm1(options_.enable_flashcomm1())
+        .flashcomm1_min_prefill_tokens(options_.flashcomm1_min_prefill_tokens())
+        .enable_mmrs_fusion(options_.enable_mmrs_fusion())
+        .mmrs_comm_mode(options_.mmrs_comm_mode())
+        .cp_size(options_.cp_size())
+        .instance_role(options_.instance_role())
+        .enable_disagg_pd(options_.enable_disagg_pd())
         .npu_kernel_backend(options_.npu_kernel_backend())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .enable_offline_inference(options_.enable_offline_inference())
@@ -275,8 +442,8 @@ Master::Master(const Options& options, EngineType type)
     const bool use_suffix_spec = options_.speculative_algorithm() == "Suffix";
     CHECK(use_suffix_spec || !draft_model_path.empty())
         << "draft model path is required unless --speculative_algorithm=Suffix";
-    const auto draft_devices = DeviceNameUtils::parse_devices(
-        options_.draft_devices().value_or("auto"));
+    // Draft model shares the same devices as the target model.
+    const auto& draft_devices = devices;
     LOG(INFO) << "Using draft devices: "
               << DeviceNameUtils::to_string(draft_devices);
     runtime::Options spec_options;
@@ -292,6 +459,7 @@ Master::Master(const Options& options, EngineType type)
         .max_linear_state_cache_slots(options_.max_linear_state_cache_slots())
         .num_speculative_tokens(options_.num_speculative_tokens())
         .speculative_algorithm(options_.speculative_algorithm())
+        .enable_mtp_draft_body_tp1(options_.enable_mtp_draft_body_tp1())
         .speculative_suffix_cache_max_depth(
             options_.speculative_suffix_cache_max_depth())
         .speculative_suffix_max_spec_factor(
@@ -312,8 +480,11 @@ Master::Master(const Options& options, EngineType type)
         .node_rank(options.node_rank())
         .dp_size(options.dp_size())
         .ep_size(options.ep_size())
-        .enable_prefill_sp(options_.enable_prefill_sp())
-        .cp_size(options.cp_size())
+        .enable_flashcomm1(options_.enable_flashcomm1())
+        .flashcomm1_min_prefill_tokens(options_.flashcomm1_min_prefill_tokens())
+        .enable_mmrs_fusion(options_.enable_mmrs_fusion())
+        .mmrs_comm_mode(options_.mmrs_comm_mode())
+        .cp_size(options_.cp_size())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .max_tokens_per_batch(options_.max_tokens_per_batch())
         .max_seqs_per_batch(options_.max_seqs_per_batch())
@@ -367,7 +538,10 @@ Master::Master(const Options& options, EngineType type)
         .node_rank(options_.node_rank())
         .dp_size(options_.dp_size())
         .ep_size(options_.ep_size())
-        .enable_prefill_sp(options_.enable_prefill_sp())
+        .enable_flashcomm1(options_.enable_flashcomm1())
+        .flashcomm1_min_prefill_tokens(options_.flashcomm1_min_prefill_tokens())
+        .enable_mmrs_fusion(options_.enable_mmrs_fusion())
+        .mmrs_comm_mode(options_.mmrs_comm_mode())
         .cp_size(options_.cp_size())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .max_tokens_per_batch(options_.max_tokens_per_batch())
@@ -434,7 +608,7 @@ Master::Master(const Options& options, EngineType type)
         .node_rank(options_.node_rank())
         .dp_size(options_.dp_size())
         .ep_size(options_.ep_size())
-        .enable_prefill_sp(options_.enable_prefill_sp())
+        .cp_size(options_.cp_size())
         .max_seqs_per_batch(options_.max_seqs_per_batch())
         .beam_width(options_.beam_width())
         .max_tokens_per_batch(options_.max_tokens_per_batch())
@@ -456,6 +630,7 @@ Master::Master(const Options& options, EngineType type)
         .model_id(options.model_id())
         .devices(devices)
         .backend(options.backend())
+        .npu_kernel_backend(options_.npu_kernel_backend())
         .enable_prefix_cache(options_.enable_prefix_cache())
         .enable_chunked_prefill(options_.enable_chunked_prefill())
         .enable_offline_inference(options_.enable_offline_inference())
@@ -475,7 +650,8 @@ Master::Master(const Options& options, EngineType type)
         .tp_size(options_.tp_size())
         .sp_size(options_.sp_size())
         .cfg_size(options_.cfg_size())
-        .vae_size(options_.vae_size());
+        .vae_size(options_.vae_size())
+        .text_encoder_tp_size(options_.text_encoder_tp_size());
 
     auto dit_engine = std::make_unique<DiTEngine>(eng_options);
     engine_ = std::move(dit_engine);

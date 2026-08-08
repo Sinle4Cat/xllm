@@ -82,8 +82,12 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
   torch::Tensor reshape_qkvz_unpad(const AttentionMetadata& attn_metadata,
                                    const torch::Tensor& padded_qkvz) const;
 
-  torch::Tensor reshape_qkvz_with_pad(const AttentionMetadata& attn_metadata,
-                                      const torch::Tensor& qkvz) const;
+  // Projection outputs are packed as [total_tokens, dim], while GDN kernels
+  // consume dense [batch, max_query_len, dim] tensors. Split the packed tokens
+  // by query length and pad each sequence before entering the kernels.
+  torch::Tensor reshape_projected_tokens_with_pad(
+      const AttentionMetadata& attn_metadata,
+      const torch::Tensor& projected_tokens) const;
 
   std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> process_mixed_qkv(
       torch::Tensor& mixed_qkv) const;

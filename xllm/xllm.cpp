@@ -17,15 +17,20 @@ limitations under the License.
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <pybind11/embed.h>
+namespace py = pybind11;
 #include <torch/torch.h>
+
+#if defined(USE_NPU)
+#include <acl/acl.h>
+#endif
 
 #include <csignal>
 #include <filesystem>
 #include <memory>
 #include <random>
-#include <unordered_set>
 
 #include "api_service/api_service.h"
+#include "core/common/global_flags.h"
 #include "core/common/instance_name.h"
 #include "core/common/metrics.h"
 #include "core/common/options.h"
@@ -58,16 +63,13 @@ limitations under the License.
 #include "core/platform/device_name_utils.h"
 #include "core/util/net.h"
 #include "core/util/utils.h"
+#include "core/util/verbose_trace_logger.h"
 #include "function_call/function_call_parser.h"
 #include "parser/reasoning_parser.h"
 #include "server/xllm_server_registry.h"
 using namespace xllm;
 
 static std::atomic<uint32_t> signal_received{0};
-
-static const std::unordered_set<std::string> prefill_sp_supported_model_set = {
-    "deepseek_v32",
-    "glm_moe_dsa"};
 
 namespace {
 
@@ -112,22 +114,34 @@ Options create_options(const std::string& instance_name, bool is_local) {
   const DiTConfig& dit_config = DiTConfig::get_instance();
   const RecConfig& rec_config = RecConfig::get_instance();
 
+#if !defined(USE_NPU)
+  CHECK(!speculative_config.enable_mtp_draft_body_tp1())
+      << "enable_mtp_draft_body_tp1 is only supported on the NPU backend";
+#endif
+
   Options options;
 #if defined(USE_NPU)
   options.npu_kernel_backend(kernel_config.npu_kernel_backend());
+  options.enable_flashcomm1(kernel_config.enable_flashcomm1())
+      .flashcomm1_min_prefill_tokens(
+          kernel_config.flashcomm1_min_prefill_tokens())
+      .enable_mmrs_fusion(kernel_config.enable_mmrs_fusion())
+      .mmrs_comm_mode(kernel_config.mmrs_comm_mode());
 #endif
   options.model_path(model_config.model())
       .model_id(model_config.model_id())
       .task_type(model_config.task())
-      .devices(model_config.devices())
       .draft_model_path(speculative_config.draft_model())
       .backend(model_config.backend())
       .limit_image_per_prompt(model_config.limit_image_per_prompt())
       .max_encoder_cache_size(model_config.max_encoder_cache_size())
+      .max_processor_cache_items(model_config.max_processor_cache_items())
       .block_size(kv_cache_config.block_size())
       .max_cache_size(kv_cache_config.max_cache_size())
       .max_memory_utilization(kv_cache_config.max_memory_utilization())
       .enable_prefix_cache(kv_cache_config.enable_prefix_cache())
+      .max_linear_state_cache_slots(
+          kv_cache_config.max_linear_state_cache_slots())
       .max_tokens_per_batch(scheduler_config.max_tokens_per_batch())
       .max_seqs_per_batch(scheduler_config.max_seqs_per_batch())
       .max_tokens_per_chunk_for_prefill(
@@ -146,6 +160,7 @@ Options create_options(const std::string& instance_name, bool is_local) {
           speculative_config.speculative_suffix_max_cached_requests())
       .speculative_suffix_use_tree_spec(
           speculative_config.speculative_suffix_use_tree_spec())
+      .enable_mtp_draft_body_tp1(speculative_config.enable_mtp_draft_body_tp1())
       .num_request_handling_threads(
           service_config.num_request_handling_threads())
       .communication_backend(parallel_config.communication_backend())
@@ -156,7 +171,6 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .rank_tablefile(eplb_config.rank_tablefile())
       .expert_parallel_degree(eplb_config.expert_parallel_degree())
       .enable_chunked_prefill(scheduler_config.enable_chunked_prefill())
-      .enable_prefill_sp(parallel_config.enable_prefill_sp())
       .master_node_addr(distributed_config.master_node_addr())
       .instance_role(InstanceRole(disagg_pd_config.instance_role()))
       .transfer_listen_port(
@@ -170,6 +184,8 @@ Options create_options(const std::string& instance_name, bool is_local) {
       .sp_size(static_cast<int32_t>(parallel_config.sp_size()))
       .cfg_size(static_cast<int32_t>(parallel_config.cfg_size()))
       .vae_size(static_cast<int32_t>(parallel_config.vae_size()))
+      .text_encoder_tp_size(
+          static_cast<int32_t>(parallel_config.text_encoder_tp_size()))
       .instance_name(instance_name)
       .enable_disagg_pd(disagg_pd_config.enable_disagg_pd())
       .enable_pd_ooc(disagg_pd_config.enable_pd_ooc())
@@ -224,17 +240,72 @@ Options create_options(const std::string& instance_name, bool is_local) {
           static_cast<int32_t>(rec_config.rec_worker_max_concurrency()))
       .is_local(is_local);
 
-  if (speculative_config.num_speculative_tokens() > 0) {
-    const std::string draft_devices = speculative_config.draft_devices().empty()
-                                          ? model_config.devices()
-                                          : speculative_config.draft_devices();
-    options.draft_devices(draft_devices);
-  }
-
   return options;
 }
 
 }  // namespace
+
+#if defined(USE_NPU)
+namespace {
+// Initialize Python interpreter and torch_npu runtime early, before any NPU
+// tensor allocation. torch_npu (post4+) calls PyGILState_Ensure inside
+// empty_with_format(), so Python must be alive before the first NPU op.
+// All NPU processes go through this path for consistency — the build system
+// links against the pip-installed torch_npu .so directly.
+void init_npu_python_runtime() {
+  auto acl_ret = aclInit(nullptr);
+  CHECK(acl_ret == ACL_SUCCESS || acl_ret == 500000)
+      << "aclInit failed with error " << acl_ret;
+
+  bool we_initialized_python = false;
+  if (!Py_IsInitialized()) {
+    py::initialize_interpreter(/*init_signal_handlers=*/false);
+    we_initialized_python = true;
+  }
+
+  // Select the same logical device this process's worker will run on. Multi-
+  // process single-card serving lets every process see all TP cards and picks
+  // its own via node_rank (see Master ctor). Using .front() here would pin an
+  // extra context on logical device 0 for every node_rank != 0 process, piling
+  // small allocations onto die0. Mirror master.cpp's get_device_idx instead.
+  const auto& distributed_config = DistributedConfig::get_instance();
+  const int32_t visible_device_count =
+      DeviceNameUtils::parse_devices("auto").size();
+  const int32_t device_index =
+      DeviceNameUtils::get_device_idx(distributed_config.node_rank(),
+                                      distributed_config.nnodes(),
+                                      visible_device_count);
+
+  {
+    py::gil_scoped_acquire gil;
+    py::exec(
+        "import os, sys\n"
+        "os.environ['TORCH_DEVICE_BACKEND_AUTOLOAD'] = '0'\n"
+        "import torch\n"
+        "orig = torch._C._get_accelerator\n"
+        "try:\n"
+        "    torch._C._get_accelerator = lambda: torch.device('cpu')\n"
+        "    import torch_npu\n"
+        "finally:\n"
+        "    torch._C._get_accelerator = orig\n"
+        "import torch_npu.npu as _npu_mod\n"
+        "try:\n"
+        "    torch_npu._C._npu_init()\n"
+        "except RuntimeError as e:\n"
+        "    if 'already initialized' not in str(e).lower():\n"
+        "        raise\n"
+        "_npu_mod._initialized = True\n"
+        "_npu_mod._original_pid = os.getpid()\n"
+        "torch_npu._C._npu_setDevice(" +
+        std::to_string(device_index) + ")\n");
+  }
+
+  if (we_initialized_python) {
+    PyEval_SaveThread();
+  }
+}
+}  // namespace
+#endif
 
 void shutdown_handler(int signal) {
   // TODO: gracefully shutdown the server
@@ -256,13 +327,11 @@ void validate_config(const std::string& model_type) {
     LOG(FATAL) << "Model is not supported currently, model type: "
                << model_type;
   }
-  if (parallel_config.enable_prefill_sp() &&
-      !prefill_sp_supported_model_set.contains(model_type)) {
-    LOG(FATAL) << "enable_prefill_sp is not supported for model_type="
-               << model_type;
-  }
   if (model_config.max_encoder_cache_size() < 0) {
     LOG(FATAL) << "max_encoder_cache_size must be >= 0.";
+  }
+  if (model_config.max_processor_cache_items() < 0) {
+    LOG(FATAL) << "max_processor_cache_items must be >= 0.";
   }
 #if defined(USE_MLU)
   // Disable enable_schedule_overlap for VLM models on MLU backend
@@ -365,6 +434,8 @@ int run() {
   std::filesystem::path model_path =
       std::filesystem::path(model_config.model()).lexically_normal();
   const std::string default_model_name = xllm::util::get_model_name(model_path);
+  const std::string model_repository_name =
+      xllm::util::get_model_repository_name(model_path);
 
   if (model_config.model_id().empty()) {
     // use last part of the path as model id
@@ -375,15 +446,16 @@ int run() {
     model_config.backend(xllm::util::get_model_backend(model_path));
   }
 
+  const std::string local_ip = net::get_local_ip_addr();
   if (service_config.host().empty()) {
     // set the host to the local IP when the host is empty
-    service_config.host(net::get_local_ip_addr());
+    service_config.host(local_ip);
   }
 
-  const bool is_local =
-      !service_config.host().empty() &&
-      net::extract_ip(distributed_config.master_node_addr()) ==
-          service_config.host();
+  const std::string master_ip =
+      net::extract_ip(distributed_config.master_node_addr());
+  const bool is_local = !service_config.host().empty() &&
+                        master_ip == net::extract_ip(service_config.host());
 
   LOG(INFO) << "set worker role to "
             << (is_local ? "local worker" : "remote worker");
@@ -432,8 +504,7 @@ int run() {
   // init XTensor allocator and PhyPagePool for xtensor mode
   if (kv_cache_config.enable_xtensor()) {
     // Parse devices
-    const auto devices =
-        DeviceNameUtils::parse_devices(options.devices().value_or("auto"));
+    const auto devices = DeviceNameUtils::parse_devices("auto");
 
     // Initialize XTensorAllocator with first device
     auto& allocator = XTensorAllocator::get_instance();
@@ -479,12 +550,13 @@ int run() {
 
   // supported models
   std::vector<std::string> model_names = {model_config.model_id()};
+  std::vector<std::string> model_repository_names = {model_repository_name};
   std::string model_version = default_model_name;
   std::vector<std::string> model_versions = {model_version};
 
   if (distributed_config.node_rank() == 0 || kv_cache_config.enable_xtensor()) {
-    auto api_service =
-        std::make_unique<APIService>(master.get(), model_names, model_versions);
+    auto api_service = std::make_unique<APIService>(
+        master.get(), model_names, model_repository_names, model_versions);
     auto xllm_server =
         ServerRegistry::get_instance().register_server("HttpServer");
 
@@ -515,11 +587,28 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging("xllm");
   initialize_configs();
 
+  const ServiceConfig& service_config = ServiceConfig::get_instance();
+  const DistributedConfig& distributed_config =
+      DistributedConfig::get_instance();
+  const std::string verbose_trace_log_path =
+      resolve_verbose_trace_log_path(service_config.verbose_trace_log_path(),
+                                     distributed_config.nnodes(),
+                                     distributed_config.node_rank());
+  VerboseTraceLogger::get_instance().initialize(
+      service_config.enable_verbose_trace_log(),
+      verbose_trace_log_path,
+      service_config.verbose_trace_log_max_size_mb(),
+      service_config.verbose_trace_log_max_files());
+
   // Check if model path is provided
   if (::xllm::ModelConfig::get_instance().model().empty()) {
     HelpFormatter::print_error("--model flag is required");
     return 1;
   }
+
+#if defined(USE_NPU)
+  init_npu_python_runtime();
+#endif
 
   return run();
 }

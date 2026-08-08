@@ -23,7 +23,6 @@ limitations under the License.
 
 // --- Server + XLLM_InitOptions gflags (defaults aligned with REC defaults) ---
 DEFINE_string(model_path, "", "Path to REC model weights");
-DEFINE_string(devices, "auto", "Devices string, e.g. npu:0 or auto");
 DEFINE_int32(port, 8000, "brpc TCP port");
 DEFINE_string(listen_addr,
               "",
@@ -37,7 +36,6 @@ DEFINE_string(backend,
               "(c_api/rec.h); only one is loaded");
 
 DEFINE_bool(enable_chunked_prefill, false, "");
-DEFINE_bool(enable_prefill_sp, false, "");
 DEFINE_bool(enable_prefix_cache, false, "");
 DEFINE_bool(enable_disagg_pd, false, "");
 DEFINE_bool(enable_pd_ooc, false, "");
@@ -48,6 +46,7 @@ DEFINE_uint32(transfer_listen_port, 26000, "");
 DEFINE_uint32(nnodes, 1, "");
 DEFINE_uint32(node_rank, 0, "");
 DEFINE_uint32(dp_size, 1, "");
+DEFINE_uint32(cp_size, 1, "");
 DEFINE_uint32(ep_size, 1, "");
 DEFINE_uint32(block_size, 1, "");
 DEFINE_uint32(max_cache_size, 1000000, "");
@@ -74,7 +73,6 @@ DEFINE_string(kv_cache_transfer_mode, "PUSH", "");
 // Not named "log_dir": glog already registers FLAGS_log_dir.
 DEFINE_string(xllm_init_log_dir, "", "");
 DEFINE_string(draft_model, "", "");
-DEFINE_string(draft_devices, "", "");
 
 namespace xllm_capi_test {
 
@@ -145,7 +143,6 @@ size_t DTypeSize(XLLM_DataType dt) {
 
 void ApplyGflagsToXllmInitOptions(XLLM_InitOptions* o) {
   o->enable_chunked_prefill = FLAGS_enable_chunked_prefill;
-  o->enable_prefill_sp = FLAGS_enable_prefill_sp;
   o->enable_prefix_cache = FLAGS_enable_prefix_cache;
   o->enable_disagg_pd = FLAGS_enable_disagg_pd;
   o->enable_pd_ooc = FLAGS_enable_pd_ooc;
@@ -156,6 +153,7 @@ void ApplyGflagsToXllmInitOptions(XLLM_InitOptions* o) {
   o->nnodes = FLAGS_nnodes;
   o->node_rank = FLAGS_node_rank;
   o->dp_size = FLAGS_dp_size;
+  o->cp_size = FLAGS_cp_size;
   o->ep_size = FLAGS_ep_size;
   o->block_size = FLAGS_block_size;
   o->max_cache_size = FLAGS_max_cache_size;
@@ -192,8 +190,6 @@ void ApplyGflagsToXllmInitOptions(XLLM_InitOptions* o) {
       o->log_dir, FLAGS_xllm_init_log_dir, XLLM_META_STRING_FIELD_MAX_LEN);
   CopyToFixed(
       o->draft_model, FLAGS_draft_model, XLLM_META_STRING_FIELD_MAX_LEN);
-  CopyToFixed(
-      o->draft_devices, FLAGS_draft_devices, XLLM_META_STRING_FIELD_MAX_LEN);
 }
 
 void PbToXllmDims(const c_api_test::XLLM_Dims& pb, XLLM_Dims* out) {

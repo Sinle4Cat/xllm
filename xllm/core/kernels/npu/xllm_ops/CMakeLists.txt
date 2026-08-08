@@ -8,6 +8,8 @@ cc_library(
     ../utils.h
   SRCS
     replace_token.cpp
+    laser_attention.cpp
+    mtp_prepare_next_draft.cpp
     top_k_top_p.cpp
     quant_matmul.cpp
     quantize.cpp
@@ -16,6 +18,7 @@ cc_library(
     compressor.cpp
     hc_post.cpp
     quant_lightning_indexer.cpp
+    lightning_indexer.cpp
     hc_pre_inv_rms.cpp
     hc_pre_sinkhorn.cpp
     hc_pre.cpp
@@ -23,6 +26,7 @@ cc_library(
     sparse_attn_sharedkv_metadata.cpp
     npu_inplace_partial_rotary_mul.cpp
     scatter_nd_update.cpp
+    reshape_and_cache_a5.cpp
     moe_gating_top_k_hash.cpp
     sparse_attn_sharedkv.cpp
     sparse_flash_attention.cpp
@@ -34,6 +38,8 @@ cc_library(
     rec_constrained_topk_fused.cpp
     beam_search_rec_final.cpp
     npu_mega_chunk_gdn.cpp
+    layer_norm_fwd.cpp
+    gamma_add_rms_norm.cpp
   INCLUDES
     ${PROJECT_SOURCE_DIR}/third_party/xllm_ops/build/autogen
   DEPS

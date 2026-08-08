@@ -59,6 +59,9 @@ struct Options {
   // maximum encoder cache size in MB (0 disables encoder cache)
   PROPERTY(int64_t, max_encoder_cache_size) = 0;
 
+  // maximum processor cache item count (default 256; 0 disables)
+  PROPERTY(int64_t, max_processor_cache_items) = 256;
+
   // active linear-state slots. 0 derives capacity from the KV cache budget.
   PROPERTY(int64_t, max_linear_state_cache_slots) = 0;
 
@@ -85,6 +88,8 @@ struct Options {
 
   // enable speculative decode
   PROPERTY(bool, enable_speculative_decode) = false;
+
+  PROPERTY(bool, enable_mtp_draft_body_tp1) = false;
 
   PROPERTY(bool, is_draft_engine) = false;
 
@@ -133,14 +138,24 @@ struct Options {
   // Default set as 1
   PROPERTY(int32_t, vae_size) = 1;
 
+  // text encoder tensor parallelism size
+  // Default set as 1
+  PROPERTY(int32_t, text_encoder_tp_size) = 1;
+
   // enable enable_schedule_overlap to improve runtime execution efficiency.
   PROPERTY(bool, enable_schedule_overlap) = true;
 
   // enable chunked prefill.
   PROPERTY(bool, enable_chunked_prefill) = true;
 
-  // enable prefill-only sequence parallel.
-  PROPERTY(bool, enable_prefill_sp) = false;
+  // Flash Communication 1 (FC1) sequence-parallel optimization.
+  PROPERTY(bool, enable_flashcomm1) = false;
+
+  PROPERTY(int32_t, flashcomm1_min_prefill_tokens) = 8192;
+
+  PROPERTY(bool, enable_mmrs_fusion) = false;
+
+  PROPERTY(std::string, mmrs_comm_mode) = "aiv";
 
   // enable returning aux_hidden_states in graph executor output.
   PROPERTY(bool, enable_graph_aux_hidden_states) = false;

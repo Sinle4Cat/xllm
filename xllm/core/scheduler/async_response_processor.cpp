@@ -36,7 +36,8 @@ AsyncResponseProcessor::AsyncResponseProcessor(
     const Tokenizer* tokenizer,
     const std::optional<InstanceRole>& role,
     bool enable_service_routing,
-    bool disable_log_stats)
+    bool disable_log_stats,
+    std::function<void(std::shared_ptr<Request>)> cancel_request)
     : response_threadpool_(
           /*num_threads=*/::xllm::ServiceConfig::get_instance()
               .num_response_handling_threads(),
@@ -52,7 +53,10 @@ AsyncResponseProcessor::AsyncResponseProcessor(
       tokenizer_(tokenizer->clone()),
       role_(role.value_or(InstanceRole::DEFAULT)),
       enable_batch_response_(enable_service_routing),
-      disable_log_stats_(disable_log_stats) {}
+      disable_log_stats_(disable_log_stats),
+      cancel_request_(std::move(cancel_request)) {}
+
+AsyncResponseProcessor::~AsyncResponseProcessor() { wait_completion(); }
 
 void AsyncResponseProcessor::process_failed_request(
     std::shared_ptr<Request> request,
@@ -214,7 +218,8 @@ void AsyncResponseProcessor::process_stream_request(
   if (!is_all_seqs_closed) {
     // output the delta text til the end of the sequence to the client
 
-    auto runnable = [request,
+    auto runnable = [cancel_request = cancel_request_,
+                     request,
                      this,
                      indexes = std::move(indexes),
                      num_tokens = std::move(num_tokens)]() {
@@ -232,8 +237,7 @@ void AsyncResponseProcessor::process_stream_request(
         }
       }
       if (!request->state().output_func(req_output)) {
-        // cancel the request if on_stream returns false
-        request->set_cancel();
+        cancel_request(request);
       }
     };
     if (request->state().response_thread_id < 0) {
@@ -285,6 +289,7 @@ void AsyncResponseProcessor::batch_process_stream_requests(
                      num_tokens = std::move(num_tokens),
                      req_output = &request_outputs[i]]() mutable {
       AUTO_COUNTER(responsing_latency_seconds_stream);
+      const absl::Time response_start_time = absl::Now();
 
       // RequestOutput req_output;
       req_output->request_id = request->request_id();
@@ -298,13 +303,20 @@ void AsyncResponseProcessor::batch_process_stream_requests(
         auto seq_output = seq->generate_streaming_output(size, *tokenizer_);
         if (seq_output.has_value()) {
           req_output->outputs.push_back(std::move(seq_output.value()));
-          if (seq->num_generated_tokens() == 1) {
-            // currently only support one sequence when enable_service_routing
-            // IMPROVE LATER: support enable_schedule_overlap in Default mode
-            // for stream request
-            req_output->finished_on_prefill_instance = true;
-          }
         }
+        if (seq->num_generated_tokens() == 1) {
+          // currently only support one sequence when enable_service_routing
+          // IMPROVE LATER: support enable_schedule_overlap in Default mode
+          // for stream request
+          req_output->finished_on_prefill_instance = true;
+        }
+      }
+      if (req_output->finished_on_prefill_instance) {
+        VLOG(1) << "Prefill response generation request_id="
+                << request->request_id() << ", response_thread_id="
+                << request->state().response_thread_id << ", total_ms="
+                << absl::ToDoubleMilliseconds(absl::Now() -
+                                              response_start_time);
       }
       counter->decrement_count();
     };
@@ -317,20 +329,30 @@ void AsyncResponseProcessor::batch_process_stream_requests(
     }
   }
 
-  rpc_threadpool_.schedule(
-      [counter = std::unique_ptr<BlockingCounter>(counter),
-       requests = std::move(requests),
-       request_outputs = std::move(request_outputs)]() mutable {
-        auto& resp_callback = requests[0]->state().outputs_func;
-        counter->wait();
-        std::vector<bool> status_set = resp_callback(request_outputs);
-        for (size_t i = 0; i < requests.size(); ++i) {
-          if (!status_set[i]) {
-            // cancel the request if on_stream returns false
-            requests[i]->set_cancel();
-          }
-        }
-      });
+  rpc_threadpool_.schedule([cancel_request = cancel_request_,
+                            counter = std::unique_ptr<BlockingCounter>(counter),
+                            requests = std::move(requests),
+                            request_outputs =
+                                std::move(request_outputs)]() mutable {
+    auto& resp_callback = requests[0]->state().outputs_func;
+    const absl::Time wait_start_time = absl::Now();
+    counter->wait();
+    const double wait_ms =
+        absl::ToDoubleMilliseconds(absl::Now() - wait_start_time);
+    const absl::Time rpc_start_time = absl::Now();
+    std::vector<bool> status_set = resp_callback(request_outputs);
+    if (!request_outputs.empty() &&
+        request_outputs[0].finished_on_prefill_instance) {
+      VLOG(1) << "Prefill response RPC request_id=" << requests[0]->request_id()
+              << ", response_wait_ms=" << wait_ms << ", rpc_ms="
+              << absl::ToDoubleMilliseconds(absl::Now() - rpc_start_time);
+    }
+    for (size_t i = 0; i < requests.size(); ++i) {
+      if (!status_set[i]) {
+        cancel_request(requests[i]);
+      }
+    }
+  });
 }
 
 // process stream requests

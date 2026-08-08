@@ -20,7 +20,6 @@ limitations under the License.
 
 #include "llm.h"
 
-std::string devices = "cuda:1";
 std::string model_name = "Qwen3-8B";
 std::string model_path = "/export/home/models/Qwen3-8B";
 
@@ -31,11 +30,12 @@ XLLM_LLM_Handler* service_startup_hook() {
   // the default value(XLLM_INIT_LLM_OPTIONS_DEFAULT) will be used
   XLLM_InitOptions init_options;
   xllm_llm_init_options_default(&init_options);
+  init_options.cp_size = 1;
   snprintf(
       init_options.log_dir, sizeof(init_options.log_dir), "/export/xllm/log");
 
-  bool ret = xllm_llm_initialize(
-      llm_handler, model_path.c_str(), devices.c_str(), &init_options);
+  bool ret =
+      xllm_llm_initialize(llm_handler, model_path.c_str(), &init_options);
   if (!ret) {
     std::cout << "LLM init failed" << std::endl;
     xllm_llm_destroy(llm_handler);

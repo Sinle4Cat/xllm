@@ -20,10 +20,12 @@ limitations under the License.
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace xllm {
 struct ModelInputParams;
 struct ModelGraphMetadataState;
+class KVCache;
 
 namespace layer {
 class LmHead;
@@ -128,12 +130,39 @@ struct has_requires_graph_forward_metadata<
     : std::true_type {};
 
 template <typename T, typename = void>
+struct has_last_prepare_expert_weight_ok : std::false_type {};
+
+template <typename T>
+struct has_last_prepare_expert_weight_ok<
+    T,
+    std::void_t<decltype(std::declval<T>()->last_prepare_expert_weight_ok(
+        std::declval<int32_t>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_start_expert_weight_transfer : std::false_type {};
+
+template <typename T>
+struct has_start_expert_weight_transfer<
+    T,
+    std::void_t<decltype(std::declval<T>()->start_expert_weight_transfer(
+        std::declval<int32_t>()))>> : std::true_type {};
+
+template <typename T, typename = void>
 struct has_is_hybrid_linear_attention : std::false_type {};
 
 template <typename T>
 struct has_is_hybrid_linear_attention<
     T,
     std::void_t<decltype(std::declval<T>()->is_hybrid_linear_attention())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_supports_mla_graph_kv_bucketing : std::false_type {};
+
+template <typename T>
+struct has_supports_mla_graph_kv_bucketing<
+    T,
+    std::void_t<decltype(std::declval<T>()->supports_mla_graph_kv_bucketing())>>
     : std::true_type {};
 
 template <typename T, typename = void>
@@ -218,5 +247,28 @@ struct has_init_or_refresh_rolling_runtime<
         std::declval<const std::string&>()))>> : std::true_type {};
 
 #endif
+
+template <typename T, typename = void>
+struct has_write_context_kv : std::false_type {};
+
+template <typename T>
+struct has_write_context_kv<
+    T,
+    std::void_t<decltype(std::declval<T>()->write_context_kv(
+        std::declval<const torch::Tensor&>(),
+        std::declval<const torch::Tensor&>(),
+        std::declval<const torch::Tensor&>(),
+        std::declval<std::vector<KVCache>&>(),
+        std::declval<const ModelInputParams&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_dspark_markov_bias : std::false_type {};
+
+template <typename T>
+struct has_dspark_markov_bias<
+    T,
+    std::void_t<decltype(std::declval<T>()->dspark_markov_bias(
+        std::declval<const torch::Tensor&>()))>> : std::true_type {};
+
 }  // namespace detail
 }  // namespace xllm

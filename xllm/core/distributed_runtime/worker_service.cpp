@@ -29,8 +29,8 @@ limitations under the License.
 #include "common/types.h"
 #include "core/distributed_runtime/comm_channel.h"
 #include "core/framework/config/eplb_config.h"
-#include "core/runtime/params_utils.h"
 #include "framework/kv_cache/kv_cache_shape.h"
+#include "framework/model/model_input_params.h"
 #include "framework/request/sequence.h"
 #include "framework/sampling/sampling_params.h"
 #include "runtime/forward_params.h"
@@ -175,10 +175,11 @@ void WorkerService::step(ForwardInput& fwd_input,
                          torch::Tensor& top_tokens,
                          torch::Tensor& top_logprobs,
                          torch::Tensor& embeddings,
-                         std::vector<torch::Tensor>& mm_embeddings,
+                         std::vector<std::vector<torch::Tensor>>& mm_embeddings,
                          std::vector<torch::Tensor>& dit_images,
+                         std::vector<std::string>& dit_text_output,
                          torch::Tensor& expert_load_data,
-                         int32_t& prepared_layer_id,
+                         int64_t& prepared_token,
                          torch::Tensor& src_seq_idxes,
                          torch::Tensor& out_tokens,
                          torch::Tensor& out_logprobs) {
@@ -202,7 +203,7 @@ void WorkerService::step(ForwardInput& fwd_input,
       expert_load_data = safe_to(forward_outputs.value().expert_load_data,
                                  torch::kCPU,
                                  /*non_blocking=*/true);
-      prepared_layer_id = forward_outputs.value().prepared_layer_id;
+      prepared_token = forward_outputs.value().prepared_token;
 
       {
         auto copy_output_to_host = [&]() {
@@ -215,9 +216,14 @@ void WorkerService::step(ForwardInput& fwd_input,
 
           mm_embeddings.clear();
           mm_embeddings.reserve(sample_output.mm_embeddings.size());
-          for (auto mm_embedding : sample_output.mm_embeddings) {
-            mm_embeddings.emplace_back(
-                safe_to(mm_embedding, torch::kCPU, /*non_blocking=*/true));
+          for (const auto& seq_mm_embeddings : sample_output.mm_embeddings) {
+            std::vector<torch::Tensor> seq_out;
+            seq_out.reserve(seq_mm_embeddings.size());
+            for (const auto& mm_embedding : seq_mm_embeddings) {
+              seq_out.emplace_back(
+                  safe_to(mm_embedding, torch::kCPU, /*non_blocking=*/true));
+            }
+            mm_embeddings.emplace_back(std::move(seq_out));
           }
 
           dit_images.clear();
@@ -226,6 +232,7 @@ void WorkerService::step(ForwardInput& fwd_input,
             dit_images.emplace_back(
                 safe_to(dit_image, torch::kCPU, /*non_blocking=*/true));
           }
+          dit_text_output = dit_forward_output.text_output;
 
           // [num_seq]
           next_tokens = safe_to(sample_output.next_tokens,
@@ -308,7 +315,15 @@ void WorkerService::create_polling_shm_thread(
         Timer timer;
         while (true) {
           ForwardInput fwd_input;
-          input_shm_manager->input_read(fwd_input, device_);
+          // NPU graph task updates cannot safely overlap an H2D enqueue from
+          // the SHM polling thread. Keep scheduler overlap, but defer device
+          // materialization to WorkerImpl's ordered prepare stream.
+          const InputDeviceMaterializationPolicy materialization_policy =
+              options_.enable_schedule_overlap() && options_.enable_graph()
+                  ? InputDeviceMaterializationPolicy::DEFER_TO_WORKER_PREPARE
+                  : InputDeviceMaterializationPolicy::MATERIALIZE_ON_READ;
+          input_shm_manager->input_read(
+              fwd_input, device_, materialization_policy);
           timer.reset();
           // model output variables
           torch::Tensor next_tokens;
@@ -316,10 +331,11 @@ void WorkerService::create_polling_shm_thread(
           torch::Tensor top_tokens;
           torch::Tensor top_logprobs;
           torch::Tensor embeddings;
-          std::vector<torch::Tensor> mm_embeddings;
+          std::vector<std::vector<torch::Tensor>> mm_embeddings;
           std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
           torch::Tensor expert_load_data;
-          int32_t prepared_layer_id = -1;
+          int64_t prepared_token = -1;
 
           // beam search kernel output
           torch::Tensor src_seq_idxes;
@@ -334,8 +350,9 @@ void WorkerService::create_polling_shm_thread(
                embeddings,
                mm_embeddings,
                dit_images,
+               dit_text_output,
                expert_load_data,
-               prepared_layer_id,
+               prepared_token,
                src_seq_idxes,
                out_tokens,
                out_logprobs);
@@ -348,8 +365,9 @@ void WorkerService::create_polling_shm_thread(
                                                    embeddings,
                                                    mm_embeddings,
                                                    dit_images,
+                                                   dit_text_output,
                                                    expert_load_data,
-                                                   prepared_layer_id,
+                                                   prepared_token,
                                                    src_seq_idxes,
                                                    out_tokens,
                                                    out_logprobs);
@@ -482,22 +500,29 @@ void WorkerService::PullKVCache(::google::protobuf::RpcController* controller,
                                 ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    uint64_t src_cluster_id = req->cluster_id();
-    std::string addr = req->addr();
-    std::vector<uint64_t> src_blocks(req->src_blocks().begin(),
-                                     req->src_blocks().end());
-    std::vector<uint64_t> dst_blocks(req->dst_blocks().begin(),
-                                     req->dst_blocks().end());
-    std::vector<uint64_t> src_linear_state_ids(
-        req->src_linear_state_ids().begin(), req->src_linear_state_ids().end());
-    std::vector<uint64_t> dst_linear_state_ids(
-        req->dst_linear_state_ids().begin(), req->dst_linear_state_ids().end());
-    auto future = worker_->pull_kv_blocks_async(src_cluster_id,
-                                                addr,
-                                                src_blocks,
-                                                dst_blocks,
-                                                src_linear_state_ids,
-                                                dst_linear_state_ids);
+    std::vector<KVTransferMapping> mappings;
+    mappings.reserve(req->mappings_size());
+    for (const proto::KVTransferMapping& proto_mapping : req->mappings()) {
+      KVTransferMapping mapping;
+      mapping.group_id = proto_mapping.group_id();
+      mapping.local_ids.assign(proto_mapping.local_ids().begin(),
+                               proto_mapping.local_ids().end());
+      mapping.remote_ids.assign(proto_mapping.remote_ids().begin(),
+                                proto_mapping.remote_ids().end());
+      mappings.emplace_back(std::move(mapping));
+    }
+    auto future = [&]() {
+      if (req->hetero_merge()) {
+        std::vector<uint64_t> src_cluster_ids(req->src_cluster_ids().begin(),
+                                              req->src_cluster_ids().end());
+        std::vector<std::string> src_addrs(req->src_addrs().begin(),
+                                           req->src_addrs().end());
+        return worker_->pull_hetero_kv_blocks_async(
+            src_cluster_ids, src_addrs, mappings);
+      }
+      return worker_->pull_kv_blocks_async(
+          req->cluster_id(), req->addr(), mappings);
+    }();
     bool status = std::move(future).get();
     resp->set_ok(status);
   });
@@ -742,10 +767,11 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
         torch::Tensor top_tokens;
         torch::Tensor top_logprobs;
         torch::Tensor embeddings;
-        std::vector<torch::Tensor> mm_embeddings;
+        std::vector<std::vector<torch::Tensor>> mm_embeddings;
         std::vector<torch::Tensor> dit_images;
+        std::vector<std::string> dit_text_output;
         torch::Tensor expert_load_data;
-        int32_t prepared_layer_id = -1;
+        int64_t prepared_token = -1;
         // beam search kernel output
         torch::Tensor src_seq_idxes;
         torch::Tensor out_tokens;
@@ -759,8 +785,9 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
              embeddings,
              mm_embeddings,
              dit_images,
+             dit_text_output,
              expert_load_data,
-             prepared_layer_id,
+             prepared_token,
              src_seq_idxes,
              out_tokens,
              out_logprobs);
@@ -770,12 +797,14 @@ void WorkerService::ExecuteModel(::google::protobuf::RpcController* controller,
                                 top_tokens,
                                 top_logprobs,
                                 embeddings,
+                                mm_embeddings,
                                 expert_load_data,
-                                prepared_layer_id,
+                                prepared_token,
                                 src_seq_idxes,
                                 out_tokens,
                                 out_logprobs,
                                 dit_images,
+                                dit_text_output,
                                 pb_forward_output);
         COUNTER_ADD(worker_service_latency_seconds, timer.elapsed_seconds());
       });
@@ -797,7 +826,7 @@ void WorkerService::GetLastStepResult(
         if (forward_outputs) {
           const ForwardOutput& forward_output = forward_outputs.value();
           const auto& sample_output = forward_output.sample_output;
-          int32_t prepared_layer_id = forward_output.prepared_layer_id;
+          int64_t prepared_token = forward_output.prepared_token;
           const auto& beam_search_output = forward_output.beam_search_output;
           torch::Tensor expert_load_data;
           torch::Tensor embeddings;
@@ -809,6 +838,7 @@ void WorkerService::GetLastStepResult(
           torch::Tensor out_tokens;
           torch::Tensor out_logprobs;
           std::vector<torch::Tensor> dit_images;
+          std::vector<std::string> dit_text_output;
           auto copy_output_to_host = [&]() {
             if (options_.enable_schedule_overlap()) {
               CHECK(stream_->wait_event(forward_output.ready_event))
@@ -831,6 +861,8 @@ void WorkerService::GetLastStepResult(
             for (auto image : forward_output.dit_forward_output.tensors) {
               dit_images.emplace_back(image);
             }
+            dit_text_output =
+                forward_outputs.value().dit_forward_output.text_output;
 
             // [num_seq]
             next_tokens = safe_to(sample_output.next_tokens,
@@ -887,19 +919,23 @@ void WorkerService::GetLastStepResult(
           }
           record_speculative_metrics_from_output(next_tokens, options_);
 
-          if (next_tokens.defined() ||
+          if (next_tokens.defined() || !dit_images.empty() ||
+              !dit_text_output.empty() ||
               ::xllm::EPLBConfig::get_instance().enable_eplb()) {
+            const std::vector<std::vector<torch::Tensor>> mm_embeddings;
             forward_output_to_proto(next_tokens,
                                     logprobs,
                                     top_tokens,
                                     top_logprobs,
                                     embeddings,
+                                    mm_embeddings,
                                     expert_load_data,
-                                    prepared_layer_id,
+                                    prepared_token,
                                     src_seq_idxes,
                                     out_tokens,
                                     out_logprobs,
                                     dit_images,
+                                    dit_text_output,
                                     pb_forward_output);
           }
         }

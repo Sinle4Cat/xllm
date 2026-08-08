@@ -59,9 +59,8 @@ XLLM_CAPI_EXPORT void xllm_llm_init_options_default(
 XLLM_CAPI_EXPORT bool xllm_llm_initialize(
     XLLM_LLM_Handler* handler,
     const char* model_path,
-    const char* devices,
     const XLLM_InitOptions* init_options) {
-  if (!handler || !model_path || !devices) return false;
+  if (!handler || !model_path) return false;
 
   try {
     XLLM_InitOptions xllm_init_options;
@@ -81,9 +80,7 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
     xllm::Options options;
     options.model_path(model_path)
         .task_type(xllm_init_options.task)
-        .devices(devices)
         .draft_model_path(xllm_init_options.draft_model)
-        .draft_devices(xllm_init_options.draft_devices)
         .backend("llm")
         .block_size(xllm_init_options.block_size)
         .max_cache_size(xllm_init_options.max_cache_size)
@@ -99,7 +96,7 @@ XLLM_CAPI_EXPORT bool xllm_llm_initialize(
         .communication_backend(xllm_init_options.communication_backend)
         .expert_parallel_degree(xllm_init_options.expert_parallel_degree)
         .enable_chunked_prefill(xllm_init_options.enable_chunked_prefill)
-        .enable_prefill_sp(xllm_init_options.enable_prefill_sp)
+        .cp_size(static_cast<int32_t>(xllm_init_options.cp_size))
         .master_node_addr(xllm_init_options.master_node_addr)
         .transfer_listen_port(xllm_init_options.transfer_listen_port)
         .nnodes(xllm_init_options.nnodes)

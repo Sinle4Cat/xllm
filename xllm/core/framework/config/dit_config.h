@@ -53,6 +53,7 @@ class DiTConfig final {
          "dit_cache_end_blocks",
          "dit_sp_communication_overlap",
          "dit_debug_print",
+         "dit_laser_attention_enabled",
          "dit_generation_image_area_max",
          "dit_vae_image_size",
          "dit_enable_vae_tiling",
@@ -61,7 +62,8 @@ class DiTConfig final {
          "dit_sparse_attention_pool_size",
          "dit_sparse_attention_sparse_start_step",
          "dit_sparse_attention_version",
-         "dit_sparse_attention_mask_refresh_steps"}};
+         "dit_sparse_attention_mask_refresh_steps",
+         "max_sequence_length"}};
     return kOptionCategory;
   }
 
@@ -89,6 +91,8 @@ class DiTConfig final {
 
   PROPERTY(bool, dit_debug_print) = false;
 
+  PROPERTY(bool, dit_laser_attention_enabled) = false;
+
   PROPERTY(int64_t, dit_generation_image_area_max) = 0;
 
   PROPERTY(int64_t, dit_vae_image_size) = 1048576;
@@ -106,6 +110,8 @@ class DiTConfig final {
   PROPERTY(std::string, dit_sparse_attention_version) = "rain_fusion";
 
   PROPERTY(int64_t, dit_sparse_attention_mask_refresh_steps) = 1;
+
+  PROPERTY(int32_t, max_sequence_length) = 0;
 };
 
 }  // namespace xllm

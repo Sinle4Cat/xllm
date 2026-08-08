@@ -62,28 +62,24 @@ class MooncakeKVCacheTransferDefault final
                                  const uint16_t listen_port,
                                  const torch::Device& device,
                                  const std::string& model_type);
-
-  void allocate_kv_cache(std::vector<xllm::KVCache>& kv_caches,
-                         const int64_t num_layers,
-                         const KVCacheShape& kv_cache_shape,
-                         torch::ScalarType dtype) override;
-
-  void allocate_kv_cache_spec(std::vector<xllm::KVCache>& kv_caches,
-                              const int64_t num_layers,
-                              const KVCacheShape& kv_cache_shape,
-                              torch::ScalarType dtype) override;
+  MooncakeKVCacheTransferDefault(
+      const int32_t device_id,
+      const uint16_t listen_port,
+      const torch::Device& device,
+      const std::string& model_type,
+      std::unique_ptr<MooncakeTransferEngine> engine);
 
   void register_kv_cache(std::vector<xllm::KVCache>& kv_caches,
                          const KVCacheShape& kv_cache_shape,
                          const torch::ScalarType dtype) override;
 
-  bool pull_kv_blocks(
-      const uint64_t src_cluster_id,
-      const std::string& src_addr,
-      const std::vector<uint64_t>& src_blocks,
-      const std::vector<uint64_t>& dst_blocks,
-      const std::vector<uint64_t>& src_linear_state_ids,
-      const std::vector<uint64_t>& dst_linear_state_ids) override;
+  void register_kv_cache_spec(std::vector<xllm::KVCache>& kv_caches,
+                              const KVCacheShape& kv_cache_shape,
+                              torch::ScalarType dtype) override;
+
+  bool pull_kv_blocks(const uint64_t src_cluster_id,
+                      const std::string& src_addr,
+                      const std::vector<KVTransferMapping>& mappings) override;
 
   void merge_kv_blocks(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
@@ -98,32 +94,39 @@ class MooncakeKVCacheTransferDefault final
       int32_t kv_split_size) override;
 
  private:
+  struct RegisteredBufferDesc {
+    int64_t buf_id = 0;
+    KVCacheTensorRole role;
+    int32_t group_id = 0;
+    uint64_t block_bytes = 0;
+  };
+
   // Mooncake assigns buffer ids in registration order. Main KV cache registers
   // first, then the speculative draft KV cache is appended after it.
   struct BufLayout {
     // Number of layers owned by this layout.
     int64_t num_layers = 0;
-    // Number of registered buffers per layer, such as K/V/index cache.
-    int64_t buf_cnt = 0;
     // Starting buffer id of this layout in the Mooncake registration table.
     int64_t offset = 0;
+    // Registration-order descriptors for each layer. Shared DSA layers may
+    // omit indexer buffers, so counts can vary by layer.
+    std::vector<std::vector<RegisteredBufferDesc>> layers;
+    // Total buffers registered by this layout.
+    int64_t total_buf_cnt = 0;
     // True after the corresponding KV cache memory has been registered.
     bool registered = false;
   };
-
-  void allocate_kv_cache_impl(std::vector<xllm::KVCache>& kv_caches,
-                              int64_t num_layers,
-                              const KVCacheShape& kv_cache_shape,
-                              torch::ScalarType dtype);
 
   void add_buf(const torch::Tensor& tensor,
                std::vector<void*>& addrs,
                std::vector<size_t>& lens,
                std::vector<uint64_t>& buf_bytes) const;
-  std::vector<int64_t> get_buf_ids(const std::vector<int64_t>& layer_ids,
-                                   bool is_spec_draft) const;
-  std::vector<int64_t> get_buf_ids(const std::vector<int64_t>& layer_ids,
-                                   const BufLayout& layout) const;
+  bool append_buffer_mappings(
+      const BufLayout& layout,
+      const std::vector<int64_t>& layer_ids,
+      const std::vector<KVTransferMapping>& mappings,
+      std::vector<MooncakeTransferEngine::BufferTransferMapping>*
+          buffer_mappings) const;
 
   // Register per-layer K/V tensor memory.
   void register_kv_cache_impl(const std::vector<xllm::KVCache>& kv_caches);
@@ -131,7 +134,6 @@ class MooncakeKVCacheTransferDefault final
   bool has_v_cache_ = true;
   BufLayout main_layout_;
   BufLayout spec_layout_;
-  std::string model_type_;
 };
 
 class MooncakeKVCacheTransferXTensor final
@@ -143,22 +145,13 @@ class MooncakeKVCacheTransferXTensor final
 
   void set_model_id(const std::string& model_id) { model_id_ = model_id; }
 
-  void allocate_kv_cache(std::vector<xllm::KVCache>& kv_caches,
-                         const int64_t num_layers,
-                         const KVCacheShape& kv_cache_shape,
-                         torch::ScalarType dtype) override;
-
   void register_kv_cache(std::vector<xllm::KVCache>& kv_caches,
                          const KVCacheShape& kv_cache_shape,
                          const torch::ScalarType dtype) override;
 
-  bool pull_kv_blocks(
-      const uint64_t src_cluster_id,
-      const std::string& src_addr,
-      const std::vector<uint64_t>& src_blocks,
-      const std::vector<uint64_t>& dst_blocks,
-      const std::vector<uint64_t>& src_linear_state_ids,
-      const std::vector<uint64_t>& dst_linear_state_ids) override;
+  bool pull_kv_blocks(const uint64_t src_cluster_id,
+                      const std::string& src_addr,
+                      const std::vector<KVTransferMapping>& mappings) override;
 
   bool push_kv_blocks(
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
@@ -168,11 +161,6 @@ class MooncakeKVCacheTransferXTensor final
       int32_t kv_split_size) override;
 
  private:
-  void allocate_kv_cache_impl(std::vector<xllm::KVCache>& kv_caches,
-                              int64_t num_layers,
-                              const KVCacheShape& kv_cache_shape,
-                              torch::ScalarType dtype);
-
   // Register GlobalXTensor memory region.
   void register_kv_cache_impl();
 

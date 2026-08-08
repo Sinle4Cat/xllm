@@ -13,6 +13,7 @@ cc_library(
   NAME
     kv_cache_estimation
   HDRS
+    kv_cache_capacity.h
     kv_cache_estimation.h
   SRCS
     kv_cache_estimation.cpp
@@ -20,6 +21,7 @@ cc_library(
     :common
     :deepseek_v4_cache_policy
     :block_utils
+    :platform
     glog::glog
     proto::xllm_proto
     torch
@@ -35,17 +37,19 @@ cc_library(
     kv_cache.h
     kv_cache_impl.h
     kv_cache_shape.h
+    kv_cache_tensor_allocator.h
     kv_cache_tensor_role.h
     kv_cache_utils.h
     linear_attention_kv_cache_impl.h
     quantized_kv_cache_impl.h
   SRCS
     deepseek_v4_kv_cache_impl.cpp
-    embedding_cache.cpp 
+    embedding_cache.cpp
     indexed_kv_cache_impl.cpp
     kv_cache.cpp
     kv_cache_impl.cpp
     kv_cache_shape.cpp
+    kv_cache_tensor_allocator.cpp
     kv_cache_utils.cpp
     linear_attention_kv_cache_impl.cpp
     quantized_kv_cache_impl.cpp
@@ -55,6 +59,29 @@ cc_library(
     :deepseek_v4_cache_policy
     :kv_cache_estimation
     :xtensor
+    glog::glog
+    torch
+    $<$<BOOL:${USE_MLU}>:cndrv>
+    $<$<BOOL:${USE_NPU}>:ascendcl>
+    $<$<BOOL:${USE_NPU}>:torch_npu>
+)
+
+# linear_state_restore depends on both :kv_cache and :model, so it lives in a
+# separate target to avoid pulling :model into the base :kv_cache library
+# (which would create a cycle, since :model already depends on :kv_cache).
+cc_library(
+  NAME
+    linear_state_restore
+  HDRS
+    linear_state_restore.h
+  SRCS
+    linear_state_restore.cpp
+  DEPS
+    :common
+    :kv_cache
+    :model
+    :platform
+    :util
     glog::glog
     torch
     $<$<BOOL:${USE_NPU}>:ascendcl>

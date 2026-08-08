@@ -123,6 +123,10 @@ size_t PrefixCache::insert(const Slice<int32_t>& token_ids,
 
   // Fill `token_hash_key` with the chained hash of block `block_idx`, reusing
   // the precomputed hash when it covers all blocks, otherwise computing it.
+  // The KV / C4 / C128 prefix is solid (no placeholders), so the compute path
+  // seeds the chain in O(1) from the previous block's stamped hash. SWA's
+  // slid-out placeholders are handled by LinearStatePrefixCache::insert, which
+  // overrides this.
   const bool use_precomputed = block_hashes.size() >= n_blocks;
   XXH3Key token_hash_key = existed_shared_blocks_num == 0
                                ? XXH3Key{}
@@ -221,6 +225,19 @@ size_t PrefixCache::insert(Slice<Block>& blocks) {
   }
 
   return blocks.size() * block_size_;
+}
+
+Block PrefixCache::find(const XXH3Key& hash) {
+  auto iter = cached_blocks_.find(hash);
+  if (iter == cached_blocks_.end()) {
+    return Block();
+  }
+  lru_lst_.move_back(iter->second);
+  return iter->second->block;
+}
+
+bool PrefixCache::contains(const XXH3Key& hash) const {
+  return cached_blocks_.find(hash) != cached_blocks_.end();
 }
 
 size_t PrefixCache::evict(size_t n_blocks) {

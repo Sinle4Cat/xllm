@@ -19,10 +19,13 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <iostream>
+#include <mutex>
 #include <unordered_set>
 
-#include "core/common/global_flags.h"
 #include "core/framework/config/kernel_config.h"
+#include "core/framework/config/model_config.h"
+#include "core/util/dit_model_discovery.h"
+#include "llm/py_causal_lm.h"
 #include "models.h"
 
 namespace {
@@ -113,8 +116,10 @@ bool resolve_model_registration(const std::string& model_type,
   if (backend == kAutoBackend) {
     effective_backend =
         is_torch_only_model_type(model_type) ? kTorchBackend : kAtbBackend;
-  } else if (model_type == "qwen3" || model_type == "qwen3_moe") {
-    // qwen3/qwen3_moe support both backends.
+  } else if (model_type == "qwen3" || model_type == "qwen3_moe" ||
+             model_type == "deepseek_v32" || model_type == "glm_moe_dsa" ||
+             model_type == "qwen3_vl") {
+    // qwen3/qwen3_moe/deepseek_v32/glm_moe_dsa/qwen3_vl support both backends.
   } else if (is_torch_only_model_type(model_type)) {
     if (backend != kTorchBackend) {
       if (error_message != nullptr) {
@@ -138,6 +143,8 @@ bool resolve_model_registration(const std::string& model_type,
     *resolved_name = "qwen3_atb";
   } else if (model_type == "qwen3_moe" && effective_backend == kAtbBackend) {
     *resolved_name = "qwen3_moe_atb";
+  } else if (model_type == "qwen3_vl" && effective_backend == kAtbBackend) {
+    *resolved_name = "qwen3_vl_atb";
   } else {
     *resolved_name = model_type;
   }
@@ -162,6 +169,30 @@ bool resolve_model_registration_name(const std::string& model_type,
   return resolve_model_registration(
       model_type, "", nullptr, resolved_name, error_message);
 #endif
+}
+
+bool is_npu_model_cp_capable(const std::string& resolved_name) {
+  // Registers model-side CP capability for master-side validation. Note this
+  // is not the same switch as the worker-side NpuCpPlan gate: deepseek_v4 and
+  // deepseek_v4_mtp own their CP split inside the model (TORCH backend) and
+  // deliberately keep model_supports_model_cp() false so the worker does not
+  // shard a second time.
+  static const std::unordered_set<std::string> kCpCapableModels = {
+      "deepseek_v32",
+      "deepseek_v32_mtp",
+      "deepseek_v4",
+      "deepseek_v4_mtp",
+      "glm_moe_dsa",
+      "glm_moe_dsa_mtp",
+  };
+  static std::once_flag once;
+  std::call_once(once, []() {
+    for (const std::string& name : kCpCapableModels) {
+      ModelRegistry::register_cp_sharding_mode(name, CpShardingMode::NPU_MODEL);
+    }
+  });
+  return ModelRegistry::get_cp_sharding_mode(resolved_name) ==
+         CpShardingMode::NPU_MODEL;
 }
 
 ModelRegistry* ModelRegistry::get_instance() {
@@ -222,6 +253,17 @@ void ModelRegistry::register_dit_model_factory(const std::string& name,
   }
 }
 
+void ModelRegistry::register_model_backend(const std::string& name,
+                                           const std::string& backend) {
+  ModelRegistry* instance = get_instance();
+  auto [it, inserted] = instance->model_backend_.emplace(name, backend);
+  if (!inserted && it->second != backend) {
+    SAFE_LOG_WARNING("model backend for "
+                     << name << " already registered as " << it->second
+                     << "; ignoring conflicting backend " << backend << ".");
+  }
+}
+
 void ModelRegistry::register_multimodal_processor_factory(
     const std::string& name,
     MultimodalProcessorFactory factory) {
@@ -270,6 +312,21 @@ void ModelRegistry::register_tokenizer_args_loader(const std::string& name,
   } else {
     instance->model_registry_[name].tokenizer_args_loader = loader;
   }
+}
+
+void ModelRegistry::register_cp_sharding_mode(const std::string& name,
+                                              CpShardingMode mode) {
+  ModelRegistry* instance = get_instance();
+  instance->model_registry_[name].cp_sharding_mode = mode;
+}
+
+CpShardingMode ModelRegistry::get_cp_sharding_mode(const std::string& name) {
+  ModelRegistry* instance = get_instance();
+  const auto it = instance->model_registry_.find(name);
+  if (it == instance->model_registry_.end()) {
+    return CpShardingMode::NONE;
+  }
+  return it->second.cp_sharding_mode;
 }
 
 CausalLMFactory ModelRegistry::get_causallm_factory(const std::string& name) {
@@ -322,9 +379,90 @@ TokenizerArgsLoader ModelRegistry::get_tokenizer_args_loader(
 
 bool ModelRegistry::has_dit_model_factory(const std::string& name) {
   ModelRegistry* instance = get_instance();
-  return (instance->model_registry_.find(name) !=
-          instance->model_registry_.end());
+  const auto it = instance->model_registry_.find(name);
+  if (it == instance->model_registry_.end()) {
+    return false;
+  }
+  return it->second.dit_model_factory != nullptr;
 }
+
+namespace util {
+
+namespace {
+
+std::string try_resolve_from_component_key(const std::string& key) {
+  if (key.empty()) {
+    return {};
+  }
+  if (ModelRegistry::has_dit_model_factory(key)) {
+    return key;
+  }
+
+  auto try_prefix = [](const std::string& prefix) -> std::string {
+    if (ModelRegistry::has_dit_model_factory(prefix)) {
+      return prefix;
+    }
+    for (const char* suffix : {"_dlm", "_dit", "_diffusion", "_model"}) {
+      const std::string candidate = prefix + suffix;
+      if (ModelRegistry::has_dit_model_factory(candidate)) {
+        return candidate;
+      }
+    }
+    return {};
+  };
+
+  if (key.size() > 4 && key.substr(key.size() - 4) == "_dit") {
+    if (std::string resolved = try_prefix(key.substr(0, key.size() - 4));
+        !resolved.empty()) {
+      return resolved;
+    }
+  }
+  if (key.size() > 4 && key.substr(key.size() - 4) == "_vae") {
+    if (std::string resolved = try_prefix(key.substr(0, key.size() - 4));
+        !resolved.empty()) {
+      return resolved;
+    }
+  }
+  return {};
+}
+
+}  // namespace
+
+std::string resolve_dit_pipeline_type(
+    const std::vector<DitDiscoveredComponent>& components) {
+  if (components.empty()) {
+    return {};
+  }
+
+  for (const auto& component : components) {
+    if (std::string resolved =
+            try_resolve_from_component_key(component.component_type);
+        !resolved.empty()) {
+      return resolved;
+    }
+    if (component.name != component.component_type) {
+      if (std::string resolved = try_resolve_from_component_key(component.name);
+          !resolved.empty()) {
+        return resolved;
+      }
+    }
+  }
+
+  std::string component_summary;
+  for (const auto& component : components) {
+    if (!component_summary.empty()) {
+      component_summary += "; ";
+    }
+    component_summary +=
+        component.name + " (model_type=" + component.component_type + ")";
+  }
+  LOG(FATAL) << "Unable to resolve a registered DiT pipeline type from "
+                "discovered components: "
+             << component_summary;
+  return {};
+}
+
+}  // namespace util
 
 std::string ModelRegistry::get_model_backend(const std::string& name) {
   ModelRegistry* instance = get_instance();
@@ -332,6 +470,20 @@ std::string ModelRegistry::get_model_backend(const std::string& name) {
 }
 
 std::unique_ptr<CausalLM> create_llm_model(const ModelContext& context) {
+  // Python model executor: build the graph via the embedded interpreter instead
+  // of resolving a C++ model class from the registry.
+  const auto& model_impl = context.get_model_impl();
+#if defined(USE_CUDA) || defined(USE_NPU)
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    return std::make_unique<PyCausalLM>(context);
+  }
+#else
+  if (ModelConfig::is_python_model_impl(model_impl)) {
+    LOG(ERROR) << "--model_impl=python is only supported on CUDA/NPU builds.";
+    return nullptr;
+  }
+#endif
+
   std::string resolved_name;
   std::string error_message;
   if (!resolve_model_registration_name(context.get_model_args().model_type(),

@@ -23,14 +23,25 @@ cc_library(
 
 cc_library(
   NAME
+    kv_transfer_completion
+  HDRS
+    kv_transfer_completion.h
+  SRCS
+    kv_transfer_completion.cpp
+  DEPS
+    glog::glog
+    Folly::folly
+)
+
+cc_library(
+  NAME
     kv_cache_transfer
   HDRS
     kv_cache_transfer.h
     $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.h>
     $<$<BOOL:${USE_NPU}>:spec_kv_cache_transfer.h>
     kv_cache_store.h
-    # hierarchy temporarily disabled during the block-manager refactor
-    # hierarchy_kv_cache_transfer.h
+    hierarchy_kv_cache_transfer.h
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_transfer_engine.h>
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_kv_cache_transfer.h>
     $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.h>
@@ -39,8 +50,7 @@ cc_library(
     $<$<BOOL:${USE_NPU}>:llm_data_dist_transfer.cpp>
     $<$<BOOL:${USE_NPU}>:spec_kv_cache_transfer.cpp>
     kv_cache_store.cpp
-    # hierarchy temporarily disabled during the block-manager refactor
-    # hierarchy_kv_cache_transfer.cpp
+    hierarchy_kv_cache_transfer.cpp
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_transfer_engine.cpp>
     $<$<OR:$<BOOL:${USE_NPU}>,$<BOOL:${USE_MLU}>,$<BOOL:${USE_DCU}>>:mooncake_kv_cache_transfer.cpp>
     $<$<BOOL:${USE_NPU}>:mooncake_weight_transfer.cpp>
@@ -49,6 +59,7 @@ cc_library(
     :kv_cache
     :push_route
     :xtensor
+    :platform
     $<$<BOOL:${USE_NPU}>:graph>
     glog::glog
     $<$<BOOL:${USE_NPU}>:llm_datadist>

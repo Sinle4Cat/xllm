@@ -20,6 +20,16 @@ cc_test(
     GTest::gtest_main
 )
 
+cc_test(
+  NAME
+    kv_transfer_completion_test
+  SRCS
+    kv_transfer_completion_test.cpp
+  DEPS
+    :kv_transfer_completion
+    GTest::gtest_main
+)
+
 if(USE_NPU OR USE_MLU)
 cc_test(
   NAME
@@ -35,4 +45,16 @@ cc_test(
 # Resolve static link order between xtensor and xllm_server for this test target.
 target_link_libraries(mooncake_transfer_engine_test PRIVATE
   "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
+endif()
+
+if(USE_MLU)
+cc_test(
+  NAME
+    quantized_indexer_host_offload_test
+  SRCS
+    hierarchy_kv_cache_transfer_test.cpp
+  DEPS
+    :kv_cache_transfer
+    GTest::gtest_main
+)
 endif()

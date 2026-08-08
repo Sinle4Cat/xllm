@@ -30,6 +30,11 @@ limitations under the License.
 namespace xllm {
 
 struct ModelArgs {
+  // Expose every plain-data field to the generic property reflection layer so
+  // the embedded Python model executor can receive the full, already-parsed
+  // config without a hand-maintained field whitelist (see property_reflect.h).
+  REFLECT_PROPERTIES(ModelArgs);
+
   PROPERTY(std::string, model_type);
 
   PROPERTY(std::string, dtype);
@@ -60,6 +65,10 @@ struct ModelArgs {
 
   PROPERTY(int64_t, vocab_size) = -1;
   PROPERTY(int64_t, draft_vocab_size) = 0;
+
+  // DSpark: low-rank dim of the Markov head. 0 = disabled (plain DFlash /
+  // non-DSpark models).
+  PROPERTY(int64_t, markov_rank) = 0;
 
   PROPERTY(bool, use_qk_norm) = false;
   PROPERTY(float, rms_norm_eps) = 0.0f;
@@ -154,6 +163,8 @@ struct ModelArgs {
   PROPERTY(std::string, index_topk_pattern);
   PROPERTY(int32_t, index_skip_topk_offset) = 0;
   PROPERTY(bool, index_share_for_mtp_iteration) = false;
+  PROPERTY(std::vector<std::string>, indexer_types) = {};
+  PROPERTY(std::vector<std::string>, mlp_layer_types) = {};
 
   // deepseek v4
   PROPERTY(int32_t, rope_head_dim) = 0;
@@ -455,12 +466,18 @@ struct ModelArgs {
   PROPERTY(int64_t, vae_scale_factor_spatial) = 0;
   PROPERTY(bool, vae_is_residual) = false;
 
+  PROPERTY(float, batch_norm_eps) = 1e-04f;
+  PROPERTY(float, batch_norm_momentum) = 0.1f;
+  PROPERTY(std::vector<int64_t>, ae_patch_size) = {};
+
   // dit related args
   PROPERTY(int64_t, joint_attention_dim) = 0;
   PROPERTY(int64_t, pooled_projection_dim) = 0;
   PROPERTY(bool, guidance_embeds) = true;
   PROPERTY(std::vector<int64_t>, axes_dims_rope) = {};
   PROPERTY(int64_t, num_single_layers) = 0;
+
+  PROPERTY(float, mlp_ratio) = 3.0f;
   PROPERTY(int, timestep_guidance_channels) = 256;
   PROPERTY(int64_t, patch_size) = 1;
   PROPERTY(std::vector<int64_t>, wan_patch_size) = { 1, 2, 2 };
@@ -476,6 +493,33 @@ struct ModelArgs {
   PROPERTY(int64_t, image_embed_dim) = -1;
   PROPERTY(int64_t, added_kv_proj_dim) = -1;
   PROPERTY(int64_t, pos_embed_seq_len) = -1;
+
+  // cola-dlm dit related args
+  PROPERTY(int64_t, txt_dim) = 0;
+  PROPERTY(int64_t, txt_in_channels) = 0;
+  PROPERTY(int64_t, txt_out_channels) = 0;
+  PROPERTY(int64_t, emb_dim) = 0;
+  PROPERTY(int64_t, heads) = 0;
+  PROPERTY(int64_t, rope_dim) = 0;
+  PROPERTY(int64_t, expand_ratio) = 0;
+  PROPERTY(int64_t, block_size) = 0;
+  PROPERTY(int64_t, latent_dim) = 0;
+  PROPERTY(bool, qk_bias) = false;
+  PROPERTY(float, norm_eps) = 1e-5f;
+
+  // cola-dlm vae related args
+  PROPERTY(int64_t, vae_dim) = 0;
+  PROPERTY(int64_t, vae_num_heads) = 0;
+  PROPERTY(int64_t, encoder_num_blocks) = 0;
+  PROPERTY(int64_t, decoder_num_blocks) = 0;
+  PROPERTY(int64_t, shared_heads_kv) = 0;
+  PROPERTY(int64_t, vae_rope_theta) = 0;
+  PROPERTY(int64_t, vae_block_size) = 0;
+  PROPERTY(int64_t, vae_patch_size) = 0;
+  PROPERTY(bool, encoder_last_ln) = true;
+  PROPERTY(float, shifting_factor) = 0.0f;
+  PROPERTY(float, scaling_factor) = 0.0f;
+  PROPERTY(bool, use_variation) = true;
 
   // t5 related args
   PROPERTY(int64_t, d_model) = 0;
@@ -535,6 +579,12 @@ struct ModelArgs {
   PROPERTY(bool, zero_cond_t) = false;
   PROPERTY(bool, use_additional_t_cond) = false;
   PROPERTY(bool, use_layer3d_rope) = false;
+
+  // JoyImage-Edit-Plus dit related args
+  PROPERTY(double, mlp_width_ratio) = 4.0;
+  PROPERTY(int64_t, text_dim) = 4096;
+  PROPERTY(std::vector<int64_t>, rope_dim_list) = { 16, 56, 56 };
+  PROPERTY(int64_t, rope_theta_dit) = 10000;
 };
 
 // Qwen hybrid models may describe full-attention layers explicitly via

@@ -17,8 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include "common/flash_comm1_context.h"
 #include "kernels/ops_api.h"
-#include "platform/device.h"
 #include "platform/platform.h"
 
 namespace xllm {
@@ -34,12 +34,14 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
                            ProcessGroup* process_group,
                            const torch::TensorOptions& options,
                            const std::string& module_prefix,
-                           double swiglu_limit)
+                           double swiglu_limit,
+                           bool apply_fc1_sequence_parallel)
     : is_gated_(is_gated),
       intermediate_size_(intermediate_size),
       process_group_(process_group),
       hidden_act_(hidden_act),
-      swiglu_limit_(swiglu_limit) {
+      swiglu_limit_(swiglu_limit),
+      apply_fc1_sequence_parallel_(apply_fc1_sequence_parallel) {
   // Check if using w8a8 smoothquant quantization
   is_smoothquant_ = quant_args.quant_method() == kQuantMethodSmoothquant;
 
@@ -95,24 +97,41 @@ DenseMLPImpl::DenseMLPImpl(int64_t hidden_size,
 }
 
 torch::Tensor DenseMLPImpl::forward(const torch::Tensor& hidden_states) {
-  // input shape: [num_tokens, hidden_size]
-  auto gate_up = gate_up_proj_->forward(hidden_states);
+  const FlashComm1Context* fc1_ctx = get_current_flash_comm1_context();
+  const bool use_fc1_sequence_parallel =
+      apply_fc1_sequence_parallel_ && fc1_ctx && is_sequence_sharded(*fc1_ctx);
+  torch::Tensor h = hidden_states;
+
+  if (use_fc1_sequence_parallel) {
+    h = gather_sequence(hidden_states, *fc1_ctx);
+  }
+
+  auto gate_up = gate_up_proj_->forward(h);
 
   if (is_smoothquant_) {
-    // For w8a8 quantization, the active operation is fused with the down_proj
-    return down_proj_->forward(gate_up);
-  } else {
-    torch::Tensor output;
-    if (!Platform::is_npu()) {
-      int64_t batch_size = gate_up.sizes()[0];
-      output = torch::empty(
-          {batch_size, intermediate_size_ / process_group_->world_size()},
-          gate_up.options());
+    if (use_fc1_sequence_parallel) {
+      return down_proj_->forward(gate_up,
+                                 row_parallel_reduce_mode_for_fc1(*fc1_ctx));
     }
 
-    act_->forward(gate_up, output);
-    return down_proj_->forward(output);
+    return down_proj_->forward(gate_up);
   }
+
+  torch::Tensor output;
+  if (!Platform::is_npu()) {
+    const int64_t batch_size = gate_up.sizes()[0];
+    output = torch::empty(
+        {batch_size, intermediate_size_ / process_group_->world_size()},
+        gate_up.options());
+  }
+
+  act_->forward(gate_up, output);
+
+  if (use_fc1_sequence_parallel) {
+    return down_proj_->forward(output,
+                               row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+  }
+  return down_proj_->forward(output);
 }
 
 void DenseMLPImpl::load_state_dict(const StateDict& state_dict) {

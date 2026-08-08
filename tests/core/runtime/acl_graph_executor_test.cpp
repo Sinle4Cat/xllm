@@ -21,29 +21,43 @@ limitations under the License.
 
 #include <cstdlib>
 #include <memory>
+#include <optional>
 #include <vector>
 
+#include "common/metrics.h"
 #include "core/framework/batch/batch.h"
 #include "core/framework/block/block.h"
 #include "core/framework/block/block_manager_impl.h"
 #include "core/framework/config/execution_config.h"
+#include "core/framework/config/speculative_config.h"
 #include "core/framework/kv_cache/kv_cache.h"
+#include "core/framework/kv_cache/kv_cache_utils.h"
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_output.h"
+#include "core/framework/model_context.h"
 #include "core/framework/model_loader.h"
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/layers/common/attention_metadata.h"
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
+#include "core/layers/npu_torch/tests_utils.h"
 #include "core/runtime/acl_graph_executor_impl.h"
+#include "core/runtime/acl_graph_persistent_param.h"
 #include "core/runtime/base_executor_impl.h"
+#include "core/runtime/mtp_async_state.h"
 #include "core/runtime/options.h"
+#include "core/runtime/speculative_worker_impl.h"
+#include "models/model_registry.h"
+#include "tests/npu_test_environment.h"
 
 // Global test environment for ACL graph executor tests
 class AclGraphExecutorTestEnvironment : public ::testing::Environment {
  public:
   void SetUp() override {
+    xllm::testing::init_npu_test_runtime();
+
     // Initialize glog
     google::InitGoogleLogging("acl_graph_executor_test");
     google::SetStderrLogging(google::INFO);
@@ -64,6 +78,8 @@ class AclGraphExecutorTestEnvironment : public ::testing::Environment {
     aclrtResetDevice(0);
     aclFinalize();
     LOG(INFO) << "AclGraphExecutorTestEnvironment TearDown completed.";
+
+    xllm::testing::finalize_npu_test_runtime();
   }
 };
 
@@ -72,6 +88,28 @@ class AclGraphExecutorTestEnvironment : public ::testing::Environment {
     ::testing::AddGlobalTestEnvironment(new AclGraphExecutorTestEnvironment);
 
 namespace xllm {
+
+TEST(AclGraphStaticGraphTaskSignatureTest,
+     BuildsSameSignatureFromCaptureAndSignal) {
+  ModelInputParams params;
+  params.parallel.query_start_loc = {0, 5};
+  params.embedding.linear_state_ids = {7};
+  params.num_accepted_tokens_host = {4};
+  const SpecVerifyGraphTaskSignal signal{
+      .linear_state_id = 7,
+      .num_accepted_tokens = 4,
+      .spec_width = 5,
+      .block_table_width = 64,
+      .max_kv_seq_len = 256,
+  };
+
+  const auto captured = npu::make_static_graph_task_signature(params);
+  ASSERT_TRUE(captured.has_value());
+  EXPECT_EQ(captured.value(), npu::make_static_graph_task_signature(signal));
+
+  params.parallel.query_start_loc.push_back(6);
+  EXPECT_FALSE(npu::make_static_graph_task_signature(params).has_value());
+}
 
 namespace {
 const KVCache& first_full_attention_cache(
@@ -226,7 +264,16 @@ class SimpleCausalLM : public CausalLM {
                       std::vector<KVCache>& kv_caches,
                       const ModelInputParams& parameters) override {
     auto hidden_states = forward_impl(tokens, positions, kv_caches, parameters);
-    return ModelOutput(hidden_states);
+    ModelOutput model_output(hidden_states);
+    if (return_aux_hidden_states_) {
+      model_output.aux_hidden_states =
+          torch::cat({hidden_states, hidden_states}, /*dim=*/-1);
+    }
+    return model_output;
+  }
+
+  void set_return_aux_hidden_states(bool value) {
+    return_aux_hidden_states_ = value;
   }
 
   const torch::TensorOptions& options() const override {
@@ -293,6 +340,7 @@ class SimpleCausalLM : public CausalLM {
   torch::Tensor block_scale_;
   torch::Tensor block_size_;
   torch::Tensor scalar_one_;
+  bool return_aux_hidden_states_ = false;
 };
 
 class AclGraphExecutorTest : public ::testing::Test {
@@ -503,6 +551,118 @@ TEST_F(AclGraphExecutorTest, GraphReplayConsistency) {
       << "First output:\n"
       << output1.hidden_states << "\nSecond output:\n"
       << output2.hidden_states;
+}
+
+TEST_F(AclGraphExecutorTest, PreservesAuxHiddenStatesAcrossGraphReplay) {
+  auto batch = CreateTestBatch();
+  ASSERT_FALSE(batch->empty());
+
+  auto forward_input =
+      batch->prepare_forward_input(options_.num_decoding_tokens(),
+                                   /*min_decoding_batch_size=*/0,
+                                   model_args_);
+  forward_input = forward_input.to(*device_, /*dtype=*/torch::kFloat32);
+
+  SimpleCausalLM* simple_model = dynamic_cast<SimpleCausalLM*>(model_.get());
+  ASSERT_NE(simple_model, nullptr);
+  simple_model->set_return_aux_hidden_states(/*value=*/true);
+  options_.enable_graph_aux_hidden_states(/*value=*/true);
+
+  ModelOutput eager_output = model_->forward({forward_input.token_ids},
+                                             {forward_input.positions},
+                                             kv_caches_,
+                                             {forward_input.input_params});
+  auto graph_executor = std::make_unique<::xllm::npu::AclGraphExecutorImpl>(
+      model_.get(), model_args_, *device_, options_);
+  const double eager_fallbacks_before =
+      COUNTER_num_model_execution_total_eager.get_value();
+  auto run_graph = [&]() {
+    return graph_executor->run({forward_input.token_ids},
+                               {forward_input.positions},
+                               kv_caches_,
+                               {forward_input.input_params});
+  };
+  ModelOutput capture_output = run_graph();
+  for (int32_t slot_idx = 1;
+       slot_idx < graph_executor->graph_slot_count_for_test();
+       ++slot_idx) {
+    run_graph();
+  }
+  ModelOutput replay_output = run_graph();
+  EXPECT_EQ(COUNTER_num_model_execution_total_eager.get_value(),
+            eager_fallbacks_before)
+      << "ACL graph aux-hidden test unexpectedly fell back to eager";
+
+  ASSERT_TRUE(eager_output.aux_hidden_states.defined());
+  ASSERT_TRUE(capture_output.aux_hidden_states.defined());
+  ASSERT_TRUE(replay_output.aux_hidden_states.defined());
+  EXPECT_EQ(capture_output.aux_hidden_states.size(/*dim=*/-1),
+            model_args_.hidden_size() * 2);
+  EXPECT_TRUE(torch::allclose(eager_output.aux_hidden_states,
+                              capture_output.aux_hidden_states,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+  EXPECT_TRUE(torch::allclose(eager_output.aux_hidden_states,
+                              replay_output.aux_hidden_states,
+                              /*rtol=*/1e-5,
+                              /*atol=*/1e-6));
+}
+
+TEST(DeepseekV4ModelTest, ReturnsPreHcHiddenStatesForMtp) {
+  ModelArgs model_args;
+  model_args.model_type("deepseek_v4");
+  model_args.dtype("float32");
+  model_args.vocab_size(8);
+  model_args.hidden_size(2);
+  model_args.n_layers(0);
+  model_args.n_heads(1);
+  model_args.hc_mult(2);
+  model_args.hc_eps(0.1f);
+  model_args.rms_norm_eps(1e-5f);
+  model_args.window_size(128);
+  model_args.max_position_embeddings(0);
+  model_args.index_head_dim(0);
+  model_args.qk_rope_head_dim(0);
+  model_args.o_lora_rank(0);
+  model_args.num_speculative_tokens(1);
+
+  const torch::Device device("npu:0");
+  const torch::TensorOptions tensor_options =
+      torch::dtype(torch::kFloat32).device(device);
+  layer::test::MockProcessGroup process_group(
+      device, /*rank=*/0, /*world_size=*/1);
+  ParallelArgs parallel_args(
+      /*rank=*/0, /*world_size=*/1, &process_group);
+  parallel_args.tp_group_ = &process_group;
+  const ModelContext context(
+      parallel_args, model_args, QuantArgs(), tensor_options);
+  const CausalLMFactory factory =
+      ModelRegistry::get_causallm_factory("deepseek_v4");
+  ASSERT_TRUE(static_cast<bool>(factory));
+  std::unique_ptr<CausalLM> model = factory(context);
+  ASSERT_NE(model, nullptr);
+
+  const torch::Tensor pre_hc_hidden =
+      torch::tensor({1.0f, 2.0f, 3.0f, 4.0f}, tensor_options).view({1, 2, 2});
+  const torch::Tensor tokens =
+      torch::zeros({1}, torch::dtype(torch::kInt).device(device));
+  const torch::Tensor positions =
+      torch::zeros({1}, torch::dtype(torch::kInt).device(device));
+  ModelInputParams input_params;
+  input_params.meta.num_sequences = 1;
+  input_params.embedding.input_embedding = pre_hc_hidden;
+  input_params.attn_metadata = std::make_shared<layer::AttentionMetadata>();
+  std::vector<KVCache> kv_caches;
+
+  const ModelOutput output =
+      model->forward(tokens, positions, kv_caches, input_params);
+
+  ASSERT_TRUE(output.aux_hidden_states.defined());
+  EXPECT_TRUE(torch::equal(output.aux_hidden_states,
+                           pre_hc_hidden.flatten(/*start_dim=*/1)));
+  ASSERT_TRUE(output.hidden_states.defined());
+  EXPECT_EQ(output.hidden_states.sizes(), torch::IntArrayRef({1, 2}));
+  EXPECT_EQ(output.aux_hidden_states.sizes(), torch::IntArrayRef({1, 4}));
 }
 
 // Test graph creation and execution with different batch sizes
@@ -732,11 +892,20 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   ASSERT_FALSE(batch->empty());
   ASSERT_FALSE(sequences_.empty());
 
+  // embedding_ids come from the EMBEDDING slot, while linear_state_ids come
+  // from the dedicated LINEAR slot; the two are decoupled and carry
+  // independent ids through transport.
   auto& seq = sequences_.back();
-  auto linear_state_block = block_manager_->allocate(1);
-  ASSERT_EQ(linear_state_block.size(), 1);
-  const int32_t expected_linear_state_id = linear_state_block[0].id();
-  seq.add_blocks(BlockType::SINGLE, linear_state_block);
+  auto embedding_block = block_manager_->allocate(1);
+  ASSERT_EQ(embedding_block.size(), 1);
+  const int32_t expected_embedding_id = embedding_block[0].id();
+  seq.add_blocks(BlockType::EMBEDDING, embedding_block);
+
+  auto linear_state_slot = block_manager_->allocate(1);
+  ASSERT_EQ(linear_state_slot.size(), 1);
+  const int32_t expected_linear_state_id = linear_state_slot[0].id();
+  seq.add_blocks(BlockType::LINEAR, linear_state_slot);
+  ASSERT_NE(expected_embedding_id, expected_linear_state_id);
 
   auto forward_input = batch->prepare_forward_input(
       options_.num_decoding_tokens(), 0, model_args_);
@@ -746,7 +915,27 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
             expected_linear_state_id);
   ASSERT_EQ(forward_input.input_params.embedding.embedding_ids.size(), 1);
   EXPECT_EQ(forward_input.input_params.embedding.embedding_ids[0],
-            expected_linear_state_id);
+            expected_embedding_id);
+
+  forward_input.input_params.linear_state_validity_mask = {1};
+  forward_input = forward_input.to(*device_, torch::kFloat32);
+  npu::GraphPersistentParam persistent_param(model_args_, *device_, options_);
+  std::optional<ModelInputParams> params_for_capture = persistent_param.update(
+      forward_input.token_ids,
+      first_full_attention_cache(kv_caches_).get_k_cache(),
+      first_full_attention_cache(kv_caches_).get_v_cache(),
+      forward_input.positions,
+      forward_input.input_params,
+      /*padded_num_tokens=*/2,
+      /*return_capture_params=*/true);
+  ASSERT_TRUE(params_for_capture.has_value());
+  EXPECT_EQ(params_for_capture->meta.num_sequences, 2);
+  EXPECT_EQ(
+      params_for_capture->embedding.linear_state_ids,
+      std::vector<int32_t>({expected_linear_state_id, kPaddingLinearStateId}));
+  ASSERT_EQ(params_for_capture->linear_state_validity_mask.size(), 2);
+  EXPECT_EQ(params_for_capture->linear_state_validity_mask[0], 1);
+  EXPECT_EQ(params_for_capture->linear_state_validity_mask[1], 0);
 }
 
 TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
@@ -768,6 +957,387 @@ TEST_F(AclGraphExecutorTest, GraphDoubleBufferFlagControlsSlotCount) {
 
   execution_config.enable_graph_double_buffer(
       original_enable_graph_double_buffer);
+}
+
+TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
+  SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
+  const bool original_enable_atb_spec_kernel =
+      speculative_config.enable_atb_spec_kernel();
+  speculative_config.enable_atb_spec_kernel(false);
+
+  ModelArgs args;
+  args.model_type("deepseek_v4");
+  args.dtype("float32");
+  args.hidden_size(8);
+  args.max_position_embeddings(32);
+
+  runtime::Options options;
+  options.block_size(4);
+  options.max_seqs_per_batch(10);
+  options.max_tokens_per_batch(64);
+  options.num_decoding_tokens(3);
+  options.enable_speculative_decode(true);
+  options.is_draft_engine(false);
+
+  const torch::Device device("npu:0");
+  ::xllm::npu::GraphPersistentParam persistent_param(
+      args,
+      device,
+      options,
+      /*need_update_attn_mask=*/false,
+      /*is_hybrid_linear_attention=*/false);
+  EXPECT_EQ(persistent_param.q_seq_lens().size(0), 30);
+  EXPECT_EQ(persistent_param.kv_seq_lens().size(0), 30);
+  EXPECT_EQ(persistent_param.persistent_block_tables().size(0), 30);
+
+  constexpr int64_t kValidateRows = 12;
+  const torch::TensorOptions int_options =
+      torch::dtype(torch::kInt).device(device);
+  const torch::Tensor tokens = torch::arange(kValidateRows, int_options);
+  const torch::Tensor positions = torch::arange(kValidateRows, int_options);
+  ModelInputParams params;
+  params.is_spec_verify = true;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.meta.num_sequences = kValidateRows;
+  params.attention.host.q_seq_lens.assign(kValidateRows, 1);
+  params.attention.host.kv_seq_lens.assign(kValidateRows, 8);
+  params.attention.device.q_seq_lens =
+      torch::ones({kValidateRows}, int_options);
+  params.attention.device.kv_seq_lens =
+      torch::full({kValidateRows}, 8, int_options);
+  params.attention.device.new_cache_slots =
+      torch::zeros({kValidateRows}, int_options);
+  params.attention.device.block_tables =
+      torch::zeros({kValidateRows, 2}, int_options);
+
+  std::optional<ModelInputParams> capture_params;
+  EXPECT_NO_THROW(capture_params = persistent_param.update(
+                      tokens,
+                      torch::Tensor(),
+                      torch::Tensor(),
+                      positions,
+                      params,
+                      /*padded_num_tokens=*/kValidateRows,
+                      /*return_capture_params=*/true));
+  EXPECT_TRUE(capture_params.has_value());
+  if (capture_params.has_value()) {
+    EXPECT_EQ(capture_params->attention.device.q_seq_lens.size(0),
+              kValidateRows);
+    EXPECT_EQ(capture_params->attention.device.block_tables.size(0),
+              kValidateRows);
+  }
+
+  ::xllm::npu::GraphPersistentParam hybrid_persistent_param(
+      args,
+      device,
+      options,
+      /*need_update_attn_mask=*/false,
+      /*is_hybrid_linear_attention=*/true);
+  EXPECT_EQ(hybrid_persistent_param.q_seq_lens().size(0), 10);
+  EXPECT_EQ(hybrid_persistent_param.persistent_block_tables().size(0), 10);
+
+  speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
+}
+
+TEST(AclGraphPersistentParamTest,
+     GenericSpecVerifyCaptureKeepsPersistentBlockTableWidth) {
+  constexpr int32_t kSpecWidth = 6;
+  constexpr int64_t kActiveBlockTableWidth = 2;
+  ModelArgs args;
+  args.model_type("deepseek_v4");
+  args.dtype("float32");
+  args.hidden_size(8);
+  args.max_position_embeddings(32);
+
+  runtime::Options options;
+  options.block_size(4);
+  options.max_seqs_per_batch(4);
+  options.max_tokens_per_batch(16);
+  options.num_decoding_tokens(kSpecWidth);
+  options.enable_speculative_decode(true);
+  options.is_draft_engine(false);
+
+  const torch::Device device("npu:0");
+  const auto int_options = torch::dtype(torch::kInt).device(device);
+  ::xllm::npu::GraphPersistentParam persistent_param(
+      args,
+      device,
+      options,
+      /*need_update_attn_mask=*/false,
+      /*is_hybrid_linear_attention=*/true);
+
+  ModelInputParams params;
+  params.is_spec_verify = true;
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.meta.num_sequences = 1;
+  params.meta.q_max_seq_len = kSpecWidth;
+  params.attention.host.q_seq_lens = {kSpecWidth};
+  params.attention.host.kv_seq_lens = {20};
+  params.attention.device.q_seq_lens = torch::tensor({kSpecWidth}, int_options);
+  params.attention.device.kv_seq_lens = torch::tensor({20}, int_options);
+  params.attention.device.new_cache_slots =
+      torch::arange(kSpecWidth, int_options);
+  params.attention.device.block_tables =
+      torch::zeros({1, kActiveBlockTableWidth}, int_options);
+  params.graph.use_expanded_decode_for_spec_verify_attention = true;
+  params.graph.expanded_kv_seq_lens =
+      torch::tensor({15, 16, 17, 18, 19, 20}, int_options);
+  params.graph.expanded_kv_seq_lens_vec = {15, 16, 17, 18, 19, 20};
+  params.graph.expanded_block_tables =
+      torch::zeros({kSpecWidth, kActiveBlockTableWidth}, int_options);
+
+  const auto tokens = torch::arange(kSpecWidth, int_options);
+  const auto positions = torch::arange(kSpecWidth, int_options);
+  auto generic = persistent_param.update(tokens,
+                                         torch::Tensor(),
+                                         torch::Tensor(),
+                                         positions,
+                                         params,
+                                         kSpecWidth,
+                                         true);
+  ASSERT_TRUE(generic.has_value());
+  const int64_t capacity =
+      mtp_async::speculative_verify_block_table_capacity(32, 4);
+  EXPECT_EQ(generic->graph.expanded_block_tables.size(0), kSpecWidth);
+  EXPECT_EQ(generic->graph.expanded_block_tables.size(1), capacity);
+  EXPECT_TRUE(generic->graph.expanded_block_tables.is_contiguous());
+
+  params.graph.spec_verify_source_addresses_stable = true;
+  auto stable = persistent_param.update(tokens,
+                                        torch::Tensor(),
+                                        torch::Tensor(),
+                                        positions,
+                                        params,
+                                        kSpecWidth,
+                                        true);
+  ASSERT_TRUE(stable.has_value());
+  EXPECT_EQ(stable->graph.expanded_block_tables.size(0), kSpecWidth);
+  EXPECT_EQ(stable->graph.expanded_block_tables.size(1),
+            kActiveBlockTableWidth);
+}
+
+TEST(AclGraphPersistentParamTest, AuxHiddenStatesUseGraphTokenCapacity) {
+  SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
+  const bool original_enable_atb_spec_kernel =
+      speculative_config.enable_atb_spec_kernel();
+  speculative_config.enable_atb_spec_kernel(false);
+
+  ModelArgs args;
+  args.model_type("deepseek_v4");
+  args.dtype("float32");
+  args.hidden_size(8);
+  args.max_position_embeddings(32);
+
+  runtime::Options options;
+  options.block_size(4);
+  options.max_seqs_per_batch(10);
+  options.max_tokens_per_batch(64);
+  options.num_decoding_tokens(3);
+  options.enable_speculative_decode(true);
+  options.is_draft_engine(false);
+
+  const torch::Device device("npu:0");
+  const torch::TensorOptions tensor_options =
+      torch::dtype(torch::kFloat32).device(device);
+  const torch::Tensor aux_hidden_states = torch::ones({12, 16}, tensor_options);
+
+  ::xllm::npu::GraphPersistentParam target_param(args, device, options);
+  target_param.set_aux_hidden_states(aux_hidden_states);
+  EXPECT_EQ(target_param.aux_hidden_states().size(0), 30);
+
+  options.is_draft_engine(true);
+  ::xllm::npu::GraphPersistentParam draft_param(args, device, options);
+  draft_param.set_aux_hidden_states(aux_hidden_states.slice(
+      /*dim=*/0, /*start=*/0, /*end=*/options.max_seqs_per_batch()));
+  EXPECT_EQ(draft_param.aux_hidden_states().size(0), 10);
+
+  speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
+}
+
+TEST(SpeculativeConfigTest, MtpAlgorithmClassificationIsCaseInsensitive) {
+  EXPECT_TRUE(SpeculativeConfig::is_mtp_algorithm("MTP"));
+  EXPECT_TRUE(SpeculativeConfig::is_mtp_algorithm("mtp"));
+  EXPECT_TRUE(SpeculativeConfig::is_mtp_algorithm("Mtp"));
+  EXPECT_TRUE(SpeculativeConfig::is_mtp_algorithm("mTp"));
+
+  EXPECT_FALSE(SpeculativeConfig::is_mtp_algorithm("Eagle3"));
+  EXPECT_FALSE(SpeculativeConfig::is_mtp_algorithm("DFlash"));
+  EXPECT_FALSE(SpeculativeConfig::is_mtp_algorithm("Suffix"));
+  EXPECT_FALSE(SpeculativeConfig::is_mtp_algorithm("unknown"));
+}
+
+TEST(SpeculativeWorkerDispatchTest, DecodeRequiresEveryDpRankToDecode) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.parallel.dp_global_token_nums = {1, 1};
+  params.parallel.dp_is_decode = {1, 1};
+  EXPECT_TRUE(should_run_speculative_decode(params));
+
+  params.parallel.dp_global_token_nums = {1, 8095};
+  params.parallel.dp_is_decode = {1, 0};
+  EXPECT_FALSE(should_run_speculative_decode(params));
+}
+
+TEST(SpeculativeWorkerDispatchTest, PreservesSingleDpRankBehavior) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  EXPECT_TRUE(should_run_speculative_decode(params));
+
+  params.parallel.dp_global_token_nums = {1};
+  EXPECT_TRUE(should_run_speculative_decode(params));
+
+  params.parallel.dp_is_decode = {1};
+  EXPECT_TRUE(should_run_speculative_decode(params));
+
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  EXPECT_FALSE(should_run_speculative_decode(params));
+}
+
+TEST(SpeculativeWorkerDispatchTest, DecodeRejectsIncompleteDpMetadata) {
+  ModelInputParams params;
+  params.meta.batch_forward_type = BatchForwardType::DECODE;
+  params.parallel.dp_global_token_nums = {1, 8095};
+  params.parallel.dp_is_decode = {1};
+  EXPECT_FALSE(should_run_speculative_decode(params));
+}
+
+TEST(AclGraphPersistentParamTest, SpecVerifyGraphUpdateSupportsRuntimeBatch) {
+  constexpr int32_t kSpecWidth = 4;
+  constexpr int32_t kBatchSize = 2;
+  constexpr int32_t kNumTokens = kBatchSize * kSpecWidth;
+  ModelArgs args;
+  args.model_type("deepseek_v4");
+  args.dtype("float32");
+  args.hidden_size(8);
+  args.max_position_embeddings(32);
+
+  runtime::Options options;
+  options.block_size(4);
+  options.max_seqs_per_batch(4);
+  options.max_tokens_per_batch(16);
+  options.num_decoding_tokens(kSpecWidth);
+  options.enable_speculative_decode(true);
+  options.is_draft_engine(false);
+
+  const torch::Device device("npu:0");
+  ::xllm::npu::GraphPersistentParam persistent_param(
+      args,
+      device,
+      options,
+      /*need_update_attn_mask=*/false,
+      /*is_hybrid_linear_attention=*/true);
+
+  ModelInputParams params;
+  params.is_spec_verify = true;
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.meta.num_sequences = kBatchSize;
+  params.meta.q_max_seq_len = kSpecWidth;
+  params.attention.host.q_seq_lens = {kSpecWidth, kSpecWidth};
+  params.attention.host.kv_seq_lens = {20, 30};
+  params.attention.host.new_cache_slots = {31, 32, 33, 34, 41, 42, 43, 44};
+  params.attention.host.block_tables =
+      torch::tensor({{51, 52}, {61, 62}}, torch::kInt32);
+  params.attention.host.q_cu_seq_lens = {0, kSpecWidth, kNumTokens};
+
+  std::vector<int32_t> token_values = {11, 12, 13, 14, 21, 22, 23, 24};
+  const std::vector<int32_t> position_values = {
+      101, 102, 103, 104, 201, 202, 203, 204};
+  std::vector<int32_t> linear_state_indices = {3, 4};
+  std::vector<int32_t> accepted_tokens = {2, 3};
+  std::vector<int32_t> expanded_kv_seq_lens = {17, 18, 19, 20, 27, 28, 29, 30};
+  std::vector<int32_t> expanded_block_tables = {
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15};
+  torch::Tensor token_ids_host;
+  torch::Tensor position_ids_host;
+  torch::Tensor token_ids;
+  torch::Tensor positions;
+  torch::Tensor expanded_block_tables_flat;
+  const std::vector<AttentionInput::PackedIntInput> extra_int_inputs = {
+      {&token_values, &token_ids_host, &token_ids},
+      {&position_values, &position_ids_host, &positions},
+      {&linear_state_indices, nullptr, &params.embedding.linear_state_indices},
+      {&accepted_tokens, nullptr, &params.num_accepted_tokens},
+      {&expanded_kv_seq_lens, nullptr, &params.graph.expanded_kv_seq_lens},
+      {&expanded_block_tables, nullptr, &expanded_block_tables_flat}};
+  auto stable_buffer_owner = std::make_shared<int>(0);
+  params.attention.attention_buffer_owner = stable_buffer_owner;
+  ASSERT_TRUE(params.attention.rebuild_device_buffer(
+      device, extra_int_inputs, AttentionInput::BufferReusePolicy::GROWABLE));
+
+  const torch::Tensor initial_device_buffer =
+      params.attention.attention_device_buffer;
+  const void* initial_token_ptr = token_ids.data_ptr();
+  EXPECT_EQ(initial_device_buffer.data_ptr(), initial_token_ptr);
+  params.attention.reserve_device_buffer_capacity(
+      params.attention.attention_buffer_capacity + 1024, device);
+  ASSERT_TRUE(params.attention.rebuild_device_buffer(
+      device,
+      extra_int_inputs,
+      AttentionInput::BufferReusePolicy::FIXED_CAPACITY));
+  EXPECT_NE(initial_token_ptr, token_ids.data_ptr());
+  EXPECT_EQ(params.attention.attention_device_buffer.data_ptr(),
+            token_ids.data_ptr());
+  const void* stable_token_ptr = token_ids.data_ptr();
+  token_values[0] = 10;
+  ASSERT_TRUE(params.attention.rebuild_device_buffer(
+      device,
+      extra_int_inputs,
+      AttentionInput::BufferReusePolicy::FIXED_CAPACITY));
+  EXPECT_EQ(stable_token_ptr, token_ids.data_ptr());
+  EXPECT_TRUE(torch::equal(token_ids_host, torch::tensor(token_values)));
+  EXPECT_TRUE(torch::equal(position_ids_host, torch::tensor(position_values)));
+
+  params.graph.spec_verify_source_addresses_stable = true;
+  params.graph.input_tokens_override = token_ids;
+  params.graph.expanded_block_tables =
+      expanded_block_tables_flat.view({kNumTokens, 2});
+
+  AttentionInput detached_attention = params.attention;
+  ASSERT_TRUE(detached_attention.rebuild_device_buffer(device));
+  EXPECT_NE(params.attention.attention_device_buffer.data_ptr(),
+            detached_attention.attention_device_buffer.data_ptr());
+
+  persistent_param.update_spec_verify_inputs(
+      params.graph.input_tokens_override,
+      positions,
+      params,
+      /*padded_num_tokens=*/kNumTokens,
+      npu::SpecVerifyInputUpdateScope::ALL_INPUTS);
+
+  EXPECT_TRUE(torch::equal(persistent_param.persistent_tokens(kNumTokens).cpu(),
+                           params.graph.input_tokens_override.cpu()));
+  EXPECT_TRUE(
+      torch::equal(persistent_param.persistent_positions(kNumTokens).cpu(),
+                   positions.cpu()));
+  EXPECT_TRUE(torch::equal(
+      persistent_param.persistent_new_cache_slots(kNumTokens).cpu(),
+      params.attention.device.new_cache_slots.cpu()));
+  EXPECT_TRUE(
+      torch::equal(persistent_param.q_seq_lens().narrow(0, 0, kBatchSize).cpu(),
+                   params.attention.device.q_seq_lens.cpu()));
+  EXPECT_TRUE(torch::equal(
+      persistent_param.kv_seq_lens().narrow(0, 0, kBatchSize).cpu(),
+      params.attention.device.kv_seq_lens.cpu()));
+  EXPECT_TRUE(torch::equal(persistent_param.persistent_block_tables()
+                               .narrow(0, 0, kBatchSize)
+                               .narrow(1, 0, 2)
+                               .cpu(),
+                           params.attention.device.block_tables.cpu()));
+
+  const auto long_options = torch::dtype(torch::kLong).device(device);
+  params.graph.spec_verify_draft_token_sources = {
+      torch::tensor({101, 201}, long_options),
+      torch::tensor({102, 202}, long_options),
+      torch::tensor({103, 203}, long_options)};
+  persistent_param.update_spec_verify_inputs(
+      params.graph.input_tokens_override,
+      torch::Tensor(),
+      params,
+      /*padded_num_tokens=*/kNumTokens,
+      npu::SpecVerifyInputUpdateScope::TOKENS_ONLY);
+  EXPECT_TRUE(torch::equal(
+      persistent_param.persistent_tokens(kNumTokens).cpu(),
+      torch::tensor({10, 101, 102, 103, 21, 201, 202, 203}, torch::kInt32)));
 }
 
 TEST(AclGraphExecutorHybridTest, KvCacheSupportsLinearOnlyLayers) {

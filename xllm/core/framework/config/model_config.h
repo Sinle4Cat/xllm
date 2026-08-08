@@ -17,7 +17,9 @@ limitations under the License.
 
 #include <cstdint>
 #include <nlohmann/json_fwd.hpp>
+#include <optional>
 #include <string>
+#include <string_view>
 
 #include "core/common/macros.h"
 #include "core/framework/config/option_category.h"
@@ -39,17 +41,24 @@ class ModelConfig final {
   void initialize();
   void normalize_cpp_chat_template(const std::string& model_type);
 
+  [[nodiscard]] static bool is_python_model_impl(std::string_view model_impl);
+  [[nodiscard]] static std::optional<std::string>
+  validate_python_speculative_decode(std::string_view model_impl,
+                                     std::string_view model_type,
+                                     int32_t num_speculative_tokens);
+
   [[nodiscard]] static const OptionCategory& option_category() {
     static const OptionCategory kOptionCategory = {
         "MODEL OPTIONS",
         {"model_id",
          "model",
+         "model_impl",
          "backend",
          "task",
-         "device_id",
-         "devices",
+         "python_model_path",
          "limit_image_per_prompt",
          "max_encoder_cache_size",
+         "max_processor_cache_items",
          "reasoning_parser",
          "tool_call_parser",
          "enable_qwen3_reranker",
@@ -65,17 +74,19 @@ class ModelConfig final {
 
   PROPERTY(std::string, model);
 
+  PROPERTY(std::string, model_impl);
+
+  PROPERTY(std::string, python_model_path);
+
   PROPERTY(std::string, backend);
 
   PROPERTY(std::string, task) = "generate";
 
-  PROPERTY(int32_t, device_id) = -1;
-
-  PROPERTY(std::string, devices) = "";
-
   PROPERTY(int32_t, limit_image_per_prompt) = 8;
 
   PROPERTY(int64_t, max_encoder_cache_size) = 0;
+
+  PROPERTY(int64_t, max_processor_cache_items) = 256;
 
   PROPERTY(std::string, reasoning_parser);
 
