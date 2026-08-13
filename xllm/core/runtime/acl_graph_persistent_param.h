@@ -209,6 +209,30 @@ class GraphPersistentParam final {
     }
     return persistent_linear_state_indices_;
   }
+  torch::Tensor persistent_linear_state_validity_mask(
+      uint32_t actual_batch_size = 0) const {
+    if (actual_batch_size > 0) {
+      return persistent_linear_state_validity_mask_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size);
+    }
+    return persistent_linear_state_validity_mask_;
+  }
+  torch::Tensor persistent_linear_state_read_indices(
+      uint32_t actual_batch_size = 0) const {
+    if (actual_batch_size > 0) {
+      return persistent_linear_state_read_indices_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size);
+    }
+    return persistent_linear_state_read_indices_;
+  }
+  torch::Tensor persistent_linear_state_write_indices(
+      uint32_t actual_batch_size = 0) const {
+    if (actual_batch_size > 0) {
+      return persistent_linear_state_write_indices_.slice(
+          /*dim=*/0, /*start=*/0, /*end=*/actual_batch_size);
+    }
+    return persistent_linear_state_write_indices_;
+  }
   torch::Tensor persistent_num_accepted_tokens(
       uint32_t actual_batch_size = 0) const {
     if (actual_batch_size > 0) {
@@ -293,6 +317,9 @@ class GraphPersistentParam final {
   // for mtp model
   torch::Tensor persistent_embedding_;
   torch::Tensor persistent_linear_state_indices_;
+  torch::Tensor persistent_linear_state_validity_mask_;
+  torch::Tensor persistent_linear_state_read_indices_;
+  torch::Tensor persistent_linear_state_write_indices_;
   torch::Tensor persistent_num_accepted_tokens_;
 
   // for mrope (multimodal rotary position embedding)

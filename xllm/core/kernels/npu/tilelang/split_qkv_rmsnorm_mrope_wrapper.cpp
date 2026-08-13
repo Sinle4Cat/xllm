@@ -18,6 +18,13 @@ limitations under the License.
 #include <torch_npu/csrc/core/npu/NPUStream.h>
 #include <torch_npu/torch_npu.h>
 
+#ifdef TORCH_HIGHER_THAN_PTA6
+#include <torch_npu/csrc/framework/OpCommand.h>
+#else
+#include <torch_npu/csrc/aten/NPUNativeFunctions.h>
+#include <torch_npu/csrc/framework/utils/OpPreparation.h>
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <limits>
@@ -351,18 +358,37 @@ split_qkv_rmsnorm_mrope(const torch::Tensor& qkvg,
 
   const int32_t device_id = qkvg.device().index();
   aclrtStream stream = c10_npu::getCurrentNPUStream(device_id).stream();
-  entry->fn(static_cast<uint8_t*>(qkvg.data_ptr()),
-            static_cast<uint8_t*>(q_weight.data_ptr()),
-            static_cast<uint8_t*>(k_weight.data_ptr()),
-            static_cast<uint8_t*>(cos_sin.data_ptr()),
-            reinterpret_cast<uint8_t*>(gather_pattern.data_ptr()),
-            static_cast<uint8_t*>(q_out_flat.data_ptr()),
-            static_cast<uint8_t*>(k_out_flat.data_ptr()),
-            static_cast<uint8_t*>(v_out_flat.data_ptr()),
-            static_cast<uint8_t*>(gate_out_flat.data_ptr()),
-            static_cast<int32_t>(num_tokens),
-            eps,
-            stream);
+  auto tilelang_launch = [entry,
+                          qkvg,
+                          q_weight,
+                          k_weight,
+                          cos_sin,
+                          gather_pattern,
+                          q_out_flat,
+                          k_out_flat,
+                          v_out_flat,
+                          gate_out_flat,
+                          num_tokens,
+                          eps,
+                          stream]() -> int {
+    entry->fn(static_cast<uint8_t*>(qkvg.data_ptr()),
+              static_cast<uint8_t*>(q_weight.data_ptr()),
+              static_cast<uint8_t*>(k_weight.data_ptr()),
+              static_cast<uint8_t*>(cos_sin.data_ptr()),
+              reinterpret_cast<uint8_t*>(gather_pattern.data_ptr()),
+              static_cast<uint8_t*>(q_out_flat.data_ptr()),
+              static_cast<uint8_t*>(k_out_flat.data_ptr()),
+              static_cast<uint8_t*>(v_out_flat.data_ptr()),
+              static_cast<uint8_t*>(gate_out_flat.data_ptr()),
+              static_cast<int32_t>(num_tokens),
+              eps,
+              stream);
+    return ACL_SUCCESS;
+  };
+  at_npu::native::OpCommand command;
+  command.Name("TileLangSplitQkvRmsnormMrope");
+  command.SetCustomHandler(tilelang_launch);
+  command.Run();
 
   return {q_out_flat.view({num_tokens, num_q_heads, head_size}),
           k_out_flat.view({num_tokens, num_kv_heads, head_size}),

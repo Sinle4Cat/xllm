@@ -225,6 +225,10 @@ void create_host_page_aligned_tensor(const std::vector<int64_t>& dims,
                                      HostPageAlignedRegion* region);
 
 #if defined(USE_NPU)
+void check_linear_attention_kv_cache_guards(const torch::Tensor& conv_cache,
+                                            const torch::Tensor& ssm_cache,
+                                            const char* phase);
+
 aclFormat get_npu_kv_cache_format(const std::string& model_type);
 
 // Allocate an NPU tensor from the huge-page device allocator. The returned

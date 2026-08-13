@@ -39,6 +39,7 @@ limitations under the License.
 #include "framework/prefix_cache/block_hasher.h"
 #include "framework/request/stopping_checker.h"
 #include "framework/sampling/sampling_params.h"
+#include "layers/npu_torch/qwen3_gated_delta_net_route.h"
 #include "platform/device.h"
 #include "platform/platform.h"
 #include "runtime/forward_shared_memory_manager.h"
@@ -1760,6 +1761,8 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
   forward_input.input_params.attention.host.block_tables =
       forward_input.input_params.attention.device.block_tables;
   forward_input.input_params.embedding.linear_state_ids = {4, 6};
+  forward_input.input_params.embedding.linear_state_read_ids = {3, 5};
+  forward_input.input_params.embedding.linear_state_write_ids = {4, 6};
 
   TransferKVInfo transfer_info;
   transfer_info.request_id = "dsv4-round-trip";
@@ -1797,12 +1800,357 @@ TEST(BatchTest, SharedMemoryRoundTripPreservesLinearStateIds) {
   EXPECT_EQ(from_shm_mapping.remote_ids, (std::vector<uint64_t>{101, 102}));
 
   forward_input.input_params.embedding.linear_state_ids.clear();
+  forward_input.input_params.embedding.linear_state_read_ids.clear();
+  forward_input.input_params.embedding.linear_state_write_ids.clear();
   ASSERT_TRUE(writer_manager.input_write(forward_input));
 
   ForwardInput legacy_from_shm;
   reader_manager.input_read(legacy_from_shm, torch::Device(torch::kCPU));
   EXPECT_EQ(legacy_from_shm.input_params.embedding.linear_state_ids,
             std::vector<int32_t>({-1, -1}));
+  EXPECT_EQ(from_shm.input_params.embedding.linear_state_read_ids,
+            std::vector<int32_t>({3, 5}));
+  EXPECT_EQ(from_shm.input_params.embedding.linear_state_write_ids,
+            std::vector<int32_t>({4, 6}));
+  ForwardInput canonical =
+      from_shm.to(torch::Device(torch::kCPU), torch::kFloat32);
+  EXPECT_TRUE(equal(canonical.input_params.embedding.linear_state_read_indices,
+                    std::vector<int32_t>({3, 5})));
+  EXPECT_EQ(
+      canonical.input_params.embedding.linear_state_indices.data_ptr(),
+      canonical.input_params.embedding.linear_state_write_indices.data_ptr());
+}
+
+TEST(ModelInputParamsTest, ToPrefersExplicitLinearStateForkIds) {
+  ModelInputParams input_params;
+  input_params.embedding.linear_state_ids = {4, 6};
+  input_params.embedding.linear_state_read_ids = {3, 5};
+  input_params.embedding.linear_state_write_ids = {7, 8};
+  input_params.embedding.linear_state_read_indices =
+      torch::tensor(std::vector<int32_t>({0, 0}), torch::kInt);
+  input_params.embedding.linear_state_write_indices =
+      torch::tensor(std::vector<int32_t>({1, 1}), torch::kInt);
+  input_params.num_accepted_tokens_host = {1, 4};
+  input_params.num_accepted_tokens =
+      torch::tensor(std::vector<int32_t>({4, 1}), torch::kInt);
+  input_params.enable_graph = true;
+
+  ModelInputParams copied = input_params.to(torch::Device(torch::kCPU));
+
+  EXPECT_TRUE(equal(copied.embedding.linear_state_indices,
+                    std::vector<int32_t>({4, 6})));
+  EXPECT_TRUE(equal(copied.embedding.linear_state_read_indices,
+                    std::vector<int32_t>({3, 5})));
+  EXPECT_TRUE(equal(copied.embedding.linear_state_write_indices,
+                    std::vector<int32_t>({7, 8})));
+  EXPECT_EQ(copied.embedding.linear_state_read_indices.scalar_type(),
+            torch::kInt32);
+  EXPECT_EQ(copied.embedding.linear_state_write_indices.scalar_type(),
+            torch::kInt32);
+  EXPECT_TRUE(copied.embedding.linear_state_read_indices.is_contiguous());
+  EXPECT_TRUE(copied.embedding.linear_state_write_indices.is_contiguous());
+  EXPECT_TRUE(equal(copied.num_accepted_tokens, std::vector<int32_t>({1, 4})));
+  EXPECT_TRUE(copied.enable_graph);
+}
+
+TEST(ModelInputParamsTest, ToPreservesStableSpecVerifyGraphSources) {
+  ModelInputParams input_params;
+  input_params.embedding.linear_state_ids = {4, 6};
+  input_params.embedding.linear_state_read_ids = {4, 6};
+  input_params.embedding.linear_state_write_ids = {4, 6};
+  input_params.embedding.linear_state_indices =
+      torch::tensor(std::vector<int32_t>({8, 9}), torch::kInt);
+  input_params.embedding.linear_state_read_indices =
+      input_params.embedding.linear_state_indices;
+  input_params.embedding.linear_state_write_indices =
+      input_params.embedding.linear_state_indices;
+  input_params.num_accepted_tokens_host = {1, 4};
+  input_params.num_accepted_tokens =
+      torch::tensor(std::vector<int32_t>({2, 3}), torch::kInt);
+  input_params.graph.spec_verify_source_addresses_stable = true;
+
+  const void* state_source =
+      input_params.embedding.linear_state_indices.data_ptr();
+  const void* accepted_source = input_params.num_accepted_tokens.data_ptr();
+  ModelInputParams copied = input_params.to(torch::Device(torch::kCPU));
+
+  EXPECT_EQ(copied.embedding.linear_state_indices.data_ptr(), state_source);
+  EXPECT_EQ(copied.embedding.linear_state_read_indices.data_ptr(),
+            state_source);
+  EXPECT_EQ(copied.embedding.linear_state_write_indices.data_ptr(),
+            state_source);
+  EXPECT_EQ(copied.num_accepted_tokens.data_ptr(), accepted_source);
+  EXPECT_TRUE(equal(copied.embedding.linear_state_indices,
+                    std::vector<int32_t>({8, 9})));
+  EXPECT_TRUE(equal(copied.num_accepted_tokens, std::vector<int32_t>({2, 3})));
+}
+
+TEST(ForwardInputTest, DeviceReadyPreservesStableSpecVerifyGraphSources) {
+  ForwardInput input;
+  input.device_tensors_ready = true;
+  input.input_params.embedding.linear_state_ids = {4, 6};
+  input.input_params.embedding.linear_state_read_ids = {4, 6};
+  input.input_params.embedding.linear_state_write_ids = {4, 6};
+  input.input_params.embedding.linear_state_indices =
+      torch::tensor(std::vector<int32_t>({8, 9}), torch::kInt);
+  input.input_params.embedding.linear_state_read_indices =
+      input.input_params.embedding.linear_state_indices;
+  input.input_params.embedding.linear_state_write_indices =
+      input.input_params.embedding.linear_state_indices;
+  input.input_params.num_accepted_tokens_host = {1, 4};
+  input.input_params.num_accepted_tokens =
+      torch::tensor(std::vector<int32_t>({2, 3}), torch::kInt);
+  input.input_params.graph.spec_verify_source_addresses_stable = true;
+
+  const void* state_source =
+      input.input_params.embedding.linear_state_indices.data_ptr();
+  const void* accepted_source =
+      input.input_params.num_accepted_tokens.data_ptr();
+  ForwardInput copied = input.to(torch::Device(torch::kCPU), torch::kFloat32);
+
+  EXPECT_EQ(copied.input_params.embedding.linear_state_indices.data_ptr(),
+            state_source);
+  EXPECT_EQ(copied.input_params.embedding.linear_state_read_indices.data_ptr(),
+            state_source);
+  EXPECT_EQ(copied.input_params.embedding.linear_state_write_indices.data_ptr(),
+            state_source);
+  EXPECT_EQ(copied.input_params.num_accepted_tokens.data_ptr(),
+            accepted_source);
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_indices,
+                    std::vector<int32_t>({8, 9})));
+  EXPECT_TRUE(equal(copied.input_params.num_accepted_tokens,
+                    std::vector<int32_t>({2, 3})));
+}
+
+TEST(ModelInputParamsTest, ToAliasesSameSlotLinearStateIndices) {
+  ModelInputParams input_params;
+  input_params.embedding.linear_state_ids = {4, 6};
+
+  ModelInputParams copied = input_params.to(torch::Device(torch::kCPU));
+
+  EXPECT_EQ(copied.embedding.linear_state_indices.data_ptr(),
+            copied.embedding.linear_state_read_indices.data_ptr());
+  EXPECT_EQ(copied.embedding.linear_state_indices.data_ptr(),
+            copied.embedding.linear_state_write_indices.data_ptr());
+}
+
+TEST(ModelInputParamsTest, ToPreservesTensorOnlyForkAsInt32) {
+  const torch::TensorOptions long_options =
+      torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+  ModelInputParams input_params;
+  input_params.embedding.linear_state_indices =
+      torch::tensor(std::vector<int64_t>({4}), long_options);
+  input_params.embedding.linear_state_read_indices =
+      torch::tensor(std::vector<int64_t>({3}), long_options);
+  input_params.embedding.linear_state_write_indices =
+      torch::tensor(std::vector<int64_t>({7}), long_options);
+
+  ModelInputParams copied = input_params.to(torch::Device(torch::kCPU));
+
+  EXPECT_TRUE(
+      equal(copied.embedding.linear_state_indices, std::vector<int32_t>({4})));
+  EXPECT_TRUE(equal(copied.embedding.linear_state_read_indices,
+                    std::vector<int32_t>({3})));
+  EXPECT_TRUE(equal(copied.embedding.linear_state_write_indices,
+                    std::vector<int32_t>({7})));
+  EXPECT_EQ(copied.embedding.linear_state_indices.scalar_type(), torch::kInt32);
+  EXPECT_EQ(copied.embedding.linear_state_read_indices.scalar_type(),
+            torch::kInt32);
+  EXPECT_EQ(copied.embedding.linear_state_write_indices.scalar_type(),
+            torch::kInt32);
+}
+
+TEST(ForwardInputTest, ContiguousBufferCanonicalizesForkedStateMetadata) {
+  const torch::TensorOptions int_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+  ForwardInput input;
+  input.token_ids = torch::tensor(std::vector<int32_t>({11, 12}), int_options);
+  input.positions = torch::tensor(std::vector<int32_t>({0, 1}), int_options);
+  input.input_params.embedding.linear_state_ids = {4, 6};
+  input.input_params.embedding.linear_state_indices =
+      torch::tensor(std::vector<int32_t>({0, 0}), int_options);
+  input.input_params.embedding.linear_state_read_ids = {3, 5};
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor(std::vector<int32_t>({0, 0}), int_options);
+  input.input_params.embedding.linear_state_write_ids = {7, 8};
+  input.input_params.embedding.linear_state_write_indices =
+      torch::tensor(std::vector<int32_t>({1, 1}), int_options);
+  input.input_params.num_accepted_tokens_host = {1, 4};
+  input.input_params.num_accepted_tokens =
+      torch::tensor(std::vector<int32_t>({4, 1}), int_options);
+
+  ForwardInput copied;
+  ASSERT_TRUE(
+      input.to_contiguous_input_buffer(torch::Device(torch::kCPU), copied));
+
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_indices,
+                    std::vector<int32_t>({4, 6})));
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_read_indices,
+                    std::vector<int32_t>({3, 5})));
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_write_indices,
+                    std::vector<int32_t>({7, 8})));
+  EXPECT_TRUE(equal(copied.input_params.num_accepted_tokens,
+                    std::vector<int32_t>({1, 4})));
+  EXPECT_NE(copied.input_params.embedding.linear_state_indices.data_ptr(),
+            copied.input_params.embedding.linear_state_read_indices.data_ptr());
+  EXPECT_NE(
+      copied.input_params.embedding.linear_state_indices.data_ptr(),
+      copied.input_params.embedding.linear_state_write_indices.data_ptr());
+  EXPECT_TRUE(copied.device_tensors_ready);
+}
+
+TEST(ForwardInputTest, ContiguousBufferAliasesSameSlotStateMetadata) {
+  const torch::TensorOptions int_options =
+      torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU);
+  ForwardInput input;
+  input.token_ids = torch::tensor(std::vector<int32_t>({11}), int_options);
+  input.positions = torch::tensor(std::vector<int32_t>({0}), int_options);
+  input.input_params.embedding.linear_state_ids = {4};
+  input.input_params.embedding.linear_state_indices =
+      torch::tensor(std::vector<int32_t>({0}), int_options);
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor(std::vector<int32_t>({1}), int_options);
+  input.input_params.embedding.linear_state_write_indices =
+      torch::tensor(std::vector<int32_t>({2}), int_options);
+
+  ForwardInput copied;
+  ASSERT_TRUE(
+      input.to_contiguous_input_buffer(torch::Device(torch::kCPU), copied));
+
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_indices,
+                    std::vector<int32_t>({4})));
+  EXPECT_EQ(copied.input_params.embedding.linear_state_indices.data_ptr(),
+            copied.input_params.embedding.linear_state_read_indices.data_ptr());
+  EXPECT_EQ(
+      copied.input_params.embedding.linear_state_indices.data_ptr(),
+      copied.input_params.embedding.linear_state_write_indices.data_ptr());
+}
+
+TEST(ForwardInputTest, DeviceReadyCanonicalizesStateMetadata) {
+  ForwardInput input;
+  input.device_tensors_ready = true;
+  input.input_params.embedding.linear_state_ids = {4};
+  input.input_params.embedding.linear_state_read_ids = {3};
+  input.input_params.embedding.linear_state_write_ids = {7};
+  input.input_params.embedding.linear_state_read_indices =
+      torch::tensor(std::vector<int32_t>({0}), torch::kInt);
+  input.input_params.embedding.linear_state_write_indices =
+      torch::tensor(std::vector<int32_t>({1}), torch::kInt);
+  input.input_params.num_accepted_tokens_host = {2};
+  input.input_params.num_accepted_tokens =
+      torch::tensor(std::vector<int32_t>({1}), torch::kInt);
+
+  ForwardInput copied = input.to(torch::Device(torch::kCPU), torch::kFloat32);
+
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_read_indices,
+                    std::vector<int32_t>({3})));
+  EXPECT_TRUE(equal(copied.input_params.embedding.linear_state_write_indices,
+                    std::vector<int32_t>({7})));
+  EXPECT_TRUE(equal(copied.input_params.num_accepted_tokens,
+                    std::vector<int32_t>({2})));
+}
+
+TEST(MegaGdnMtpDecodeRouteTest, SupportsConfiguredSpeculativeTokenCounts) {
+  for (int64_t speculative_tokens = 1; speculative_tokens <= 16;
+       ++speculative_tokens) {
+    for (const bool enable_graph : {false, true}) {
+      const int64_t seq_len = speculative_tokens + 1;
+      EXPECT_TRUE(layer::detail::can_use_mega_gdn_mtp_decode(
+          /*use_spec_verify=*/true,
+          /*is_prefill=*/false,
+          /*is_chunked_prefill=*/true,
+          enable_graph,
+          /*batch_size=*/1,
+          seq_len,
+          /*num_state_slots=*/2,
+          /*q_seq_lens=*/{static_cast<int32_t>(seq_len)},
+          /*legacy_state_ids=*/{0},
+          /*explicit_read_state_ids=*/{},
+          /*explicit_write_state_ids=*/{},
+          /*num_accepted_tokens=*/{static_cast<int32_t>(seq_len)}));
+    }
+  }
+}
+
+TEST(MegaGdnMtpDecodeRouteTest, RejectsNonDenseAndAcceptsGraphVerify) {
+  EXPECT_FALSE(layer::detail::can_use_mega_gdn_mtp_decode(
+      /*use_spec_verify=*/true,
+      /*is_prefill=*/false,
+      /*is_chunked_prefill=*/true,
+      /*enable_graph=*/false,
+      /*batch_size=*/2,
+      /*seq_len=*/5,
+      /*num_state_slots=*/8,
+      /*q_seq_lens=*/{5, 4},
+      /*legacy_state_ids=*/{0, 1},
+      /*explicit_read_state_ids=*/{},
+      /*explicit_write_state_ids=*/{},
+      /*num_accepted_tokens=*/{1, 5}));
+  EXPECT_TRUE(layer::detail::can_use_mega_gdn_mtp_decode(
+      /*use_spec_verify=*/true,
+      /*is_prefill=*/false,
+      /*is_chunked_prefill=*/true,
+      /*enable_graph=*/true,
+      /*batch_size=*/2,
+      /*seq_len=*/5,
+      /*num_state_slots=*/8,
+      /*q_seq_lens=*/{5, 5},
+      /*legacy_state_ids=*/{0, 1},
+      /*explicit_read_state_ids=*/{},
+      /*explicit_write_state_ids=*/{},
+      /*num_accepted_tokens=*/{1, 5}));
+}
+
+TEST(MegaGdnMtpDecodeRouteTest, ValidatesForkedStateOwnership) {
+  const auto can_use_fork = [](const std::vector<int32_t>& read_state_ids,
+                               const std::vector<int32_t>& write_state_ids,
+                               const std::vector<int64_t>& num_accepted_tokens,
+                               int64_t num_state_slots = 8) {
+    return layer::detail::can_use_mega_gdn_mtp_decode(
+        /*use_spec_verify=*/true,
+        /*is_prefill=*/false,
+        /*is_chunked_prefill=*/true,
+        /*enable_graph=*/false,
+        /*batch_size=*/2,
+        /*seq_len=*/5,
+        num_state_slots,
+        /*q_seq_lens=*/{5, 5},
+        /*legacy_state_ids=*/{4, 5},
+        read_state_ids,
+        write_state_ids,
+        num_accepted_tokens);
+  };
+
+  EXPECT_TRUE(can_use_fork({0, 0}, {4, 5}, {1, 5}));
+  EXPECT_FALSE(can_use_fork({0, 1}, {1, 2}, {1, 5}));
+  EXPECT_FALSE(can_use_fork({0, 1}, {2, 2}, {1, 5}));
+  EXPECT_FALSE(can_use_fork({0, 1}, {2, 3}, {0, 5}));
+  EXPECT_FALSE(can_use_fork({0, 1}, {2, 8}, {1, 5}));
+}
+
+TEST(MegaGdnMtpDecodeRouteTest, SeparatesMetadataValidityFromEligibility) {
+  EXPECT_TRUE(layer::detail::has_valid_mega_gdn_mtp_state_metadata(
+      /*batch_size=*/2,
+      /*seq_len=*/5,
+      /*num_state_slots=*/8,
+      /*q_seq_lens=*/{5, 4},
+      /*legacy_state_ids=*/{4, 5},
+      /*explicit_read_state_ids=*/{0, 1},
+      /*explicit_write_state_ids=*/{2, 3},
+      /*num_accepted_tokens=*/{1, 4}));
+  EXPECT_FALSE(layer::detail::has_valid_mega_gdn_mtp_state_metadata(
+      /*batch_size=*/2,
+      /*seq_len=*/5,
+      /*num_state_slots=*/8,
+      /*q_seq_lens=*/{5, 4},
+      /*legacy_state_ids=*/{4, 5},
+      /*explicit_read_state_ids=*/{0, 1},
+      /*explicit_write_state_ids=*/{2, 3},
+      /*num_accepted_tokens=*/{1, 5}));
+  EXPECT_TRUE(layer::detail::has_forked_mega_gdn_mtp_state(
+      /*legacy_state_ids=*/{4, 5},
+      /*explicit_read_state_ids=*/{0, 1},
+      /*explicit_write_state_ids=*/{2, 3}));
 }
 
 TEST(BatchTest, SharedMemoryRoundTripPreservesEmptyRankTensors) {

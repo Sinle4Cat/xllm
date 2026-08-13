@@ -69,6 +69,13 @@ class CausalLM : public torch::nn::Module {
 
   virtual bool is_hybrid_linear_attention() { return false; }
 
+  virtual torch::Tensor materialize_graph_input_embedding(
+      const torch::Tensor&) {
+    return torch::Tensor();
+  }
+
+  virtual void warmup_graph_collective(int64_t) {}
+
   virtual bool supports_mla_graph_kv_bucketing() const { return false; }
 
   virtual std::unique_ptr<ModelGraphMetadataState>
@@ -227,6 +234,20 @@ class CausalLMImpl : public CausalLM {
       return model_->is_hybrid_linear_attention();
     } else {
       return CausalLM::is_hybrid_linear_attention();
+    }
+  }
+
+  torch::Tensor materialize_graph_input_embedding(
+      const torch::Tensor& tokens) override {
+    if constexpr (detail::has_materialize_graph_input_embedding<Model>::value) {
+      return model_->materialize_graph_input_embedding(tokens);
+    }
+    return CausalLM::materialize_graph_input_embedding(tokens);
+  }
+
+  void warmup_graph_collective(int64_t num_tokens) override {
+    if constexpr (detail::has_warmup_graph_collective<Model>::value) {
+      model_->warmup_graph_collective(num_tokens);
     }
   }
 

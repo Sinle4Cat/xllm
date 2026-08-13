@@ -57,6 +57,19 @@ TEST(AttentionMetadataBuilderTest, MaterializesCanonicalInitialStateMask) {
                            torch::tensor({false, true, false}, torch::kBool)));
 }
 
+TEST(AttentionMetadataBuilderTest, ReusesPreMaterializedInitialStateMask) {
+  ModelInputParams params = make_params();
+  params.embedding.linear_state_validity_mask =
+      torch::tensor({false, true, false}, torch::kBool);
+
+  AttentionMetadata metadata =
+      AttentionMetadataBuilder::build(params, /*enable_mla=*/false);
+
+  ASSERT_TRUE(metadata.has_initial_states.defined());
+  EXPECT_TRUE(metadata.has_initial_states.is_same(
+      params.embedding.linear_state_validity_mask));
+}
+
 TEST(AttentionMetadataBuilderTest, DoesNotDeriveValidityFromContextOrSlot) {
   ModelInputParams params = make_params();
   params.embedding.linear_state_indices = torch::tensor({0, 0, 0}, torch::kInt);

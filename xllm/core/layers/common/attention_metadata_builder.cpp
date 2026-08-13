@@ -95,10 +95,20 @@ void materialize_linear_state_validity(
     options = torch::TensorOptions().device(device.value());
   }
   options = options.dtype(torch::kBool);
-  attn_metadata.has_initial_states =
-      attn_metadata.is_dummy && mask_rows == 0
-          ? torch::zeros({1}, options)
-          : torch::tensor(params.linear_state_validity_mask, options);
+  if (params.embedding.linear_state_validity_mask.defined()) {
+    CHECK_EQ(params.embedding.linear_state_validity_mask.scalar_type(),
+             torch::kBool)
+        << "linear state validity tensor must have bool dtype";
+    CHECK_EQ(params.embedding.linear_state_validity_mask.numel(), mask_rows)
+        << "linear state validity tensor row count mismatch";
+    attn_metadata.has_initial_states =
+        params.embedding.linear_state_validity_mask;
+  } else {
+    attn_metadata.has_initial_states =
+        attn_metadata.is_dummy && mask_rows == 0
+            ? torch::zeros({1}, options)
+            : torch::tensor(params.linear_state_validity_mask, options);
+  }
 }
 
 AttentionMetadata build_attention_metadata(

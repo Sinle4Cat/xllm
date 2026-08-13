@@ -219,10 +219,10 @@ Qwen3_5GatedDeltaNetImpl::project_prefill_split_inputs(
     const AttentionMetadata& attn_metadata) {
   auto [qkv_flat, z_flat, b_flat, a_flat] =
       project_split_activations(hidden_states);
-  auto qkv = reshape_qkvz_with_pad(attn_metadata, qkv_flat);
-  auto z_proj = reshape_qkvz_with_pad(attn_metadata, z_flat);
-  auto b_proj = reshape_qkvz_with_pad(attn_metadata, b_flat);
-  auto a_proj = reshape_qkvz_with_pad(attn_metadata, a_flat);
+  auto qkv = reshape_projected_tokens_with_pad(attn_metadata, qkv_flat);
+  auto z_proj = reshape_projected_tokens_with_pad(attn_metadata, z_flat);
+  auto b_proj = reshape_projected_tokens_with_pad(attn_metadata, b_flat);
+  auto a_proj = reshape_projected_tokens_with_pad(attn_metadata, a_flat);
 
   const int64_t batch_size = qkv.size(0);
   const int64_t seq_len = qkv.size(1);

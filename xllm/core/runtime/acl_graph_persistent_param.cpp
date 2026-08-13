@@ -158,6 +158,68 @@ int64_t get_spec_verify_width(const ModelInputParams& params) {
   return spec_width;
 }
 
+const std::vector<int32_t>& get_linear_state_read_ids(
+    const ModelEmbeddingInput& embedding) {
+  return embedding.linear_state_read_ids.empty()
+             ? embedding.linear_state_ids
+             : embedding.linear_state_read_ids;
+}
+
+const std::vector<int32_t>& get_linear_state_write_ids(
+    const ModelEmbeddingInput& embedding) {
+  return embedding.linear_state_write_ids.empty()
+             ? embedding.linear_state_ids
+             : embedding.linear_state_write_ids;
+}
+
+const torch::Tensor& get_linear_state_read_indices(
+    const ModelEmbeddingInput& embedding) {
+  return embedding.linear_state_read_indices.defined()
+             ? embedding.linear_state_read_indices
+             : embedding.linear_state_indices;
+}
+
+const torch::Tensor& get_linear_state_write_indices(
+    const ModelEmbeddingInput& embedding) {
+  return embedding.linear_state_write_indices.defined()
+             ? embedding.linear_state_write_indices
+             : embedding.linear_state_indices;
+}
+
+void update_linear_state_indices(const std::vector<int32_t>& ids,
+                                 const torch::Tensor& indices,
+                                 torch::Tensor& persistent_indices,
+                                 int64_t actual_batch_size,
+                                 int64_t padded_batch_size,
+                                 const torch::Device& device) {
+  if (ids.empty()) {
+    return;
+  }
+  const int64_t copy_len =
+      std::min<int64_t>(actual_batch_size, static_cast<int64_t>(ids.size()));
+  if (copy_len > 0) {
+    if (indices.defined()) {
+      CHECK_GE(indices.numel(), copy_len);
+      persistent_indices.slice(/*dim=*/0, /*start=*/0, /*end=*/copy_len)
+          .copy_(indices.slice(/*dim=*/0, /*start=*/0, /*end=*/copy_len),
+                 /*non_blocking=*/true);
+    } else {
+      persistent_indices.slice(/*dim=*/0, /*start=*/0, /*end=*/copy_len)
+          .copy_(torch::tensor(ids, torch::kInt)
+                     .to(device)
+                     .slice(/*dim=*/0, /*start=*/0, /*end=*/copy_len),
+                 /*non_blocking=*/true);
+    }
+  }
+  if (padded_batch_size > actual_batch_size) {
+    persistent_indices
+        .slice(/*dim=*/0,
+               /*start=*/actual_batch_size,
+               /*end=*/padded_batch_size)
+        .fill_(kPaddingLinearStateId);
+  }
+}
+
 }  // namespace
 
 int32_t get_mla_capture_kv_seq_len_bucket(const ModelInputParams& params,
@@ -236,6 +298,12 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   persistent_new_cache_slots_default_ = torch::zeros(
       {max_tokens_per_batch}, torch::dtype(torch::kInt).device(device));
   persistent_linear_state_indices_ = torch::zeros(
+      {metadata_capacity}, torch::dtype(torch::kInt).device(device));
+  persistent_linear_state_validity_mask_ = torch::zeros(
+      {metadata_capacity}, torch::dtype(torch::kBool).device(device));
+  persistent_linear_state_read_indices_ = torch::zeros(
+      {metadata_capacity}, torch::dtype(torch::kInt).device(device));
+  persistent_linear_state_write_indices_ = torch::zeros(
       {metadata_capacity}, torch::dtype(torch::kInt).device(device));
   persistent_num_accepted_tokens_ = torch::ones(
       {metadata_capacity}, torch::dtype(torch::kInt).device(device));
@@ -737,6 +805,14 @@ void GraphPersistentParam::update_spec_verify_inputs(
   CHECK_GE(attention.block_tables.size(0), batch_size);
   CHECK_GE(attention.q_cu_seq_lens.numel(), batch_size + 1);
   CHECK_GE(params.embedding.linear_state_indices.numel(), batch_size);
+  const torch::Tensor& linear_state_read_indices =
+      get_linear_state_read_indices(params.embedding);
+  const torch::Tensor& linear_state_write_indices =
+      get_linear_state_write_indices(params.embedding);
+  CHECK(linear_state_read_indices.defined());
+  CHECK(linear_state_write_indices.defined());
+  CHECK_GE(linear_state_read_indices.numel(), batch_size);
+  CHECK_GE(linear_state_write_indices.numel(), batch_size);
   CHECK_GE(params.num_accepted_tokens.numel(), batch_size);
   CHECK_GE(params.graph.expanded_kv_seq_lens.numel(), total_tokens);
   CHECK_GE(params.graph.expanded_block_tables.size(0), total_tokens);
@@ -768,6 +844,10 @@ void GraphPersistentParam::update_spec_verify_inputs(
   persistent_linear_state_indices_.narrow(0, 0, batch_size)
       .copy_(params.embedding.linear_state_indices.narrow(0, 0, batch_size),
              true);
+  persistent_linear_state_read_indices_.narrow(0, 0, batch_size)
+      .copy_(linear_state_read_indices.narrow(0, 0, batch_size), true);
+  persistent_linear_state_write_indices_.narrow(0, 0, batch_size)
+      .copy_(linear_state_write_indices.narrow(0, 0, batch_size), true);
   persistent_num_accepted_tokens_.narrow(0, 0, batch_size)
       .copy_(params.num_accepted_tokens.narrow(0, 0, batch_size), true);
   q_cu_seq_lens_.narrow(0, 0, batch_size + 1)
@@ -927,34 +1007,49 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
                      actual_num_tokens,
                      static_cast<int64_t>(padded_num_tokens));
   }
-  if (!params.embedding.linear_state_ids.empty()) {
-    const int64_t linear_copy_len = std::min<int64_t>(
+  update_linear_state_indices(params.embedding.linear_state_ids,
+                              params.embedding.linear_state_indices,
+                              persistent_linear_state_indices_,
+                              actual_batch_size,
+                              padded_batch_size,
+                              device_);
+  if (!params.linear_state_validity_mask.empty()) {
+    const int64_t validity_copy_len = std::min<int64_t>(
         actual_batch_size,
-        static_cast<int64_t>(params.embedding.linear_state_ids.size()));
-    if (linear_copy_len > 0) {
-      if (params.embedding.linear_state_indices.defined()) {
-        persistent_linear_state_indices_
-            .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_copy_len)
-            .copy_(params.embedding.linear_state_indices.slice(
-                       /*dim=*/0, /*start=*/0, /*end=*/linear_copy_len),
-                   /*non_blocking=*/true);
-      } else {
-        persistent_linear_state_indices_
-            .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_copy_len)
-            .copy_(torch::tensor(params.embedding.linear_state_ids, torch::kInt)
-                       .to(device_)
-                       .slice(/*dim=*/0, /*start=*/0, /*end=*/linear_copy_len),
-                   /*non_blocking=*/true);
-      }
+        static_cast<int64_t>(params.linear_state_validity_mask.size()));
+    if (validity_copy_len > 0) {
+      persistent_linear_state_validity_mask_
+          .slice(/*dim=*/0, /*start=*/0, /*end=*/validity_copy_len)
+          .copy_(torch::tensor(params.linear_state_validity_mask,
+                               torch::TensorOptions()
+                                   .dtype(torch::kBool)
+                                   .device(torch::kCPU)),
+                 /*non_blocking=*/true);
     }
-    if (padded_batch_size > actual_batch_size) {
-      persistent_linear_state_indices_
+    if (padded_batch_size > validity_copy_len) {
+      persistent_linear_state_validity_mask_
           .slice(/*dim=*/0,
-                 /*start=*/actual_batch_size,
+                 /*start=*/validity_copy_len,
                  /*end=*/padded_batch_size)
-          .fill_(kPaddingLinearStateId);
+          .fill_(false);
     }
   }
+  const std::vector<int32_t>& linear_state_read_ids =
+      get_linear_state_read_ids(params.embedding);
+  const std::vector<int32_t>& linear_state_write_ids =
+      get_linear_state_write_ids(params.embedding);
+  update_linear_state_indices(linear_state_read_ids,
+                              get_linear_state_read_indices(params.embedding),
+                              persistent_linear_state_read_indices_,
+                              actual_batch_size,
+                              padded_batch_size,
+                              device_);
+  update_linear_state_indices(linear_state_write_ids,
+                              get_linear_state_write_indices(params.embedding),
+                              persistent_linear_state_write_indices_,
+                              actual_batch_size,
+                              padded_batch_size,
+                              device_);
   if (params.num_accepted_tokens.defined()) {
     persistent_num_accepted_tokens_
         .slice(/*dim=*/0, /*start=*/0, /*end=*/actual_batch_size)
@@ -1290,10 +1385,29 @@ std::optional<ModelInputParams> GraphPersistentParam::update(
       graph_params->embedding.linear_state_indices =
           persistent_linear_state_indices(
               static_cast<uint32_t>(padded_batch_size));
+      graph_params->embedding.linear_state_validity_mask =
+          persistent_linear_state_validity_mask(
+              static_cast<uint32_t>(padded_batch_size));
       graph_params->linear_state_validity_mask =
           params.linear_state_validity_mask;
       graph_params->linear_state_validity_mask.resize(
           static_cast<size_t>(padded_batch_size), 0);
+    }
+    if (!linear_state_read_ids.empty()) {
+      graph_params->embedding.linear_state_read_ids = linear_state_read_ids;
+      graph_params->embedding.linear_state_read_ids.resize(
+          static_cast<size_t>(padded_batch_size), kPaddingLinearStateId);
+      graph_params->embedding.linear_state_read_indices =
+          persistent_linear_state_read_indices(
+              static_cast<uint32_t>(padded_batch_size));
+    }
+    if (!linear_state_write_ids.empty()) {
+      graph_params->embedding.linear_state_write_ids = linear_state_write_ids;
+      graph_params->embedding.linear_state_write_ids.resize(
+          static_cast<size_t>(padded_batch_size), kPaddingLinearStateId);
+      graph_params->embedding.linear_state_write_indices =
+          persistent_linear_state_write_indices(
+              static_cast<uint32_t>(padded_batch_size));
     }
 
     // Keep the capture contract aligned with replay: the expanded decoder does

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+import hashlib
 import importlib
 import multiprocessing
 import os
@@ -15,7 +16,11 @@ from . import abi_entry, kernel_registry, toolchain
 from .kernel_registry import RegisteredKernelFamily
 from .kernels import utils as kernel_utils
 from .kernels.utils import render_family_registry_inc, render_family_variants_inc
-from .toolchain import AscendBuildContext
+from .toolchain import (
+    PTO_DEVICE_TO_BISHENG_ARCH,
+    AscendBuildContext,
+    TILELANG_PTO_BISHENG_COMMON_FLAGS,
+)
 
 
 # TileLang variant compilation is much heavier than ordinary C++ compilation:
@@ -71,16 +76,103 @@ class _VariantWorkerArgs:
     plan: _VariantBuildPlan
     entry_symbol: str
     bisheng_executable: str
-    bisheng_compile_flags: tuple[str, ...]
+    compile_flags: tuple[str, ...]
     include_dirs: tuple[str, ...]
     toolchain_options: dict
     fingerprint: dict
     compile_cwd: str
 
 
+def _variant_compile_flags(
+    context: AscendBuildContext,
+    target: str,
+) -> tuple[str, ...]:
+    if target == "ascend":
+        return context.bisheng_compile_flags
+    if target == "pto":
+        if context.device not in PTO_DEVICE_TO_BISHENG_ARCH:
+            supported = ", ".join(sorted(PTO_DEVICE_TO_BISHENG_ARCH))
+            raise ValueError(
+                "TileLang PTO kernel compilation requires one of devices: "
+                f"{supported}; got {context.device!r}"
+            )
+        return (
+            f"--cce-aicore-arch={PTO_DEVICE_TO_BISHENG_ARCH[context.device]}",
+            *TILELANG_PTO_BISHENG_COMMON_FLAGS,
+        )
+    raise ValueError(f"Unsupported Ascend TileLang kernel target: {target}")
+
+
+def _variant_include_dirs(
+    context: AscendBuildContext,
+    target: str,
+) -> tuple[str, ...]:
+    include_dirs = list(context.include_dirs)
+    if target == "pto":
+        tilelang_root = context.fingerprint.get("tl_root")
+        if not isinstance(tilelang_root, str) or not tilelang_root:
+            raise RuntimeError(
+                "Ascend build fingerprint is missing the TileLang root"
+            )
+        include_dirs.insert(
+            0,
+            str(toolchain.resolve_pto_include_dir(tilelang_root)),
+        )
+    elif target != "ascend":
+        raise ValueError(f"Unsupported Ascend TileLang kernel target: {target}")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for include_dir in include_dirs:
+        if include_dir in seen:
+            continue
+        seen.add(include_dir)
+        deduped.append(include_dir)
+    return tuple(deduped)
+
+
+def _variant_toolchain_options(
+    context: AscendBuildContext,
+    target: str,
+) -> dict:
+    compile_flags = _variant_compile_flags(context, target)
+    include_dirs = _variant_include_dirs(context, target)
+    options = dict(context.toolchain_options)
+    options["kernel_target"] = target
+    options["compiler_flags"] = list(compile_flags)
+    options["include_dirs"] = list(include_dirs)
+    if target == "pto":
+        options["pto_bisheng_arch"] = PTO_DEVICE_TO_BISHENG_ARCH[
+            context.device
+        ]
+    return options
+
+
+def _variant_fingerprint(
+    context: AscendBuildContext,
+    target: str,
+) -> dict:
+    fingerprint = dict(context.fingerprint)
+    fingerprint.update(_variant_toolchain_options(context, target))
+    tilelang_root = fingerprint.get("tl_root")
+    if not isinstance(tilelang_root, str) or not tilelang_root:
+        raise RuntimeError("Ascend build fingerprint is missing the TileLang root")
+    fingerprint["external_headers"] = toolchain.target_header_fingerprint(
+        tilelang_root,
+        target,
+    )
+    return fingerprint
+
+
 def _variant_entry_symbol(spec: KernelCompileSpec) -> str:
     kernel_entry_name = spec.entry_name or spec.kernel_name
     return f"{kernel_entry_name}__{spec.variant_key}_call"
+
+
+def _variant_internal_symbol_suffix(spec: KernelCompileSpec) -> str:
+    identity = f"{spec.kernel_name}\0{spec.variant_key}".encode("utf-8")
+    digest = hashlib.sha256(identity).hexdigest()[:24]
+    return f"tl_{digest}"
 
 
 def _write_text_if_changed(path: Path, content: str) -> None:
@@ -98,19 +190,20 @@ def _run_variant_worker(args: _VariantWorkerArgs) -> _VariantBuildResult:
     kernel_spec = plan.kernel_spec
 
     source = kernel_cls.generate_source(**compile_spec.specialization)
+    internal_symbol_suffix = _variant_internal_symbol_suffix(compile_spec)
     rendered_source = abi_entry.rename_variant_internal_symbols(
         abi_entry.rename_entry_symbol(
             source, compile_spec.source_entry_symbol, args.entry_symbol
         ),
-        compile_spec.variant_key,
+        internal_symbol_suffix,
     )
     kernel_abi = abi_entry.parse_kernel_abi(rendered_source, args.entry_symbol)
     plan.generated_source.write_text(rendered_source, encoding="utf-8")
 
     compile_cmd = [
         args.bisheng_executable,
-        *args.bisheng_compile_flags,
-        f"-Dg_tilingKey=g_tilingKey__{compile_spec.variant_key}",
+        *args.compile_flags,
+        f"-Dg_tilingKey=g_tilingKey__{internal_symbol_suffix}",
         *[f"-I{d}" for d in args.include_dirs],
         str(plan.generated_source),
         "-c",
@@ -229,6 +322,25 @@ def build_kernel_family(
     force: bool = False,
     jobs: int | str | None = None,
 ) -> KernelFamilyManifest:
+    family_targets = {
+        compile_spec.target for compile_spec, _ in family.spec_pairs
+    }
+    if len(family_targets) != 1:
+        raise ValueError(
+            f"TileLang kernel {family.kernel_name!r} must use one target, "
+            f"got {sorted(family_targets)}"
+        )
+    family_target = next(iter(family_targets))
+    variant_toolchain_options = _variant_toolchain_options(
+        context,
+        family_target,
+    )
+    variant_fingerprint = _variant_fingerprint(context, family_target)
+    variant_compile_flags = tuple(
+        variant_toolchain_options["compiler_flags"]
+    )
+    variant_include_dirs = tuple(variant_toolchain_options["include_dirs"])
+
     family_output_dir = Path(output_root) / "targets" / "ascend" / family.kernel_name
     family_output_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = family_output_dir / "manifest.json"
@@ -240,7 +352,7 @@ def build_kernel_family(
     family_kernel_abi: KernelAbi | None = None
 
     for compile_spec, kernel_spec in family.spec_pairs:
-        if compile_spec.target != "ascend":
+        if compile_spec.target not in ("ascend", "pto"):
             raise ValueError(
                 f"Unsupported target for Ascend build.py: {compile_spec.target}"
             )
@@ -258,7 +370,7 @@ def build_kernel_family(
 
         cache_key = compute_cache_key(
             compile_spec,
-            context.fingerprint,
+            variant_fingerprint,
             dependency_files,
         )
 
@@ -295,8 +407,8 @@ def build_kernel_family(
                 compiled_binary=cached_variant.compiled_binary,
                 entry_symbol=cached_variant.entry_symbol,
                 cache_key=cached_variant.cache_key,
-                toolchain_options=dict(context.toolchain_options),
-                fingerprint=dict(context.fingerprint),
+                toolchain_options=dict(variant_toolchain_options),
+                fingerprint=dict(variant_fingerprint),
                 compile_definitions=kernel_spec.render_compile_definitions(
                     entry_symbol=cached_variant.entry_symbol
                 ),
@@ -326,10 +438,10 @@ def build_kernel_family(
                 plan=plan,
                 entry_symbol=_variant_entry_symbol(plan.compile_spec),
                 bisheng_executable=context.bisheng_executable,
-                bisheng_compile_flags=context.bisheng_compile_flags,
-                include_dirs=tuple(str(d) for d in context.include_dirs),
-                toolchain_options=dict(context.toolchain_options),
-                fingerprint=dict(context.fingerprint),
+                compile_flags=variant_compile_flags,
+                include_dirs=variant_include_dirs,
+                toolchain_options=dict(variant_toolchain_options),
+                fingerprint=dict(variant_fingerprint),
                 compile_cwd=compile_cwd,
             )
         )
@@ -402,7 +514,7 @@ def build_kernel_family(
     )
 
     manifest = KernelFamilyManifest(
-        target="ascend",
+        target=family_target,
         kernel_name=family.kernel_name,
         output_dir=str(family_output_dir),
         variants_inc=str(variants_inc_path),

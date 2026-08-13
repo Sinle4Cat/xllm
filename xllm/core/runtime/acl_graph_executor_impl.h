@@ -16,6 +16,7 @@ limitations under the License.
 #pragma once
 
 #include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 #include <acl/acl.h>
 #include <torch/torch.h>
 
@@ -51,6 +52,76 @@ limitations under the License.
 namespace xllm::npu {
 
 struct AclGraphTaskUpdateContext;
+
+inline constexpr size_t kMaxAclGraphVariantsPerSlot = 16;
+
+using SpecVerifyInputAddresses = std::array<const void*, 11>;
+inline constexpr size_t kSpecVerifyLinearStateIndicesAddressIndex = 6;
+inline constexpr size_t kSpecVerifyNumAcceptedTokensAddressIndex = 7;
+
+inline bool spec_verify_replay_source_addresses_match(
+    const std::optional<SpecVerifyInputAddresses>& captured,
+    const std::optional<SpecVerifyInputAddresses>& current) {
+  if (!captured.has_value() || !current.has_value()) {
+    return false;
+  }
+  for (size_t i = 0; i < captured->size(); ++i) {
+    if (captured.value()[i] != current.value()[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Bounds all graph variants in one persistent-input slot. Capture failures are
+// remembered so an unsupported key falls back without retrying every step.
+class AclGraphVariantTracker {
+ public:
+  explicit AclGraphVariantTracker(
+      size_t max_variants = kMaxAclGraphVariantsPerSlot)
+      : max_variants_(max_variants) {}
+
+  [[nodiscard]] std::optional<uint64_t> evict_before_capture() {
+    if (captured_keys_.size() < max_variants_) {
+      return std::nullopt;
+    }
+    const uint64_t evicted_key = captured_keys_.front();
+    captured_keys_.pop_front();
+    return evicted_key;
+  }
+
+  void record_capture_success(uint64_t graph_key) {
+    captured_keys_.push_back(graph_key);
+    failed_keys_.erase(graph_key);
+  }
+
+  void record_capture_failure(uint64_t graph_key) {
+    failed_keys_.insert(graph_key);
+  }
+
+  bool remove_captured(uint64_t graph_key) {
+    for (auto it = captured_keys_.begin(); it != captured_keys_.end(); ++it) {
+      if (*it == graph_key) {
+        captured_keys_.erase(it);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  [[nodiscard]] bool capture_failed(uint64_t graph_key) const {
+    return failed_keys_.contains(graph_key);
+  }
+
+  [[nodiscard]] size_t captured_count() const { return captured_keys_.size(); }
+
+  [[nodiscard]] size_t failed_count() const { return failed_keys_.size(); }
+
+ private:
+  size_t max_variants_;
+  std::deque<uint64_t> captured_keys_;
+  absl::flat_hash_set<uint64_t> failed_keys_;
+};
 
 struct StaticGraphTaskSignature {
   int64_t linear_state_id = 0;
@@ -91,10 +162,12 @@ inline StaticGraphTaskSignature make_static_graph_task_signature(
 class AclGraph {
  public:
   explicit AclGraph(GraphPersistentParam& persistent_param,
-                    c10::DeviceIndex device_index)
-      : persistent_param_(persistent_param), device_index_(device_index) {
-    // Initialize capture stream in constructor
-    initialize_capture_stream(device_index);
+                    c10::DeviceIndex device_index,
+                    const c10_npu::NPUStream& capture_stream)
+      : persistent_param_(persistent_param),
+        capture_stream_(capture_stream),
+        device_index_(device_index) {
+    initialize_graph_resources(device_index);
   }
 
   ~AclGraph();
@@ -123,17 +196,25 @@ class AclGraph {
   bool prepare_static_mtp_graph_tasks(const SpecVerifyGraphTaskSignal& signal,
                                       const c10_npu::NPUStream& signal_stream);
 
+  [[nodiscard]] bool spec_verify_source_addresses_match(
+      const torch::Tensor& tokens,
+      const torch::Tensor& positions,
+      const ModelInputParams& params) const;
+
   // Get the hidden states from the last capture
   torch::Tensor get_hidden_states(uint32_t actual_num_tokens = 0) const {
     return persistent_param_.hidden_states(actual_num_tokens);
+  }
+
+  [[nodiscard]] c10::StreamId capture_stream_id_for_test() const {
+    return capture_stream_.value().id();
   }
 
  private:
   // Print graph held tensors for debugging
   void print_graph_tensors() const;
 
-  // Initialize capture stream if not already initialized
-  void initialize_capture_stream(c10::DeviceIndex device_index);
+  void initialize_graph_resources(c10::DeviceIndex device_index);
   void make_graph_wait_for_current_stream(aclrtStream current_stream);
   void make_current_stream_wait_for_graph(aclrtStream current_stream);
   void prepare_model_graph_metadata(CausalLM* model,
@@ -156,7 +237,7 @@ class AclGraph {
   GraphPersistentParam& persistent_param_;
   std::unique_ptr<ModelGraphMetadataState> model_graph_metadata_state_;
 
-  // Fallback non-default stream for capture when callers are on default stream.
+  // Executor-owned non-default stream shared by all bucket captures.
   std::optional<c10_npu::NPUStream> capture_stream_;
   aclrtStream graph_stream_ = nullptr;
   aclrtEvent replay_input_ready_event_ = nullptr;
@@ -166,7 +247,7 @@ class AclGraph {
   std::optional<c10_npu::NPUStream> update_stream_;
   std::atomic<bool> replay_inputs_prepared_{false};
   std::optional<StaticGraphTaskSignature> static_graph_task_signature_;
-  std::optional<std::array<const void*, 11>>
+  std::optional<SpecVerifyInputAddresses>
       spec_verify_input_addresses_at_capture_;
   torch::Tensor graph_paged_attention_tiling_data_;
   std::optional<kernel::npu::PagedAttentionTilingLayout>
@@ -206,6 +287,8 @@ class AclGraphExecutorImpl : public ExecutorImpl {
     return graph_slot_count_;
   }
 
+  [[nodiscard]] bool captured_graphs_share_stream_for_test();
+
  private:
   // not own
   CausalLM* model_;
@@ -213,11 +296,12 @@ class AclGraphExecutorImpl : public ExecutorImpl {
   ModelArgs args_;
   torch::Device device_;
   runtime::Options options_;
+  std::optional<c10_npu::NPUStream> graph_capture_stream_;
 
   struct GraphSlot {
     std::unique_ptr<GraphPersistentParam> persistent_param;
     absl::flat_hash_map<uint64_t, std::shared_ptr<AclGraph>> graphs;
-    std::deque<uint64_t> static_mtp_graph_keys;
+    AclGraphVariantTracker graph_variants;
     bool is_prepared = false;
   };
   std::array<GraphSlot, 2> graph_slots_;

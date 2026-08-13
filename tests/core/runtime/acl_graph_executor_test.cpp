@@ -111,6 +111,59 @@ TEST(AclGraphStaticGraphTaskSignatureTest,
   EXPECT_FALSE(npu::make_static_graph_task_signature(params).has_value());
 }
 
+TEST(AclGraphVariantTrackerTest, BoundsAllGraphVariantsWithFifoEviction) {
+  npu::AclGraphVariantTracker tracker(/*max_variants=*/3);
+  tracker.record_capture_success(11);
+  tracker.record_capture_success(22);
+  tracker.record_capture_success(33);
+
+  EXPECT_EQ(tracker.captured_count(), 3);
+  EXPECT_EQ(tracker.evict_before_capture(), 11);
+  tracker.record_capture_success(44);
+  EXPECT_EQ(tracker.captured_count(), 3);
+  EXPECT_TRUE(tracker.remove_captured(33));
+  EXPECT_FALSE(tracker.remove_captured(99));
+  EXPECT_EQ(tracker.captured_count(), 2);
+  tracker.record_capture_success(55);
+  EXPECT_EQ(tracker.evict_before_capture(), 22);
+}
+
+TEST(AclGraphVariantTrackerTest, RemembersCaptureFailures) {
+  npu::AclGraphVariantTracker tracker(/*max_variants=*/3);
+  EXPECT_FALSE(tracker.capture_failed(55));
+
+  tracker.record_capture_failure(55);
+  EXPECT_TRUE(tracker.capture_failed(55));
+  EXPECT_EQ(tracker.failed_count(), 1);
+
+  tracker.record_capture_success(55);
+  EXPECT_FALSE(tracker.capture_failed(55));
+  EXPECT_EQ(tracker.failed_count(), 0);
+}
+
+TEST(AclGraphSourceAddressTest, RejectsAnyMovedReplaySource) {
+  std::array<int32_t, 11> captured_storage{};
+  std::array<int32_t, 11> replacement_storage{};
+  npu::SpecVerifyInputAddresses captured{};
+  npu::SpecVerifyInputAddresses current{};
+  for (size_t i = 0; i < captured.size(); ++i) {
+    captured[i] = &captured_storage[i];
+    current[i] = captured[i];
+  }
+
+  current[npu::kSpecVerifyLinearStateIndicesAddressIndex] =
+      &replacement_storage[npu::kSpecVerifyLinearStateIndicesAddressIndex];
+  EXPECT_FALSE(
+      npu::spec_verify_replay_source_addresses_match(captured, current));
+
+  current = captured;
+  current[2] = &replacement_storage[2];
+  EXPECT_FALSE(
+      npu::spec_verify_replay_source_addresses_match(captured, current));
+  EXPECT_FALSE(
+      npu::spec_verify_replay_source_addresses_match(std::nullopt, current));
+}
+
 namespace {
 const KVCache& first_full_attention_cache(
     const std::vector<KVCache>& kv_caches) {
@@ -326,6 +379,19 @@ class SimpleCausalLM : public CausalLM {
     // Simple implementation for testing
   }
 
+  void warmup_graph_collective(int64_t num_tokens) override {
+    ++graph_collective_warmup_calls_;
+    last_graph_collective_warmup_tokens_ = num_tokens;
+  }
+
+  int32_t graph_collective_warmup_calls() const {
+    return graph_collective_warmup_calls_;
+  }
+
+  int64_t last_graph_collective_warmup_tokens() const {
+    return last_graph_collective_warmup_tokens_;
+  }
+
  private:
   ModelArgs args_;
   torch::Device device_;
@@ -340,6 +406,8 @@ class SimpleCausalLM : public CausalLM {
   torch::Tensor block_scale_;
   torch::Tensor block_size_;
   torch::Tensor scalar_one_;
+  int32_t graph_collective_warmup_calls_ = 0;
+  int64_t last_graph_collective_warmup_tokens_ = 0;
   bool return_aux_hidden_states_ = false;
 };
 
@@ -420,26 +488,23 @@ class AclGraphExecutorTest : public ::testing::Test {
   }
 
   // Helper function to create a simple batch
-  std::unique_ptr<Batch> CreateTestBatch() {
-    sequences_.emplace_back(0,
-                            std::vector<int32_t>{1, 3, 5, 7, 5, 4, 3, 2, 1},
-                            input_embedding_,
-                            mm_data_,
-                            fake_decoder_,
-                            seq_params_);
-    auto& sequence = sequences_.back();
-
-    // Allocate blocks and configure sequence
-    sequence.add_blocks(BlockType::KV, block_manager_->allocate(3));
-    // Set kv_cache_tokens_num to be >= num_prompt_tokens to move to decode
-    // stage
-    sequence.kv_state().incr_kv_cache_tokens_num(
-        /*size=*/9);  // 9 prompt tokens
-    sequence.append_token(100);
-
-    // Create batch with pointer to sequence (batch doesn't own sequence)
+  std::unique_ptr<Batch> CreateTestBatch(uint32_t batch_size = 1) {
     auto batch = std::make_unique<Batch>();
-    batch->add(&sequence);
+    const int64_t sequence_id_base = static_cast<int64_t>(sequences_.size());
+    for (uint32_t i = 0; i < batch_size; ++i) {
+      sequences_.emplace_back(sequence_id_base + static_cast<int64_t>(i),
+                              std::vector<int32_t>{1, 3, 5, 7, 5, 4, 3, 2, 1},
+                              input_embedding_,
+                              mm_data_,
+                              fake_decoder_,
+                              seq_params_);
+      Sequence& sequence = sequences_.back();
+
+      sequence.add_blocks(BlockType::KV, block_manager_->allocate(3));
+      sequence.kv_state().incr_kv_cache_tokens_num(/*size=*/9);
+      sequence.append_token(static_cast<int32_t>(100 + i));
+      batch->add(&sequence);
+    }
 
     return batch;
   }
@@ -912,6 +977,14 @@ TEST_F(AclGraphExecutorTest, BatchInputCarriesLinearStateIds) {
   ASSERT_EQ(forward_input.input_params.meta.num_sequences, 1);
   ASSERT_EQ(forward_input.input_params.embedding.linear_state_ids.size(), 1);
   EXPECT_EQ(forward_input.input_params.embedding.linear_state_ids[0],
+            expected_linear_state_id);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_read_ids.size(),
+            1);
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_read_ids[0],
+            expected_linear_state_id);
+  ASSERT_EQ(forward_input.input_params.embedding.linear_state_write_ids.size(),
+            1);
+  EXPECT_EQ(forward_input.input_params.embedding.linear_state_write_ids[0],
             expected_linear_state_id);
   ASSERT_EQ(forward_input.input_params.embedding.embedding_ids.size(), 1);
   EXPECT_EQ(forward_input.input_params.embedding.embedding_ids[0],

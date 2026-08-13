@@ -26,6 +26,7 @@ limitations under the License.
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "common/types.h"
@@ -86,7 +87,7 @@ bool unpack_from_input_host_buffer(const ForwardInput& input,
 
 struct ForwardInputBufferEntry {
   torch::Tensor host_tensor;
-  torch::Tensor* target = nullptr;
+  std::vector<torch::Tensor*> targets;
   uint64_t offset = 0;
   uint64_t aligned_bytes = 0;
 };
@@ -101,7 +102,13 @@ struct ForwardInputBufferPlan {
     if (!tensor.device().is_cpu()) {
       return false;
     }
-    entries.push_back({tensor.contiguous(), target, 0, 0});
+    for (auto& entry : entries) {
+      if (tensor.is_same(entry.host_tensor)) {
+        entry.targets.emplace_back(target);
+        return true;
+      }
+    }
+    entries.push_back({tensor.contiguous(), {target}, 0, 0});
     return true;
   }
 
@@ -145,32 +152,51 @@ struct ForwardInputBufferPlan {
                          const torch::Device& device) const {
     const char* base = static_cast<const char*>(device_buffer.data_ptr());
     for (const auto& entry : entries) {
-      if (entry.target == nullptr || !entry.host_tensor.defined()) {
+      if (entry.targets.empty() || !entry.host_tensor.defined()) {
         continue;
       }
       const void* ptr = base + entry.offset;
+      const auto bind_targets = [&entry](const torch::Tensor& device_view) {
+        for (torch::Tensor* target : entry.targets) {
+          if (target != nullptr) {
+            *target = device_view;
+          }
+        }
+      };
+      if (device.is_cpu()) {
+        torch::Tensor owner = device_buffer;
+        auto deleter = [owner](void*) {};
+        bind_targets(
+            torch::from_blob(const_cast<void*>(ptr),
+                             entry.host_tensor.sizes().vec(),
+                             std::move(deleter),
+                             torch::TensorOptions()
+                                 .dtype(entry.host_tensor.scalar_type())
+                                 .device(torch::kCPU)));
+        continue;
+      }
 #if defined(USE_CUDA) || defined(USE_DCU)
       if (device.type() == torch::kCUDA) {
-        *entry.target = get_tensor_from_blob(entry.host_tensor.sizes().vec(),
-                                             entry.host_tensor.scalar_type(),
-                                             ptr,
-                                             device_buffer);
+        bind_targets(get_tensor_from_blob(entry.host_tensor.sizes().vec(),
+                                          entry.host_tensor.scalar_type(),
+                                          ptr,
+                                          device_buffer));
         continue;
       }
 #endif
 #if defined(USE_MLU)
       if (device.type() == torch::kPrivateUse1) {
-        *entry.target = get_tensor_from_blob(entry.host_tensor.sizes().vec(),
-                                             entry.host_tensor.scalar_type(),
-                                             ptr,
-                                             device_buffer);
+        bind_targets(get_tensor_from_blob(entry.host_tensor.sizes().vec(),
+                                          entry.host_tensor.scalar_type(),
+                                          ptr,
+                                          device_buffer));
         continue;
       }
 #endif
 #if defined(USE_NPU)
-      *entry.target = get_tensor_from_blob(entry.host_tensor.sizes().vec(),
-                                           entry.host_tensor.scalar_type(),
-                                           ptr);
+      bind_targets(get_tensor_from_blob(entry.host_tensor.sizes().vec(),
+                                        entry.host_tensor.scalar_type(),
+                                        ptr));
 #else
       (void)device;
 #endif
@@ -217,6 +243,10 @@ inline void clear_contiguous_input_buffer_tensor_targets(
     ModelInputParams& params) {
   params.embedding.input_embedding = torch::Tensor();
   params.embedding.linear_state_indices = torch::Tensor();
+  params.embedding.linear_state_validity_mask = torch::Tensor();
+  params.embedding.linear_state_read_indices = torch::Tensor();
+  params.embedding.linear_state_write_indices = torch::Tensor();
+  params.num_accepted_tokens = torch::Tensor();
   params.embedding.mtp_bootstrap_embeddings = torch::Tensor();
   params.block_copy.src_block_indices = torch::Tensor();
   params.block_copy.dst_block_indices = torch::Tensor();
@@ -263,6 +293,13 @@ inline bool add_model_tensors_to_plan(const ModelInputParams& source,
                   &target.embedding.input_embedding) &&
          plan.add(source.embedding.linear_state_indices,
                   &target.embedding.linear_state_indices) &&
+         plan.add(source.embedding.linear_state_validity_mask,
+                  &target.embedding.linear_state_validity_mask) &&
+         plan.add(source.embedding.linear_state_read_indices,
+                  &target.embedding.linear_state_read_indices) &&
+         plan.add(source.embedding.linear_state_write_indices,
+                  &target.embedding.linear_state_write_indices) &&
+         plan.add(source.num_accepted_tokens, &target.num_accepted_tokens) &&
          plan.add(source.embedding.mtp_bootstrap_embeddings,
                   &target.embedding.mtp_bootstrap_embeddings) &&
          plan.add(source.block_copy.src_block_indices,
@@ -425,7 +462,9 @@ struct StepDecodeMeta {
 struct ForwardInput {
   ForwardInput to(const torch::Device& device, torch::ScalarType dtype) const {
     if (device_tensors_ready) {
-      return *this;
+      ForwardInput inputs = *this;
+      canonicalize_mtp_state_metadata(inputs.input_params, device);
+      return inputs;
     }
 
     if (input_host_buffer_has_layout) {
@@ -437,6 +476,7 @@ struct ForwardInput {
       if (detail::unpack_from_input_host_buffer(
               *this, device, dtype, buffer_inputs, materialize_device_buffer)) {
         if (buffer_inputs.device_tensors_ready) {
+          canonicalize_mtp_state_metadata(buffer_inputs.input_params, device);
           return buffer_inputs;
         }
         return buffer_inputs.to(device, dtype);
@@ -477,12 +517,13 @@ struct ForwardInput {
     copy_metadata_to(inputs);
     set_host_views(inputs);
 
-    const ModelInputParams& source_params = input_params;
     if (missing_required_host_views(inputs) ||
-        detail::has_contiguous_input_buffer_exclusions(source_params)) {
+        detail::has_contiguous_input_buffer_exclusions(input_params)) {
       return false;
     }
 
+    ModelInputParams source_params = input_params;
+    canonicalize_mtp_state_metadata(source_params, torch::Device(torch::kCPU));
     inputs.input_params = source_params;
     detail::clear_contiguous_input_buffer_tensor_targets(inputs.input_params);
 

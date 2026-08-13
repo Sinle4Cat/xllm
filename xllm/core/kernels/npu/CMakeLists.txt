@@ -22,7 +22,7 @@ cc_library(
     npu_gemma_rms_norm.cpp
     npu_block_sparse_attention.cpp
     npu_rain_fusion_attention.cpp
-    npu_qwen35_gdn_decode_super_op.cpp
+    npu_mega_gdn_decode.cpp
     npu_qwen35_gdn_prefill_super_op.cpp
     npu_grouped_matmul.cpp
     npu_moe_gating_topk_softmax.cpp
@@ -33,6 +33,7 @@ cc_library(
     npu_moe_distribute_dispatch_v2.cpp
     npu_moe_init_routing_v2.cpp
     npu_moe_token_unpermute.cpp
+    npu_mega_gdn_mtp_decode.cpp
     rope.cpp
     npu_recurrent_gated_delta_rule.cpp
     utils.cpp

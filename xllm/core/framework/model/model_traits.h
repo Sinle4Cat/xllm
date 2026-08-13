@@ -157,6 +157,24 @@ struct has_is_hybrid_linear_attention<
     : std::true_type {};
 
 template <typename T, typename = void>
+struct has_materialize_graph_input_embedding : std::false_type {};
+
+template <typename T>
+struct has_materialize_graph_input_embedding<
+    T,
+    std::void_t<decltype(std::declval<T>()->materialize_graph_input_embedding(
+        std::declval<const torch::Tensor&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_warmup_graph_collective : std::false_type {};
+
+template <typename T>
+struct has_warmup_graph_collective<
+    T,
+    std::void_t<decltype(std::declval<T>()->warmup_graph_collective(
+        std::declval<int64_t>()))>> : std::true_type {};
+
+template <typename T, typename = void>
 struct has_supports_mla_graph_kv_bucketing : std::false_type {};
 
 template <typename T>

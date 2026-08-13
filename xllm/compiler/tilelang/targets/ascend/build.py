@@ -9,7 +9,17 @@ from ...common.manifest import KernelFamilyManifest
 from ...common.toolchain import find_required_executable
 from .kernel_family_builder import build_kernel_family as _build_kernel_family
 from .kernel_registry import RegisteredKernelFamily, get_default_families
-from .toolchain import resolve_build_context
+from .toolchain import PTO_DEVICE_TO_BISHENG_ARCH, resolve_build_context
+
+
+def _is_default_family_supported(
+    family: RegisteredKernelFamily,
+    device: str | None,
+) -> bool:
+    targets = {
+        compile_spec.target for compile_spec, _ in family.spec_pairs
+    }
+    return "pto" not in targets or device in PTO_DEVICE_TO_BISHENG_ARCH
 
 
 def build_kernel_family(
@@ -44,7 +54,14 @@ def build_kernels(
         bisheng_executable=find_required_executable("bisheng"),
     )
     manifests = []
-    for family in get_default_families(kernel_names):
+    families = get_default_families(kernel_names)
+    if kernel_names is None:
+        families = [
+            family
+            for family in families
+            if _is_default_family_supported(family, context.device)
+        ]
+    for family in families:
         manifests.append(
             _build_kernel_family(
                 family,

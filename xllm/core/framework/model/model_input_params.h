@@ -57,6 +57,23 @@ namespace layer {
 struct AttentionMetadata;
 }  // namespace layer
 
+struct ModelEmbeddingInput;
+struct ModelInputParams;
+
+inline void canonicalize_linear_state_metadata(
+    ModelEmbeddingInput& embedding,
+    const torch::Device& device,
+    bool preserve_existing_tensors = false);
+inline void canonicalize_mtp_state_metadata(ModelInputParams& params,
+                                            const torch::Device& device);
+
+namespace detail {
+inline void canonicalize_num_accepted_tokens_metadata(
+    ModelInputParams& params,
+    const torch::Device& device,
+    bool preserve_existing_tensor = false);
+}  // namespace detail
+
 struct OneRecModelInputParams {
   enum class RecStage {
     PREFILL,
@@ -784,6 +801,19 @@ struct ModelEmbeddingInput {
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
 
+  // Optional BoolTensor: [n_seq]. Graph executors use this stable device
+  // buffer to avoid materializing the host validity mask during capture.
+  torch::Tensor linear_state_validity_mask;
+
+  // Linear state read/write ids of each sequence. Empty vectors inherit the
+  // legacy linear_state_ids same-slot contract.
+  std::vector<int32_t> linear_state_read_ids;
+  std::vector<int32_t> linear_state_write_ids;
+
+  // IntTensor: [n_seq]
+  torch::Tensor linear_state_read_indices;
+  torch::Tensor linear_state_write_indices;
+
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
 
@@ -798,12 +828,21 @@ struct ModelEmbeddingInput {
   std::vector<int32_t> mtp_bootstrap_row_idxes;
   torch::Tensor mtp_bootstrap_embeddings;
 
-  ModelEmbeddingInput to(const torch::Device& device) const {
+  ModelEmbeddingInput to(const torch::Device& device,
+                         bool preserve_state_metadata_tensors = false) const {
     ModelEmbeddingInput out;
     out.input_embedding = safe_to(input_embedding, device);
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
-    out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_indices = linear_state_indices;
+    out.linear_state_validity_mask =
+        safe_to(linear_state_validity_mask, device, true);
+    out.linear_state_read_ids = linear_state_read_ids;
+    out.linear_state_write_ids = linear_state_write_ids;
+    out.linear_state_read_indices = linear_state_read_indices;
+    out.linear_state_write_indices = linear_state_write_indices;
+    canonicalize_linear_state_metadata(
+        out, device, preserve_state_metadata_tensors);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -993,9 +1032,11 @@ struct GraphInput {
 struct ModelInputParams {
   ModelInputParams to(const torch::Device& device) const {
     ModelInputParams params;
+    const bool preserve_graph_replay_sources =
+        graph.spec_verify_source_addresses_stable;
     params.meta = meta;
     params.attention = attention.to(device);
-    params.embedding = embedding.to(device);
+    params.embedding = embedding.to(device, preserve_graph_replay_sources);
     params.block_copy = block_copy.to(device);
     params.multimodal = multimodal.to(device);
     params.parallel = parallel.to(device);
@@ -1005,22 +1046,17 @@ struct ModelInputParams {
     params.linear_state_cache_ops = linear_state_cache_ops;
     params.linear_state_validity_mask = linear_state_validity_mask;
     params.is_spec_verify = is_spec_verify;
-    params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
     params.mtp_topk_state =
         mtp_topk_state == nullptr ? nullptr : mtp_topk_state->to(device);
+    params.num_accepted_tokens = num_accepted_tokens;
+    detail::canonicalize_num_accepted_tokens_metadata(
+        params, device, preserve_graph_replay_sources);
     for (const auto& table : multi_block_tables) {
       params.multi_block_tables.push_back(
           safe_to(table, table.options().device(torch::kCPU), true));
     }
     params.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
-    if (!params.embedding.linear_state_indices.defined() &&
-        !params.embedding.linear_state_ids.empty()) {
-      params.embedding.linear_state_indices =
-          torch::tensor(params.embedding.linear_state_ids, torch::kInt)
-              .to(device);
-    }
-
     // rec_params device conversion for both OneRec and LLM-Rec variants
     if (const auto* onerec_xattn = onerec_xattention_params()) {
       params.rec_params = onerec_xattn->to(device);
@@ -1029,6 +1065,7 @@ struct ModelInputParams {
     } else if (const auto* llmrec = llmrec_params()) {
       params.rec_params = llmrec->to(device);
     }
+    params.enable_graph = enable_graph;
 
     return params;
   }
@@ -1209,5 +1246,165 @@ struct ModelInputParams {
   // Flag for graph capture/replay mode.
   bool enable_graph = false;
 };
+
+namespace detail {
+
+template <typename T>
+inline torch::Tensor state_metadata_tensor_from_host(
+    const std::vector<T>& values,
+    const torch::Device& device) {
+  torch::Tensor host_tensor = torch::tensor(values, torch::kInt);
+  return safe_to(host_tensor, device, /*non_blocking=*/true).contiguous();
+}
+
+inline torch::Tensor move_state_metadata_tensor(const torch::Tensor& tensor,
+                                                const torch::Device& device) {
+  return tensor.defined()
+             ? safe_to(
+                   tensor,
+                   torch::TensorOptions().dtype(torch::kInt32).device(device),
+                   true)
+                   .contiguous()
+             : tensor;
+}
+
+inline void canonicalize_num_accepted_tokens_metadata(
+    ModelInputParams& params,
+    const torch::Device& device,
+    bool preserve_existing_tensor) {
+  if (!preserve_existing_tensor && !params.num_accepted_tokens_host.empty()) {
+    params.num_accepted_tokens = state_metadata_tensor_from_host(
+        params.num_accepted_tokens_host, device);
+    return;
+  }
+  params.num_accepted_tokens =
+      move_state_metadata_tensor(params.num_accepted_tokens, device);
+}
+
+}  // namespace detail
+
+inline void canonicalize_linear_state_metadata(ModelEmbeddingInput& embedding,
+                                               const torch::Device& device,
+                                               bool preserve_existing_tensors) {
+  const bool has_legacy_host_ids = !embedding.linear_state_ids.empty();
+  const bool has_read_host_ids = !embedding.linear_state_read_ids.empty();
+  const bool has_write_host_ids = !embedding.linear_state_write_ids.empty();
+  const bool read_tensor_aliases_legacy =
+      embedding.linear_state_read_indices.defined() &&
+      embedding.linear_state_indices.defined() &&
+      embedding.linear_state_read_indices.is_same(
+          embedding.linear_state_indices);
+  const bool write_tensor_aliases_legacy =
+      embedding.linear_state_write_indices.defined() &&
+      embedding.linear_state_indices.defined() &&
+      embedding.linear_state_write_indices.is_same(
+          embedding.linear_state_indices);
+  const bool write_tensor_aliases_read =
+      embedding.linear_state_write_indices.defined() &&
+      embedding.linear_state_read_indices.defined() &&
+      embedding.linear_state_write_indices.is_same(
+          embedding.linear_state_read_indices);
+
+  if (!has_read_host_ids && has_legacy_host_ids) {
+    embedding.linear_state_read_ids = embedding.linear_state_ids;
+  }
+  if (!has_write_host_ids && has_legacy_host_ids) {
+    embedding.linear_state_write_ids = embedding.linear_state_ids;
+  }
+
+  if (preserve_existing_tensors) {
+    embedding.linear_state_indices = detail::move_state_metadata_tensor(
+        embedding.linear_state_indices, device);
+    if (has_legacy_host_ids &&
+        embedding.linear_state_read_ids == embedding.linear_state_ids) {
+      embedding.linear_state_read_indices = embedding.linear_state_indices;
+    } else if (has_read_host_ids) {
+      embedding.linear_state_read_indices =
+          detail::state_metadata_tensor_from_host(
+              embedding.linear_state_read_ids, device);
+    } else if (read_tensor_aliases_legacy) {
+      embedding.linear_state_read_indices = embedding.linear_state_indices;
+    } else {
+      embedding.linear_state_read_indices = detail::move_state_metadata_tensor(
+          embedding.linear_state_read_indices, device);
+    }
+    if (has_legacy_host_ids &&
+        embedding.linear_state_write_ids == embedding.linear_state_ids) {
+      embedding.linear_state_write_indices = embedding.linear_state_indices;
+    } else if (has_write_host_ids && has_read_host_ids &&
+               embedding.linear_state_write_ids ==
+                   embedding.linear_state_read_ids) {
+      embedding.linear_state_write_indices =
+          embedding.linear_state_read_indices;
+    } else if (has_write_host_ids) {
+      embedding.linear_state_write_indices =
+          detail::state_metadata_tensor_from_host(
+              embedding.linear_state_write_ids, device);
+    } else if (write_tensor_aliases_legacy) {
+      embedding.linear_state_write_indices = embedding.linear_state_indices;
+    } else if (write_tensor_aliases_read) {
+      embedding.linear_state_write_indices =
+          embedding.linear_state_read_indices;
+    } else {
+      embedding.linear_state_write_indices = detail::move_state_metadata_tensor(
+          embedding.linear_state_write_indices, device);
+    }
+    return;
+  }
+
+  if (has_legacy_host_ids) {
+    embedding.linear_state_indices = detail::state_metadata_tensor_from_host(
+        embedding.linear_state_ids, device);
+  } else {
+    embedding.linear_state_indices = detail::move_state_metadata_tensor(
+        embedding.linear_state_indices, device);
+  }
+
+  if (has_legacy_host_ids &&
+      embedding.linear_state_read_ids == embedding.linear_state_ids) {
+    embedding.linear_state_read_indices = embedding.linear_state_indices;
+  } else if (has_read_host_ids) {
+    embedding.linear_state_read_indices =
+        detail::state_metadata_tensor_from_host(embedding.linear_state_read_ids,
+                                                device);
+  } else if (read_tensor_aliases_legacy ||
+             !embedding.linear_state_read_indices.defined()) {
+    embedding.linear_state_read_indices = embedding.linear_state_indices;
+  } else {
+    embedding.linear_state_read_indices = detail::move_state_metadata_tensor(
+        embedding.linear_state_read_indices, device);
+  }
+
+  if (has_legacy_host_ids &&
+      embedding.linear_state_write_ids == embedding.linear_state_ids) {
+    embedding.linear_state_write_indices = embedding.linear_state_indices;
+  } else if (has_write_host_ids && has_read_host_ids &&
+             embedding.linear_state_write_ids ==
+                 embedding.linear_state_read_ids) {
+    embedding.linear_state_write_indices = embedding.linear_state_read_indices;
+  } else if (has_write_host_ids) {
+    embedding.linear_state_write_indices =
+        detail::state_metadata_tensor_from_host(
+            embedding.linear_state_write_ids, device);
+  } else if (write_tensor_aliases_legacy ||
+             !embedding.linear_state_write_indices.defined()) {
+    embedding.linear_state_write_indices = embedding.linear_state_indices;
+  } else if (write_tensor_aliases_read) {
+    embedding.linear_state_write_indices = embedding.linear_state_read_indices;
+  } else {
+    embedding.linear_state_write_indices = detail::move_state_metadata_tensor(
+        embedding.linear_state_write_indices, device);
+  }
+}
+
+inline void canonicalize_mtp_state_metadata(ModelInputParams& params,
+                                            const torch::Device& device) {
+  const bool preserve_graph_replay_sources =
+      params.graph.spec_verify_source_addresses_stable;
+  canonicalize_linear_state_metadata(
+      params.embedding, device, preserve_graph_replay_sources);
+  detail::canonicalize_num_accepted_tokens_metadata(
+      params, device, preserve_graph_replay_sources);
+}
 
 }  // namespace xllm

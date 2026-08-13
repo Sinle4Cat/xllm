@@ -245,4 +245,28 @@ std::tuple<torch::Tensor, torch::Tensor> fused_sigmoid_gating_delta_rule(
     float softplus_beta,
     float softplus_threshold);
 
+// Experimental three-stage TileLang MTP decode path. It is selected only by
+// the xLLM NPU wrapper's explicit A/B environment switch.
+bool has_mega_gdn_mtp_decode_segmented_specialization(
+    int64_t batch_size,
+    int64_t num_state_slots,
+    int64_t num_k_heads,
+    int64_t num_v_heads,
+    int64_t speculative_tokens);
+
+torch::Tensor mega_gdn_mtp_decode_segmented(
+    const torch::Tensor& qkv,
+    const torch::Tensor& z,
+    const torch::Tensor& b,
+    const torch::Tensor& a,
+    const torch::Tensor& conv_weight,
+    torch::Tensor& conv_state,
+    const torch::Tensor& a_log,
+    const torch::Tensor& dt_bias,
+    torch::Tensor& ssm_state,
+    const torch::Tensor& read_state_indices,
+    const torch::Tensor& write_state_indices,
+    const torch::Tensor& num_accepted_tokens,
+    const torch::Tensor& norm_weight);
+
 }  // namespace xllm::kernel::npu::tilelang

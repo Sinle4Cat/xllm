@@ -18,7 +18,9 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -35,11 +37,30 @@ torch::Tensor to_cpu_int64_contiguous(const torch::Tensor& tensor) {
   return cpu_tensor;
 }
 
+bool debug_mtp_state_enabled() {
+  return std::getenv("XLLM_DEBUG_MTP_STATE") != nullptr;
+}
+
+bool debug_mtp_state_minimal_enabled() {
+  return std::getenv("XLLM_DEBUG_MTP_STATE_MINIMAL") != nullptr;
+}
+
+bool debug_mtp_state_route_enabled() {
+  return std::getenv("XLLM_DEBUG_MTP_STATE_ROUTE") != nullptr;
+}
+
+bool debug_mtp_state_route_summary_enabled() {
+  return std::getenv("XLLM_DEBUG_MTP_STATE_ROUTE_SUMMARY") != nullptr;
+}
+
 }  // namespace
 
 EmbeddingCache::EmbeddingCache(int32_t total_nums) {
   CHECK_GT(total_nums, 0) << "No embeddings to allocate";
   decode_tails_.resize(total_nums);
+  if (debug_mtp_state_route_summary_enabled()) {
+    debug_route_traces_.resize(total_nums);
+  }
 }
 
 void EmbeddingCache::write_prefill_target_context(
@@ -81,6 +102,26 @@ void EmbeddingCache::write_prefill_target_context(
     CHECK_LE(token, static_cast<int64_t>(std::numeric_limits<int32_t>::max()))
         << "prefill target token overflow";
 
+    if (debug_mtp_state_route_summary_enabled()) {
+      DebugRouteTrace& trace = debug_route_traces_[ids[i]];
+      if (!trace.request_id.empty()) {
+        std::ostringstream route;
+        for (size_t step_idx = 0; step_idx < trace.steps.size(); ++step_idx) {
+          if (step_idx != 0) {
+            route << ",";
+          }
+          route << trace.steps[step_idx].first << ":"
+                << trace.steps[step_idx].second;
+        }
+        LOG(INFO) << "[MTP_STATE] route_summary id=" << ids[i]
+                  << ", request_id=" << trace.request_id
+                  << ", step_count=" << trace.steps.size()
+                  << ", steps=" << route.str();
+      }
+      trace.request_id = request_ids.empty() ? std::string() : request_ids[i];
+      trace.steps.clear();
+    }
+
     DecodeState state;
     state.valid = true;
     if (!request_ids.empty()) {
@@ -93,6 +134,12 @@ void EmbeddingCache::write_prefill_target_context(
 
     DecodeState& tail = mutable_tail(ids[i]);
     tail = std::move(state);
+    if (debug_mtp_state_enabled() || debug_mtp_state_minimal_enabled() ||
+        debug_mtp_state_route_enabled()) {
+      LOG(INFO) << "[MTP_STATE] write_prefill id=" << ids[i] << ", request_id="
+                << (request_ids.empty() ? "<empty>" : request_ids[i])
+                << ", token_id=" << token;
+    }
   }
 }
 
@@ -166,6 +213,17 @@ void EmbeddingCache::write_target_context(
         << "each sequence must have at least one accepted target token";
 
     const int32_t last_idx = accepted_len - 1;
+    if (debug_mtp_state_route_summary_enabled()) {
+      DebugRouteTrace& trace = debug_route_traces_[ids[i]];
+      const std::string request_id =
+          request_ids.empty() ? std::string() : request_ids[i];
+      if (trace.request_id != request_id) {
+        trace.request_id = request_id;
+        trace.steps.clear();
+      }
+      trace.steps.emplace_back(accepted_len, last_token_id);
+    }
+
     DecodeState state;
     state.valid = true;
     if (!request_ids.empty()) {
@@ -192,6 +250,13 @@ void EmbeddingCache::write_target_context(
 
     DecodeState& tail = mutable_tail(ids[i]);
     tail = std::move(state);
+    if (debug_mtp_state_enabled() || debug_mtp_state_route_enabled()) {
+      LOG(INFO) << "[MTP_STATE] write_target id=" << ids[i] << ", request_id="
+                << (request_ids.empty() ? "<empty>" : request_ids[i])
+                << ", accepted_len=" << accepted_len
+                << ", token_id=" << last_token_id
+                << ", correction_offset=" << correction_offset;
+    }
   }
 }
 
@@ -216,6 +281,8 @@ std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
     const int32_t id = ids[i];
     const DecodeState& cached_state = get_tail(id);
     DecodeState state = cached_state;
+    const bool request_mismatch = state.valid && !request_ids.empty() &&
+                                  state.request_id != request_ids[i];
     if (state.valid && !request_ids.empty() &&
         state.request_id != request_ids[i]) {
       state = DecodeState();
@@ -232,6 +299,17 @@ std::vector<EmbeddingCache::DecodeState> EmbeddingCache::read_decode_states(
         CHECK(state.prev_embedding.defined())
             << "decode entry missing previous target embedding";
       }
+    }
+    if (debug_mtp_state_enabled()) {
+      LOG(INFO) << "[MTP_STATE] read_decode id=" << id << ", request_id="
+                << (request_ids.empty() ? "<empty>" : request_ids[i])
+                << ", cached_request_id="
+                << (cached_state.request_id.empty() ? "<empty>"
+                                                    : cached_state.request_id)
+                << ", cached_valid=" << cached_state.valid
+                << ", request_mismatch=" << request_mismatch
+                << ", returned_valid=" << state.valid
+                << ", token_id=" << state.token_id;
     }
     states.emplace_back(std::move(state));
   }
@@ -261,6 +339,11 @@ std::vector<int32_t> EmbeddingCache::read_accepted_prefix_lengths(
       accepted_length = state.correction_position_offset + 1;
     }
     accepted_prefix_lengths.emplace_back(accepted_length);
+    if (debug_mtp_state_enabled()) {
+      LOG(INFO) << "[MTP_STATE] read_accepted id=" << ids[i] << ", request_id="
+                << (state.request_id.empty() ? "<empty>" : state.request_id)
+                << ", accepted_prefix_length=" << accepted_length;
+    }
   }
   return accepted_prefix_lengths;
 }

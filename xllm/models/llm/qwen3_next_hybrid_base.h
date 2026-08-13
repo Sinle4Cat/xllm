@@ -259,6 +259,9 @@ class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
  public:
   explicit Qwen3HybridForCausalLMImplBase(const ModelContext& context) {
     tie_word_embeddings_ = context.get_model_args().tie_word_embeddings();
+    hidden_size_ = context.get_model_args().hidden_size();
+    tensor_options_ = context.get_tensor_options();
+    tp_process_group_ = context.get_parallel_args().tp_group_;
     lm_head_ = register_module("lm_head", layer::LmHead(context));
   }
 
@@ -339,6 +342,21 @@ class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
 
   bool is_hybrid_linear_attention() { return true; }
 
+  torch::Tensor materialize_graph_input_embedding(const torch::Tensor& tokens) {
+    torch::NoGradGuard no_grad;
+    return model_->get_word_embedding()(tokens);
+  }
+
+  void warmup_graph_collective(int64_t num_tokens) {
+    if (tp_process_group_ == nullptr || tp_process_group_->world_size() <= 1) {
+      return;
+    }
+    CHECK_GT(num_tokens, 0);
+    torch::Tensor probe =
+        torch::zeros({num_tokens, hidden_size_}, tensor_options_);
+    parallel_state::reduce(probe, tp_process_group_);
+  }
+
   layer::LmHead get_lm_head() { return lm_head_; }
 
   void set_lm_head(layer::LmHead& head) { lm_head_ = head; }
@@ -357,6 +375,9 @@ class Qwen3HybridForCausalLMImplBase : public torch::nn::Module {
 
  protected:
   bool tie_word_embeddings_{false};
+  int64_t hidden_size_ = 0;
+  torch::TensorOptions tensor_options_;
+  ProcessGroup* tp_process_group_ = nullptr;
   layer::LmHead lm_head_{nullptr};
   Qwen3HybridModelModulePtr model_;
 };

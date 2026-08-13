@@ -82,9 +82,9 @@ function(tilelang_register_runtime_kernel)
   set(multiValueArgs WRAPPER_SRCS)
   cmake_parse_arguments(TL_RUNTIME "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
-  if(NOT TL_RUNTIME_NAME OR NOT TL_RUNTIME_WRAPPER_SRCS)
+  if(NOT TL_RUNTIME_NAME)
     message(FATAL_ERROR
-      "tilelang_register_runtime_kernel requires NAME and WRAPPER_SRCS")
+      "tilelang_register_runtime_kernel requires NAME")
   endif()
   if(NOT DEFINED TILELANG_GENERATED_ROOT)
     message(FATAL_ERROR "TILELANG_GENERATED_ROOT must be set before registering TileLang kernels")
@@ -187,6 +187,19 @@ tilelang_register_runtime_kernel(
   WRAPPER_SRCS fused_sigmoid_gating_delta_rule_wrapper.cpp
 )
 
+tilelang_register_runtime_kernel(
+  NAME mega_gdn_mtp_decode_conv
+  WRAPPER_SRCS mega_gdn_mtp_decode_segmented_wrapper.cpp
+)
+
+tilelang_register_runtime_kernel(
+  NAME mega_gdn_mtp_decode_recurrent
+)
+
+tilelang_register_runtime_kernel(
+  NAME mega_gdn_mtp_decode_norm
+)
+
 cc_library(
   NAME
     tilelang_kernels
@@ -215,6 +228,7 @@ target_link_libraries(tilelang_kernels
     "$ENV{NPU_HOME_PATH}/lib64/libascend_dump.so"
     "$ENV{NPU_HOME_PATH}/lib64/libprofapi.so"
     "$ENV{NPU_HOME_PATH}/lib64/libmmpa.so"
+    unified_dlog
     m
     dl
 )

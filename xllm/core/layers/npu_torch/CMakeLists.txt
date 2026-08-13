@@ -10,6 +10,7 @@ cc_library(
     minimax_rms_norm.h
     minimax_m2_attention.h
     qwen3_gated_delta_net_base.h
+    qwen3_gated_delta_net_route.h
     qwen3_next_attention.h
     qwen3_next_gated_delta_net.h
     qwen3_5_gated_delta_net.h

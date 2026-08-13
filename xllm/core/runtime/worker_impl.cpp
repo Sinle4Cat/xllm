@@ -178,6 +178,8 @@ void ensure_forward_input_device_tensors(ForwardInput& input,
                                          const torch::Device& device) {
   move_tensor_to_device_if_needed(input.token_ids, device);
   move_tensor_to_device_if_needed(input.positions, device);
+  move_tensor_to_device_if_needed(input.input_params.embedding.input_embedding,
+                                  device);
   move_tensor_to_device_if_needed(
       input.input_params.embedding.mtp_shifted_token_ids, device);
   move_tensor_to_device_if_needed(input.sampling_params.selected_token_idxes,

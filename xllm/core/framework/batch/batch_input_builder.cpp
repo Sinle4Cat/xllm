@@ -1218,6 +1218,14 @@ ForwardInput BatchInputBuilder::state_to_forward_input() {
   if (!input_params.embedding.linear_state_ids.empty()) {
     input_params.embedding.linear_state_indices =
         torch::tensor(input_params.embedding.linear_state_ids, torch::kInt);
+    input_params.embedding.linear_state_read_ids =
+        input_params.embedding.linear_state_ids;
+    input_params.embedding.linear_state_write_ids =
+        input_params.embedding.linear_state_ids;
+    input_params.embedding.linear_state_read_indices =
+        input_params.embedding.linear_state_indices;
+    input_params.embedding.linear_state_write_indices =
+        input_params.embedding.linear_state_indices;
   }
   input_params.embedding.request_ids = std::move(state_.request_ids);
   input_params.embedding.extra_token_ids = std::move(state_.extra_token_ids);

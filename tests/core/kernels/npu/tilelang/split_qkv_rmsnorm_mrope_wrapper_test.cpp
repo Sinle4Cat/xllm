@@ -354,6 +354,77 @@ TEST_F(TileLangSplitQkvRmsnormMRopeWrapperTest,
   EXPECT_EQ(interleaved[255].item<int32_t>(), 0);
 }
 
+TEST_F(TileLangSplitQkvRmsnormMRopeWrapperTest,
+       OrdersAfterTorchLinearProducer) {
+  constexpr int64_t kNumTokens = 3;
+  constexpr int64_t kNumQHeads = 16;
+  constexpr int64_t kNumKvHeads = 4;
+  constexpr int64_t kProducerWidth = 128;
+
+  const torch::Device device("npu:0");
+  const auto opts =
+      torch::TensorOptions().dtype(torch::kBFloat16).device(device);
+  const std::vector<int64_t> mrope_section = {11, 11, 10};
+  const int64_t rope_dim =
+      2 * (mrope_section[0] + mrope_section[1] + mrope_section[2]);
+  const int64_t q_size = kNumQHeads * kHeadSize;
+  const int64_t kv_size = kNumKvHeads * kHeadSize;
+  const int64_t qkvg_width = q_size * 2 + kv_size * 2;
+
+  torch::manual_seed(1001);
+  torch::Tensor producer_input =
+      torch::randn({kNumTokens, kProducerWidth}, opts);
+  torch::Tensor producer_weight =
+      torch::randn({qkvg_width, kProducerWidth}, opts);
+  torch::Tensor q_weight = torch::randn({kHeadSize}, opts);
+  torch::Tensor k_weight = torch::randn({kHeadSize}, opts);
+  torch::Tensor phase = torch::randn(
+      {3, kNumTokens, rope_dim / 2},
+      torch::TensorOptions().dtype(torch::kFloat32).device(device));
+  torch::Tensor cos_sin =
+      torch::cat({torch::cos(phase), torch::sin(phase)}, /*dim=*/2)
+          .to(torch::kBFloat16);
+  torch::Tensor cos_sin_merged = merge_cos_sin_for_wrapper(cos_sin);
+  torch::Tensor gather_pattern = build_split_qkv_rmsnorm_mrope_gather_pattern(
+      rope_dim, mrope_section, /*is_interleaved=*/false, device);
+
+  aclrtStream stream = c10_npu::getCurrentNPUStream(device.index()).stream();
+  ASSERT_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS);
+
+  torch::Tensor qkvg = torch::linear(producer_input, producer_weight);
+  auto [q_out, k_out, v_out, gate_out] =
+      split_qkv_rmsnorm_mrope(qkvg,
+                              q_weight,
+                              k_weight,
+                              cos_sin_merged,
+                              gather_pattern,
+                              static_cast<float>(kRmsNormEps),
+                              kNumQHeads,
+                              kNumKvHeads,
+                              kHeadSize);
+  auto [q_ref, k_ref, v_ref, gate_ref] =
+      torch_split_qkv_rmsnorm_mrope(qkvg,
+                                    q_weight,
+                                    k_weight,
+                                    cos_sin,
+                                    kNumQHeads,
+                                    kNumKvHeads,
+                                    kHeadSize,
+                                    kRmsNormEps,
+                                    mrope_section,
+                                    /*is_interleaved=*/false);
+
+  ASSERT_EQ(aclrtSynchronizeStream(stream), ACL_SUCCESS);
+  EXPECT_TRUE(torch::allclose(q_out, q_ref, /*rtol=*/1e-2, /*atol=*/1e-2))
+      << "q mismatch, max_diff=" << max_abs_diff(q_out, q_ref);
+  EXPECT_TRUE(torch::allclose(k_out, k_ref, /*rtol=*/1e-2, /*atol=*/1e-2))
+      << "k mismatch, max_diff=" << max_abs_diff(k_out, k_ref);
+  EXPECT_TRUE(torch::allclose(v_out, v_ref, /*rtol=*/0, /*atol=*/0))
+      << "v mismatch, max_diff=" << max_abs_diff(v_out, v_ref);
+  EXPECT_TRUE(torch::allclose(gate_out, gate_ref, /*rtol=*/0, /*atol=*/0))
+      << "gate mismatch, max_diff=" << max_abs_diff(gate_out, gate_ref);
+}
+
 TEST_F(TileLangSplitQkvRmsnormMRopeWrapperTest, MatchesTorchReference) {
   const std::vector<SplitQkvTestCase> cases = {
       {.name = "tiny_t1_q16_kv4",

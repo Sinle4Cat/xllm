@@ -22,6 +22,7 @@ limitations under the License.
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -44,8 +45,16 @@ extern "C" aclError aclrtHostUnregister(void* ptr);
 namespace xllm {
 namespace {
 
-size_t get_tensor_nbytes(const std::vector<int64_t>& dims,
-                         torch::ScalarType dtype) {
+#if defined(USE_NPU)
+constexpr double kLinearStatePrefixGuardValue = 97.0;
+constexpr double kLinearStateSuffixGuardValue = -97.0;
+
+bool linear_state_cache_guard_enabled() {
+  return std::getenv("XLLM_DEBUG_MTP_STATE_GUARD") != nullptr;
+}
+#endif
+
+size_t get_tensor_numel(const std::vector<int64_t>& dims) {
   size_t count = 1;
   for (int64_t dim : dims) {
     CHECK_GE(dim, 0) << "tensor dim must be non-negative";
@@ -56,6 +65,12 @@ size_t get_tensor_nbytes(const std::vector<int64_t>& dims,
     }
     count *= dim_size;
   }
+  return count;
+}
+
+size_t get_tensor_nbytes(const std::vector<int64_t>& dims,
+                         torch::ScalarType dtype) {
+  const size_t count = get_tensor_numel(dims);
   const size_t elem_size = static_cast<size_t>(torch::elementSize(dtype));
   CHECK_GT(elem_size, static_cast<size_t>(0)) << "tensor dtype size is zero";
   CHECK_LE(count, std::numeric_limits<size_t>::max() / elem_size)
@@ -126,6 +141,100 @@ torch::Tensor alloc_npu_huge_page_tensor(const std::vector<int64_t>& dims,
       tensor.storage().unsafeGetStorageImpl());
   tensor_storage->npu_desc_.npu_format_ = format;
   return tensor;
+}
+
+torch::Tensor alloc_guarded_npu_linear_state_tensor(
+    const std::vector<int64_t>& dims,
+    int64_t num_state_slots,
+    torch::ScalarType dtype,
+    const torch::Device& device,
+    bool use_huge_page_allocator) {
+  CHECK_GT(num_state_slots, 0) << "linear state slot count must be positive";
+  const size_t logical_numel = get_tensor_numel(dims);
+  const size_t state_slots = static_cast<size_t>(num_state_slots);
+  CHECK_EQ(logical_numel % state_slots, static_cast<size_t>(0))
+      << "linear state cache must contain complete logical slots";
+  const size_t guard_numel = logical_numel / state_slots;
+  CHECK_LE(guard_numel,
+           (std::numeric_limits<size_t>::max() - logical_numel) / 2)
+      << "linear state guard size overflow";
+  const size_t backing_numel = logical_numel + guard_numel * 2;
+  CHECK_LE(backing_numel,
+           static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+      << "linear state guarded allocation is too large";
+
+  const int64_t backing_size = static_cast<int64_t>(backing_numel);
+  const int64_t guard_size = static_cast<int64_t>(guard_numel);
+  const int64_t logical_size = static_cast<int64_t>(logical_numel);
+  torch::Tensor backing =
+      use_huge_page_allocator
+          ? alloc_npu_huge_page_tensor({backing_size}, dtype, ACL_FORMAT_ND)
+          : at_npu::native::npu_format_cast(
+                torch::empty({backing_size},
+                             torch::dtype(dtype).device(device)),
+                ACL_FORMAT_ND);
+  backing.narrow(/*dim=*/0, /*start=*/0, guard_size)
+      .fill_(kLinearStatePrefixGuardValue);
+  torch::Tensor cache =
+      backing.narrow(/*dim=*/0, guard_size, logical_size).view(dims);
+  cache.zero_();
+  backing.narrow(/*dim=*/0, guard_size + logical_size, guard_size)
+      .fill_(kLinearStateSuffixGuardValue);
+  CHECK(cache.is_contiguous())
+      << "guarded linear state cache must be contiguous";
+  CHECK_EQ(cache.storage_offset(), guard_size)
+      << "guarded linear state cache offset mismatch";
+  LOG(INFO) << "[MTP_STATE_GUARD] allocated cache shape=" << cache.sizes()
+            << ", storage=" << cache.storage().data()
+            << ", data=" << cache.data_ptr()
+            << ", guard_elements=" << guard_size;
+  return cache;
+}
+
+void check_linear_state_cache_guard(const torch::Tensor& cache,
+                                    const char* cache_name,
+                                    const char* phase) {
+  CHECK(cache.defined()) << cache_name << " cache must be defined";
+  const int64_t item_size = cache.itemsize();
+  CHECK_GT(item_size, 0) << cache_name << " cache item size must be positive";
+  const size_t storage_nbytes = cache.storage().nbytes();
+  CHECK_EQ(storage_nbytes % static_cast<size_t>(item_size),
+           static_cast<size_t>(0))
+      << cache_name << " cache storage must contain complete elements";
+  const size_t storage_numel_size =
+      storage_nbytes / static_cast<size_t>(item_size);
+  CHECK_LE(storage_numel_size,
+           static_cast<size_t>(std::numeric_limits<int64_t>::max()))
+      << cache_name << " cache storage is too large";
+  const int64_t storage_numel = static_cast<int64_t>(storage_numel_size);
+  const int64_t prefix_numel = cache.storage_offset();
+  const int64_t suffix_start = prefix_numel + cache.numel();
+  const int64_t suffix_numel = storage_numel - suffix_start;
+  CHECK_GT(prefix_numel, 0) << cache_name << " prefix guard is missing";
+  CHECK_GT(suffix_numel, 0) << cache_name << " suffix guard is missing";
+
+  torch::Tensor storage_view = torch::empty({0}, cache.options());
+  storage_view.set_(cache.storage(), /*storage_offset=*/0, {storage_numel});
+  const bool prefix_ok =
+      storage_view.narrow(/*dim=*/0, /*start=*/0, prefix_numel)
+          .eq(kLinearStatePrefixGuardValue)
+          .all()
+          .item<bool>();
+  CHECK(prefix_ok) << "[MTP_STATE_GUARD] " << cache_name
+                   << " prefix corrupted at " << phase
+                   << ", storage=" << cache.storage().data()
+                   << ", data=" << cache.data_ptr()
+                   << ", guard_elements=" << prefix_numel;
+  const bool suffix_ok =
+      storage_view.narrow(/*dim=*/0, suffix_start, suffix_numel)
+          .eq(kLinearStateSuffixGuardValue)
+          .all()
+          .item<bool>();
+  CHECK(suffix_ok) << "[MTP_STATE_GUARD] " << cache_name
+                   << " suffix corrupted at " << phase
+                   << ", storage=" << cache.storage().data()
+                   << ", data=" << cache.data_ptr()
+                   << ", guard_elements=" << suffix_numel;
 }
 #endif
 
@@ -327,7 +436,21 @@ LinearAttentionKVCacheTensors create_linear_attention_kv_cache_tensors(
   LinearAttentionKVCacheTensors tensors;
 
 #if defined(USE_NPU)
-  if (create_options.enable_kv_cache_huge_page_allocator()) {
+  if (linear_state_cache_guard_enabled()) {
+    const int64_t num_state_slots = kv_cache_shape.conv_cache_shape().front();
+    tensors.conv_cache = alloc_guarded_npu_linear_state_tensor(
+        kv_cache_shape.conv_cache_shape(),
+        num_state_slots,
+        create_options.dtype(),
+        create_options.device(),
+        create_options.enable_kv_cache_huge_page_allocator());
+    tensors.ssm_cache = alloc_guarded_npu_linear_state_tensor(
+        kv_cache_shape.ssm_cache_shape(),
+        num_state_slots,
+        create_options.ssm_dtype(),
+        create_options.device(),
+        create_options.enable_kv_cache_huge_page_allocator());
+  } else if (create_options.enable_kv_cache_huge_page_allocator()) {
     tensors.conv_cache =
         alloc_npu_huge_page_tensor(kv_cache_shape.conv_cache_shape(),
                                    create_options.dtype(),
@@ -365,6 +488,16 @@ LinearAttentionKVCacheTensors create_linear_attention_kv_cache_tensors(
 }
 
 #if defined(USE_NPU)
+void check_linear_attention_kv_cache_guards(const torch::Tensor& conv_cache,
+                                            const torch::Tensor& ssm_cache,
+                                            const char* phase) {
+  if (!linear_state_cache_guard_enabled()) {
+    return;
+  }
+  check_linear_state_cache_guard(conv_cache, "conv", phase);
+  check_linear_state_cache_guard(ssm_cache, "ssm", phase);
+}
+
 aclFormat get_npu_kv_cache_format(const std::string& model_type) {
   return use_npu_nz_kv_cache_layout(model_type) ? ACL_FORMAT_FRACTAL_NZ
                                                 : ACL_FORMAT_ND;

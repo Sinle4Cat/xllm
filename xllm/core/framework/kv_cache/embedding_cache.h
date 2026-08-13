@@ -18,6 +18,7 @@ limitations under the License.
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "common/macros.h"
@@ -105,7 +106,13 @@ class EmbeddingCache final {
   void clear(const std::vector<int32_t>& embedding_ids);
 
  private:
+  struct DebugRouteTrace {
+    std::string request_id;
+    std::vector<std::pair<int32_t, int32_t>> steps;
+  };
+
   std::vector<DecodeState> decode_tails_;
+  std::vector<DebugRouteTrace> debug_route_traces_;
   torch::Tensor embedding_placeholder_;
 
   DecodeState& mutable_tail(int32_t embedding_id);

@@ -2370,11 +2370,38 @@ inline void deserialize_forward_input_payload(
   read_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
   normalize_linear_state_ids(input_params.embedding.linear_state_ids,
                              input_params.meta.num_sequences);
-  if (materialize_device_buffer &&
-      !input_params.embedding.linear_state_ids.empty()) {
-    input_params.embedding.linear_state_indices =
-        torch::tensor(input_params.embedding.linear_state_ids, torch::kInt)
-            .to(device, /*non_blocking=*/true);
+  read_vector(context, input_params.embedding.linear_state_read_ids);
+  if (input_params.embedding.linear_state_read_ids.empty()) {
+    input_params.embedding.linear_state_read_ids =
+        input_params.embedding.linear_state_ids;
+  }
+  normalize_linear_state_ids(input_params.embedding.linear_state_read_ids,
+                             input_params.meta.num_sequences);
+  read_vector(context, input_params.embedding.linear_state_write_ids);
+  if (input_params.embedding.linear_state_write_ids.empty()) {
+    input_params.embedding.linear_state_write_ids =
+        input_params.embedding.linear_state_ids;
+  }
+  normalize_linear_state_ids(input_params.embedding.linear_state_write_ids,
+                             input_params.meta.num_sequences);
+  if (materialize_device_buffer) {
+    if (!input_params.embedding.linear_state_ids.empty()) {
+      input_params.embedding.linear_state_indices =
+          torch::tensor(input_params.embedding.linear_state_ids, torch::kInt)
+              .to(device, /*non_blocking=*/true);
+    }
+    if (!input_params.embedding.linear_state_read_ids.empty()) {
+      input_params.embedding.linear_state_read_indices =
+          torch::tensor(input_params.embedding.linear_state_read_ids,
+                        torch::kInt)
+              .to(device, /*non_blocking=*/true);
+    }
+    if (!input_params.embedding.linear_state_write_ids.empty()) {
+      input_params.embedding.linear_state_write_indices =
+          torch::tensor(input_params.embedding.linear_state_write_ids,
+                        torch::kInt)
+              .to(device, /*non_blocking=*/true);
+    }
   }
   read_string_vector(context, input_params.embedding.request_ids);
   read_vector(context, input_params.embedding.extra_token_ids);
@@ -2733,6 +2760,10 @@ inline void serialize_forward_input_sections(
   write_vector(context.descriptor, input_params.embedding.embedding_ids);
   write_vector(context.descriptor, input_params.embedding.linear_state_ids);
   write_linear_state_cache_ops(context, input_params.linear_state_cache_ops);
+  write_vector(context.descriptor,
+               input_params.embedding.linear_state_read_ids);
+  write_vector(context.descriptor,
+               input_params.embedding.linear_state_write_ids);
   write_string_vector(context.descriptor, input_params.embedding.request_ids);
   write_vector(context.descriptor, input_params.embedding.extra_token_ids);
   // Mirror the read_* layout: write root + embedding mtp paths so the

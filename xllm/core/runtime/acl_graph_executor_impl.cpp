@@ -51,7 +51,6 @@ constexpr uint64_t kSpecVerifyBucketMask = (1ull << 16) - 1;
 constexpr uint64_t kSpecVerifyFieldMask = (1ull << 16) - 1;
 constexpr uint64_t kSpecVerifyExpandedBlockMask = (1ull << 15) - 1;
 constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
-constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
@@ -175,7 +174,19 @@ std::pair<torch::Tensor, torch::Tensor> find_attention_plan_kv_cache(
   return {torch::Tensor(), torch::Tensor()};
 }
 
-std::optional<std::array<const void*, 11>> spec_verify_input_addresses(
+ModelInputParams materialize_graph_input_embedding(
+    CausalLM* model,
+    const torch::Tensor& tokens,
+    const ModelInputParams& params) {
+  ModelInputParams graph_input_params = params;
+  if (!graph_input_params.embedding.input_embedding.defined()) {
+    graph_input_params.embedding.input_embedding =
+        model->materialize_graph_input_embedding(tokens);
+  }
+  return graph_input_params;
+}
+
+std::optional<SpecVerifyInputAddresses> spec_verify_input_addresses(
     const torch::Tensor& tokens,
     const torch::Tensor& positions,
     const ModelInputParams& params) {
@@ -198,7 +209,7 @@ std::optional<std::array<const void*, 11>> spec_verify_input_addresses(
       &params.attention.device.q_cu_seq_lens,
       &params.graph.expanded_kv_seq_lens,
       &params.graph.expanded_block_tables};
-  std::array<const void*, 11> addresses;
+  SpecVerifyInputAddresses addresses;
   for (size_t i = 0; i < sources.size(); ++i) {
     if (!sources[i]->defined()) {
       return std::nullopt;
@@ -261,8 +272,9 @@ bool AclGraph::capture(CausalLM* model,
 
   // Begin graph capture using NPUGraph mempool for temporary tensor management
   // Get current NPU stream from libtorch NPU API
-  aclrtStream stream =
-      c10_npu::getCurrentNPUStream(tensor_options.device().index()).stream();
+  const c10_npu::NPUStream original_stream =
+      c10_npu::getCurrentNPUStream(tensor_options.device().index());
+  aclrtStream stream = original_stream.stream();
 
   // For hybrid models (e.g., qwen3_next with mixed GDN/full_attention layers),
   // we need to find the first Full Attention layer to get the correct kv_cache.
@@ -278,11 +290,13 @@ bool AclGraph::capture(CausalLM* model,
       params.graph.spec_verify_source_addresses_stable &&
       params.graph.input_tokens_override.defined() && params.is_spec_verify &&
       params.meta.batch_forward_type.is_chunked_prefill();
+  ModelInputParams graph_input_params =
+      materialize_graph_input_embedding(model, tokens, params);
   auto graph_params = persistent_param_.update(tokens,
                                                k_cache,
                                                v_cache,
                                                positions,
-                                               params,
+                                               graph_input_params,
                                                num_tokens_,
                                                /*return_capture_params=*/true,
                                                /*skip_token_update=*/
@@ -381,8 +395,7 @@ bool AclGraph::capture(CausalLM* model,
         ::xllm::npu::DeviceCaptureLock::get_instance().get_lock(device_idx);
     std::lock_guard<std::mutex> lock_guard(capture_lock);
 
-    if (c10_npu::getCurrentNPUStream(device_idx) ==
-        c10_npu::getDefaultNPUStream(device_idx)) {
+    if (original_stream != capture_stream_.value()) {
       c10_npu::setCurrentNPUStream(capture_stream_.value());
       aclrtSynchronizeStream(capture_stream_.value().stream());
       graph_stream_ = capture_stream_.value().stream();
@@ -404,7 +417,7 @@ bool AclGraph::capture(CausalLM* model,
           model->forward({persistent_param_.persistent_tokens(num_tokens_)},
                          {persistent_param_.persistent_positions(num_tokens_)},
                          kv_cache,
-                         {graph_params.value()});
+                         graph_params.value());
 
       // Store result in persistent buffer owned by NPUGraph mempool
       persistent_param_.set_hidden_states(forward_result.hidden_states);
@@ -438,8 +451,7 @@ bool AclGraph::capture(CausalLM* model,
     }
     // Lock is automatically released here when lock goes out of scope
     if (need_restore_stream) {
-      c10_npu::setCurrentNPUStream(
-          c10_npu::getDefaultNPUStream(tensor_options.device().index()));
+      c10_npu::setCurrentNPUStream(original_stream);
     }
   }
   // Synchronize and test replay to verify graph capture
@@ -529,6 +541,19 @@ bool AclGraph::static_graph_task_signature_matches(
          static_graph_task_signature_ == current_signature;
 }
 
+bool AclGraph::spec_verify_source_addresses_match(
+    const torch::Tensor& tokens,
+    const torch::Tensor& positions,
+    const ModelInputParams& params) const {
+  if (!graph_paged_attention_tiling_data_.defined()) {
+    return true;
+  }
+  const auto current_addresses =
+      spec_verify_input_addresses(tokens, positions, params);
+  return spec_verify_replay_source_addresses_match(
+      spec_verify_input_addresses_at_capture_, current_addresses);
+}
+
 void AclGraph::capture_static_graph_task_signature(
     const ModelInputParams& params) {
   static_graph_task_signature_ = make_static_graph_task_signature(params);
@@ -555,12 +580,7 @@ AclGraph::~AclGraph() {
   }
 }
 
-void AclGraph::initialize_capture_stream(c10::DeviceIndex device_index) {
-  // Get a secondary stream from high-priority pool for graph capture.
-  // This is required because NPUGraph::capture_begin() enforces that capture
-  // must be performed on a non-default stream (see
-  // torch_npu/csrc/core/npu/NPUGraph.cpp:159).
-  capture_stream_ = c10_npu::getStreamFromPool(true, device_index);
+void AclGraph::initialize_graph_resources(c10::DeviceIndex device_index) {
   update_stream_ = c10_npu::getStreamFromPool(true, device_index);
   device_index_ = device_index;
   CHECK_EQ(aclrtCreateEventWithFlag(&replay_input_ready_event_, ACL_EVENT_SYNC),
@@ -653,17 +673,22 @@ ModelOutput AclGraph::replay(CausalLM* model,
   // by k_cache being valid and non-empty
   const bool needs_graph_metadata = model->requires_graph_forward_metadata() ||
                                     model->is_hybrid_linear_attention();
+  ModelInputParams graph_input_params =
+      materialize_graph_input_embedding(model, tokens, params);
+  const bool graph_embedding_materialized =
+      !params.embedding.input_embedding.defined() &&
+      graph_input_params.embedding.input_embedding.defined();
   const bool replay_inputs_prepared =
       replay_inputs_prepared_.exchange(false, std::memory_order_acq_rel);
   const bool can_use_prepared_inputs =
       replay_inputs_prepared && params.graph.input_tokens_override.defined() &&
-      !needs_graph_metadata;
+      !needs_graph_metadata && !graph_embedding_materialized;
   std::optional<ModelInputParams> graph_params;
   if (graph_paged_attention_tiling_data_.defined()) {
     const auto current_addresses =
         spec_verify_input_addresses(tokens, positions, params);
-    if (!spec_verify_input_addresses_at_capture_.has_value() ||
-        current_addresses != spec_verify_input_addresses_at_capture_) {
+    if (!spec_verify_replay_source_addresses_match(
+            spec_verify_input_addresses_at_capture_, current_addresses)) {
       LOG_FIRST_N(ERROR, 1)
           << "Falling back to eager speculative verification because graph "
              "input source storage moved after capture.";
@@ -687,14 +712,14 @@ ModelOutput AclGraph::replay(CausalLM* model,
     graph_params = params;
   } else if (can_use_prepared_inputs) {
     persistent_param_.update_tokens(
-        tokens, params, actual_num_tokens, num_tokens_);
+        tokens, graph_input_params, actual_num_tokens, num_tokens_);
   } else {
     auto [k_cache, v_cache] = find_attention_plan_kv_cache(kv_cache);
     graph_params = persistent_param_.update(tokens,
                                             k_cache,
                                             v_cache,
                                             positions,
-                                            params,
+                                            graph_input_params,
                                             num_tokens_,
                                             needs_graph_metadata);
     if (needs_graph_metadata) {
@@ -789,6 +814,10 @@ AclGraphExecutorImpl::AclGraphExecutorImpl(CausalLM* model,
                                            const torch::Device& device,
                                            const runtime::Options& options)
     : model_(model), args_(args), device_(device), options_(options) {
+  // All bucket graphs in one executor share a non-default capture stream so
+  // stream-specific HCCL resources can be reused across captures.
+  graph_capture_stream_ =
+      c10_npu::getStreamFromPool(/*isHighPriority=*/true, device_.index());
   const bool need_update_attn_mask = model->is_hybrid_linear_attention();
   const bool is_hybrid_linear_attn = model->is_hybrid_linear_attention();
   graph_slot_count_ =
@@ -1023,6 +1052,25 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     }
   }
 
+  if (replay_graph != nullptr &&
+      !replay_graph->spec_verify_source_addresses_match(
+          tokens_tensor, positions_tensor, params_single)) {
+    LOG_FIRST_N(INFO, 1)
+        << "Discarding a warmup ACL graph because speculative-verify input "
+           "storage changed; recapturing with the stable runtime buffers.";
+    {
+      std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+      auto it = active_slot.graphs.find(graph_key);
+      if (it != active_slot.graphs.end() && it->second == replay_graph) {
+        active_slot.graphs.erase(it);
+        const bool removed =
+            active_slot.graph_variants.remove_captured(graph_key);
+        CHECK(removed) << "graph variant tracker is out of sync";
+      }
+    }
+    replay_graph.reset();
+  }
+
   if (replay_graph != nullptr) {
     // Replay the existing graph
     VLOG(kGraphExecutorLogVerboseLevel)
@@ -1041,9 +1089,37 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     return result;
   }
 
+  bool capture_failed = false;
+  std::shared_ptr<AclGraph> evicted_graph;
+  {
+    std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+    capture_failed = active_slot.graph_variants.capture_failed(graph_key);
+    if (!capture_failed) {
+      const auto evicted_key =
+          active_slot.graph_variants.evict_before_capture();
+      if (evicted_key.has_value()) {
+        auto evicted_it = active_slot.graphs.find(evicted_key.value());
+        if (evicted_it != active_slot.graphs.end()) {
+          evicted_graph = std::move(evicted_it->second);
+          active_slot.graphs.erase(evicted_it);
+        }
+      }
+    }
+  }
+  if (capture_failed) {
+    LOG_FIRST_N(ERROR, 1)
+        << "Skipping ACL graph capture for a key that failed previously; "
+           "falling back to eager mode.";
+    COUNTER_INC(num_model_execution_total_eager);
+    return forward_eager(model_, tokens, positions, kv_caches, params);
+  }
+  // Destroy outside graph_slots_mutex_: AclGraph destruction synchronizes its
+  // stream and NPUGraph::reset releases the private allocator pool.
+  evicted_graph.reset();
+
   // Graph doesn't exist for this bucket num_tokens, try to create it lazily
-  auto graph =
-      std::make_shared<AclGraph>(active_persistent_param, device_.index());
+  auto graph = std::make_shared<AclGraph>(
+      active_persistent_param, device_.index(), graph_capture_stream_.value());
   VLOG(kGraphExecutorLogVerboseLevel)
       << "AclGraphExecutorImpl::run() in capture mode";
   bool capture_success = false;
@@ -1056,6 +1132,10 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
                                      kv_caches,
                                      bucket_num_tokens);
   } catch (const std::exception& e) {
+    {
+      std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+      active_slot.graph_variants.record_capture_failure(graph_key);
+    }
     LOG(ERROR) << "ACL graph capture threw exception for bucket num_tokens="
                << bucket_num_tokens << ": " << e.what();
     if (model_->supports_mla_graph_kv_bucketing()) {
@@ -1071,23 +1151,12 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
               << bucket_num_tokens << " (actual num_tokens: " << n_tokens
               << ") done";
 
-    const bool static_mtp_variant = uses_static_mtp_graph_task_variant(
-        params_single, bucket_num_tokens, options_.block_size());
     {
       std::lock_guard<std::mutex> lock(graph_slots_mutex_);
-      if (static_mtp_variant) {
-        while (active_slot.static_mtp_graph_keys.size() >=
-               kMaxStaticMtpGraphVariantsPerSlot) {
-          const uint64_t evicted_key =
-              active_slot.static_mtp_graph_keys.front();
-          active_slot.static_mtp_graph_keys.pop_front();
-          active_slot.graphs.erase(evicted_key);
-        }
-        active_slot.static_mtp_graph_keys.push_back(graph_key);
-      }
       // shared_ptr keeps a replay/prepare that already left the map alive if a
-      // later capture evicts this static variant.
+      // later capture evicts this variant.
       active_slot.graphs[graph_key] = graph;
+      active_slot.graph_variants.record_capture_success(graph_key);
     }
 
     // Return the output from capture (no need to replay since capture
@@ -1106,8 +1175,26 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
   // Fallback to eager mode if capture fails
   LOG(ERROR) << "Failed to capture ACL graph for bucket num_tokens: "
              << bucket_num_tokens;
+  {
+    std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+    active_slot.graph_variants.record_capture_failure(graph_key);
+  }
   COUNTER_INC(num_model_execution_total_eager);
   return forward_eager(model_, tokens, positions, kv_caches, params);
+}
+
+bool AclGraphExecutorImpl::captured_graphs_share_stream_for_test() {
+  std::lock_guard<std::mutex> lock(graph_slots_mutex_);
+  const c10::StreamId expected_stream_id = graph_capture_stream_.value().id();
+  for (const GraphSlot& slot : graph_slots_) {
+    for (const auto& graph_entry : slot.graphs) {
+      if (graph_entry.second->capture_stream_id_for_test() !=
+          expected_stream_id) {
+        return false;
+      }
+    }
+  }
+  return true;
 }
 
 void AclGraphExecutorImpl::prepare_graph_input(const torch::Tensor& tokens,

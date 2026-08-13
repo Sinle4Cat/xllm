@@ -51,6 +51,8 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
                         KVCache& kv_cache,
                         const ModelInputParams& input_params);
 
+  void set_layer_id(int32_t layer_id) { layer_id_ = layer_id; }
+
  protected:
   virtual std::pair<torch::Tensor, torch::Tensor> project_decode_inputs(
       const torch::Tensor& hidden_states) = 0;
@@ -100,6 +102,7 @@ class Qwen3GatedDeltaNetBaseImpl : public torch::nn::Module {
   int64_t v_size_ = 0;
   int64_t tp_size_ = 1;
   int64_t rank_ = 0;
+  int32_t layer_id_ = -1;
   int32_t conv_kernel_size_ = 0;
   torch::Tensor conv1d_zero_bias_;
 

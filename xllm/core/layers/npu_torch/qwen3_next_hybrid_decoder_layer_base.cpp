@@ -41,6 +41,7 @@ Qwen3HybridDecoderLayerImplBase::Qwen3HybridDecoderLayerImplBase(
         Qwen3NextAttention(
             model_args, quant_args, parallel_args, options, layer_id));
   } else {
+    linear_attention_module->set_layer_id(layer_id);
     linear_attention_ =
         register_module("linear_attn", std::move(linear_attention_module));
   }
@@ -133,7 +134,6 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
     }
     std::tie(x, residual) = input_norm_->forward(x, residual);
   }
-
   // Attention
   if (attention_) {
     x = attention_->forward(
@@ -141,7 +141,6 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
   } else {
     x = linear_attention_->forward(x, attn_metadata, kv_cache, input_params);
   }
-
   // Post-attention norm
   // Ensure the residual layout matches the attention output before post_norm.
   if (fc1_ctx && is_sequence_sharded(*fc1_ctx) && residual.has_value() &&
@@ -160,7 +159,6 @@ torch::Tensor Qwen3HybridDecoderLayerImplBase::forward(
   } else {
     x = mlp_(x);
   }
-
   return x;
 }
 

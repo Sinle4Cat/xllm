@@ -14,7 +14,8 @@ def rename_variant_internal_symbols(source: str, variant_key: str) -> str:
     symbol_names: set[str] = set()
     symbol_names.update(
         re.findall(
-            r'extern\s+"C"\s+__global__\s+__aicore__\s+void\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(',
+            r'extern\s+"C"\s+__global__\s+(?:__aicore__|AICORE)\s+void\s+'
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*\(",
             source,
         )
     )

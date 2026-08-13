@@ -18,6 +18,7 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 
@@ -156,12 +157,6 @@ void record_metadata_ready_event(Stream& stream, ForwardInput& input) {
 }
 
 void finish_metadata_prepare(Stream& stream, ForwardInput& input) {
-  record_metadata_ready_event(stream, input);
-}
-
-void record_current_metadata_ready_event(ForwardInput& input, Stream& stream) {
-  CHECK(stream.wait_event(input.metadata_ready_event))
-      << "failed to wait speculative metadata ready event";
   record_metadata_ready_event(stream, input);
 }
 
@@ -683,6 +678,14 @@ bool MTPWorkerImpl::supports_explicit_spec_verify_replay_update() const {
 bool MTPWorkerImpl::should_use_explicit_spec_verify_replay_update(
     const ForwardInput& input) const {
 #if defined(USE_NPU)
+  // Keep the proven persistent-input graph path as the default until the
+  // final-draft overlap update has model-level accuracy parity.
+  const char* enable_explicit_update =
+      std::getenv("XLLM_ENABLE_EXPLICIT_SPEC_VERIFY_GRAPH_UPDATE");
+  if (enable_explicit_update == nullptr || enable_explicit_update[0] != '1' ||
+      enable_explicit_update[1] != '\0') {
+    return false;
+  }
   const torch::Tensor& block_tables =
       input.input_params.attention.host.block_tables;
   if (!::xllm::ExecutionConfig::get_instance().enable_graph() ||
@@ -970,6 +973,12 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
       run_llm_no_sync_impl(
           *impl_, input, *prepare_stream_, *compute_stream_, target_prepared)
           .value();
+#if defined(USE_NPU)
+  const int32_t default_stream_ret = device_.synchronize_default_stream();
+  CHECK_EQ(default_stream_ret, 0)
+      << "failed to synchronize MTP target prefill default stream, ret="
+      << default_stream_ret;
+#endif
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
@@ -980,8 +989,9 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
   // prepare input for draft model
   auto& embeddings = output.sample_output.embeddings;
 
-  {
+  if (embeddings.defined() || output.sample_output.next_tokens.defined()) {
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
+    wait_metadata_ready_event(prefill_input, *compute_stream_);
     // Target prefill seeds the MTP decode cache. Under orthogonal CP x TP each
     // CP shard samples independently unless this token is synchronized across
     // both axes; caching divergent tokens makes the first decode input disagree
@@ -1001,9 +1011,7 @@ std::optional<ForwardOutput> MTPWorkerImpl::step_prefill(
                                       output.sample_output.next_tokens,
                                       prefill_input.token_ids.options());
     }
-    if (embeddings.defined() || output.sample_output.next_tokens.defined()) {
-      record_current_metadata_ready_event(prefill_input, *compute_stream_);
-    }
+    record_metadata_ready_event(*compute_stream_, prefill_input);
   }
   // generate kv cache for draft model
   timer.reset();

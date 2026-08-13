@@ -119,7 +119,10 @@ void ModelContext::derive_optimization_config() {
   optimization_config_.enable_fused_spec_kernel = false;
   optimization_config_.enable_fused_mla_kernel = false;
   optimization_config_.enable_fused_indexer_qk = false;
-  optimization_config_.enable_spec_token_broadcast = false;
+  // TP speculative decode must use one rank's proposals and accepted tokens
+  // so every rank advances the same model and checkpoint state.
+  optimization_config_.enable_spec_token_broadcast =
+      Platform::is_mlu() || Platform::is_npu();
 
   // determine whether to enable fused kernel based on backend
   if (Platform::is_npu()) {
