@@ -784,6 +784,13 @@ struct ModelEmbeddingInput {
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
 
+  // Source slots consumed by recurrent-state kernels. A negative id means
+  // that the sequence starts from a zero state.
+  std::vector<int32_t> linear_state_read_ids;
+
+  // IntTensor: [n_seq]
+  torch::Tensor linear_state_read_indices;
+
   // request ids of each sequence, used by suffix decoding request identity
   std::vector<std::string> request_ids;
 
@@ -804,6 +811,9 @@ struct ModelEmbeddingInput {
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_read_ids = linear_state_read_ids;
+    out.linear_state_read_indices =
+        safe_to(linear_state_read_indices, device, true);
     out.request_ids = request_ids;
     out.extra_token_ids = extra_token_ids;
     out.mtp_shifted_token_ids = safe_to(mtp_shifted_token_ids, device, true);
@@ -874,6 +884,7 @@ struct ParallelInput {
   std::shared_ptr<LayerSynchronizer> layer_wise_load_synchronizer = nullptr;
 #if defined(USE_NPU)
   std::vector<int64_t> query_start_loc;
+  std::vector<int64_t> has_initial_state;
 #endif
 
   ParallelInput to(const torch::Device& device) const {
@@ -891,6 +902,7 @@ struct ParallelInput {
     out.layer_wise_load_synchronizer = layer_wise_load_synchronizer;
 #if defined(USE_NPU)
     out.query_start_loc = query_start_loc;
+    out.has_initial_state = has_initial_state;
 #endif
     return out;
   }

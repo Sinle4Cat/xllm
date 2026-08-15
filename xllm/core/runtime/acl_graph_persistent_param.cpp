@@ -49,22 +49,51 @@ namespace xllm::npu {
 namespace {
 constexpr int32_t kMlaGraphKvLenBucket = 2048;
 
-int64_t get_decode_graph_capacity(const runtime::Options& options) {
-  CHECK_GT(options.num_decoding_tokens(), 0)
-      << "num_decoding_tokens must be > 0 for graph capacity";
-  return options.max_seqs_per_batch();
+int64_t get_graph_bucket_capacity(int64_t num_tokens) {
+  CHECK_GT(num_tokens, 0) << "graph token capacity must be positive";
+  if (num_tokens <= 1) {
+    return 1;
+  }
+  if (num_tokens <= 2) {
+    return 2;
+  }
+  if (num_tokens <= 4) {
+    return 4;
+  }
+  if (num_tokens <= 8) {
+    return 8;
+  }
+  return util::align_up(num_tokens, int64_t{16});
 }
 
 int64_t get_decode_graph_token_capacity(const runtime::Options& options) {
   CHECK_GT(options.num_decoding_tokens(), 0)
       << "num_decoding_tokens must be > 0 for graph token capacity";
+  int64_t token_capacity = options.max_seqs_per_batch();
   if (::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel()) {
-    return options.max_seqs_per_batch();
+    return get_graph_bucket_capacity(token_capacity);
   }
   if (options.enable_speculative_decode() && !options.is_draft_engine()) {
-    return options.max_seqs_per_batch() * options.num_decoding_tokens();
+    token_capacity *= options.num_decoding_tokens();
   }
-  return options.max_seqs_per_batch();
+  // AclGraphExecutor rounds runtime token counts to graph buckets. Persistent
+  // inputs must cover the largest rounded bucket, not just the largest compact
+  // request. For example, B4 MTP4 validates 20 tokens but captures 32 rows.
+  return get_graph_bucket_capacity(token_capacity);
+}
+
+int64_t get_decode_graph_metadata_capacity(const runtime::Options& options,
+                                           bool is_hybrid_linear_attention) {
+  const int64_t token_capacity = get_decode_graph_token_capacity(options);
+  const bool uses_sequence_scoped_verify_metadata =
+      is_hybrid_linear_attention && options.enable_speculative_decode() &&
+      !options.is_draft_engine() &&
+      !::xllm::SpeculativeConfig::get_instance().enable_atb_spec_kernel();
+  if (!uses_sequence_scoped_verify_metadata) {
+    return token_capacity;
+  }
+  return (token_capacity + options.num_decoding_tokens() - 1) /
+         options.num_decoding_tokens();
 }
 
 float get_dp_ep_all2all_buffer_factor(int64_t length) {
@@ -213,11 +242,10 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   // only serves decode / spec-verify batches, so the relevant row upper bound
   // comes from decode graph capacity instead.
   const int64_t max_graph_tokens = get_decode_graph_token_capacity(options);
-  // Hybrid spec verify keeps sequence-scoped metadata, while non-hybrid MTP
-  // expands every proposal token into its own decode metadata row.
-  const int64_t metadata_capacity = is_hybrid_linear_attention
-                                        ? get_decode_graph_capacity(options)
-                                        : max_graph_tokens;
+  // Hybrid MTP keeps recurrent and ordinary attention metadata sequence-scoped
+  // while expanded decode attention uses one row per validation token.
+  const int64_t metadata_capacity =
+      get_decode_graph_metadata_capacity(options, is_hybrid_linear_attention);
 
   const int64_t max_seq_len = args_.max_position_embeddings();
 

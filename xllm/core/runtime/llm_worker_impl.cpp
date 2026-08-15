@@ -232,6 +232,9 @@ std::optional<ForwardOutput> LLMWorkerImpl::step_for_schedule_overlap(
     restore_linear_state_slots(kv_caches_,
                                mutable_params.linear_state_cache_ops,
                                mutable_params.linear_state_validity_mask);
+#if defined(USE_NPU)
+    use_live_linear_state_slots(mutable_params);
+#endif
   }
   return execute_no_sync_on_stream(input, *compute_stream_);
 }

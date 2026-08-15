@@ -15,7 +15,12 @@ limitations under the License.
 #include <glog/logging.h>
 #include <torch/torch.h>
 
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <optional>
+#include <string>
 #include <tuple>
 
 #include "xllm/core/kernels/npu/npu_ops_api.h"
@@ -26,6 +31,35 @@ namespace xllm {
 namespace layer {
 
 namespace {
+uint64_t debug_hash_tensor(const torch::Tensor& tensor) {
+  auto cpu = tensor.contiguous().to(torch::kCPU);
+  const auto* bytes = reinterpret_cast<const uint8_t*>(cpu.data_ptr());
+  const int64_t byte_count = cpu.numel() * cpu.element_size();
+  uint64_t hash = 1469598103934665603ULL;
+  for (int64_t i = 0; i < byte_count; ++i) {
+    hash ^= bytes[i];
+    hash *= 1099511628211ULL;
+  }
+  return hash;
+}
+
+uint64_t hash_last_token(const torch::Tensor& tensor) {
+  return debug_hash_tensor(tensor.select(0, tensor.size(0) - 1));
+}
+
+void dump_tensor(const torch::Tensor& tensor, const std::string& path) {
+  auto cpu = tensor.contiguous().to(torch::kCPU);
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  CHECK(output.is_open()) << "failed to open debug tensor dump: " << path;
+  output.write(reinterpret_cast<const char*>(cpu.data_ptr()),
+               cpu.numel() * cpu.element_size());
+  CHECK(output.good()) << "failed to write debug tensor dump: " << path;
+}
+
+void dump_last_token(const torch::Tensor& tensor, const std::string& path) {
+  dump_tensor(tensor.select(0, tensor.size(0) - 1), path);
+}
+
 torch::Tensor l2norm(const torch::Tensor& x, int64_t dim, double eps = 1e-6) {
   auto norm = torch::sqrt(torch::sum(torch::square(x), dim, true) + eps);
   return x / norm;
@@ -558,6 +592,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       attn_metadata.is_prefill || attn_metadata.is_chunked_prefill;
   torch::Tensor mixed_qkv, z, b, a;
   torch::Tensor processed_q, processed_k, processed_v;
+  torch::Tensor g, beta;
   int64_t batch_size = 0;
   int64_t seq_len = 0;
 
@@ -600,6 +635,14 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   const int64_t local_v_heads = num_v_heads_ / tp_size_;
   const int64_t local_conv_dim =
       2 * local_q_heads * head_k_dim_ + local_v_heads * head_v_dim_;
+  const bool supported_qwen35_tp = tp_size_ == 1 || tp_size_ == 2 ||
+                                   tp_size_ == 4 || tp_size_ == 8 ||
+                                   tp_size_ == 16;
+  const bool supported_prefill_super_op_heads =
+      local_v_heads == 1 || local_v_heads == 2 || local_v_heads == 3 ||
+      local_v_heads == 4 || local_v_heads == 6 || local_v_heads == 8 ||
+      local_v_heads == 12 || local_v_heads == 16 || local_v_heads == 24 ||
+      local_v_heads == 32 || local_v_heads == 48 || local_v_heads == 64;
   bool used_direct_prefill_qkv = false;
 
   torch::Tensor conv_cache = kv_cache.get_conv_cache();
@@ -608,14 +651,285 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   torch::Tensor conv_weight = conv1d_->weight();
   torch::Tensor logical_state_indices =
       get_linear_state_indices(input_params, device);
+  torch::Tensor logical_state_read_indices =
+      input_params.embedding.linear_state_read_indices;
+  if (!logical_state_read_indices.defined()) {
+    std::vector<int32_t> read_ids =
+        input_params.embedding.linear_state_read_ids;
+    if (read_ids.empty()) {
+      read_ids.resize(input_params.embedding.linear_state_ids.size(), -1);
+      for (size_t i = 0; i < read_ids.size(); ++i) {
+        if (i < input_params.parallel.has_initial_state.size() &&
+            input_params.parallel.has_initial_state[i] != 0) {
+          read_ids[i] = input_params.embedding.linear_state_ids[i];
+        }
+      }
+    }
+    logical_state_read_indices = torch::tensor(
+        read_ids, torch::TensorOptions().dtype(torch::kInt32).device(device));
+  } else if (logical_state_read_indices.device() != device ||
+             logical_state_read_indices.scalar_type() != torch::kInt32) {
+    logical_state_read_indices = logical_state_read_indices.to(
+        torch::TensorOptions().dtype(torch::kInt32).device(device),
+        /*non_blocking=*/true,
+        /*copy=*/true);
+  }
+  logical_state_read_indices = logical_state_read_indices.contiguous();
   const int64_t checkpoint_stride =
       get_checkpoint_stride(conv_cache, ssm_cache);
   torch::Tensor linear_state_base_indices =
       build_linear_state_base_indices(logical_state_indices, checkpoint_stride);
+  torch::Tensor linear_state_read_base_indices =
+      build_linear_state_base_indices(logical_state_read_indices,
+                                      checkpoint_stride);
   auto graph_context = input_params.graph.acl_graph_task_update_context;
   const bool register_conv1d_graph_update =
       graph_context != nullptr && graph_context->capturing;
 
+  const auto& norm_weight = norm_->weight();
+  int64_t packed_prefill_tokens = 0;
+  int64_t prefill_num_matrices = 0;
+  bool prefill_lengths_valid =
+      batch_size >= 1 && batch_size <= 8 && seq_len > 1 &&
+      attn_metadata.q_seq_lens_vec.size() == static_cast<size_t>(batch_size) &&
+      input_params.parallel.query_start_loc.size() ==
+          static_cast<size_t>(batch_size + 1) &&
+      input_params.parallel.query_start_loc.front() == 0;
+  if (prefill_lengths_valid) {
+    for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      const int64_t valid_len = attn_metadata.q_seq_lens_vec[batch_idx];
+      const int64_t start = input_params.parallel.query_start_loc[batch_idx];
+      const int64_t end = input_params.parallel.query_start_loc[batch_idx + 1];
+      prefill_lengths_valid =
+          prefill_lengths_valid && valid_len > 0 && valid_len <= seq_len &&
+          start == packed_prefill_tokens && end - start == valid_len;
+      packed_prefill_tokens += valid_len;
+      prefill_num_matrices += ((valid_len + 127) / 128) * local_v_heads;
+    }
+  }
+
+  bool prefill_state_metadata_valid =
+      input_params.embedding.linear_state_ids.size() ==
+          static_cast<size_t>(batch_size) &&
+      input_params.embedding.linear_state_read_ids.size() ==
+          static_cast<size_t>(batch_size) &&
+      input_params.parallel.has_initial_state.size() ==
+          static_cast<size_t>(batch_size);
+  if (prefill_state_metadata_valid) {
+    const int64_t logical_state_slots = std::min<int64_t>(
+        conv_cache.size(0), ssm_cache.size(0) / checkpoint_stride);
+    for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+      const int64_t write_id =
+          input_params.embedding.linear_state_ids[batch_idx];
+      const int64_t read_id =
+          input_params.embedding.linear_state_read_ids[batch_idx];
+      const int32_t has_initial_state =
+          input_params.parallel.has_initial_state[batch_idx];
+      prefill_state_metadata_valid =
+          prefill_state_metadata_valid && write_id >= 0 &&
+          write_id < logical_state_slots && read_id >= -1 &&
+          read_id < logical_state_slots &&
+          (has_initial_state == 0 || has_initial_state == 1) &&
+          ((has_initial_state == 0 && read_id == -1) ||
+           (has_initial_state == 1 && read_id >= 0));
+    }
+  }
+  if (std::getenv("XLLM_ENABLE_QWEN35_GDN_PREFILL_E2E") != nullptr &&
+      std::getenv("XLLM_DISABLE_QWEN35_GDN_PREFILL_E2E") == nullptr &&
+      !use_spec_verify && is_any_prefill && fla_ssm_state_layout &&
+      prefill_lengths_valid && prefill_state_metadata_valid &&
+      packed_prefill_tokens == original_num_tokens &&
+      packed_prefill_tokens <= 2048 && supported_qwen35_tp &&
+      num_k_heads_ % tp_size_ == 0 && num_v_heads_ % tp_size_ == 0 &&
+      local_q_heads > 0 && supported_prefill_super_op_heads &&
+      local_v_heads % local_q_heads == 0 && head_k_dim_ == 128 &&
+      head_v_dim_ == 128 && std::abs(norm_->eps() - 1e-6) < 1e-12 &&
+      logical_state_read_indices.dim() == 1 &&
+      logical_state_read_indices.numel() == batch_size &&
+      logical_state_read_indices.scalar_type() == torch::kInt32 &&
+      linear_state_read_base_indices.dim() == 1 &&
+      linear_state_read_base_indices.numel() == batch_size &&
+      linear_state_read_base_indices.scalar_type() == torch::kInt32 &&
+      linear_state_base_indices.dim() == 1 &&
+      linear_state_base_indices.numel() == batch_size &&
+      linear_state_base_indices.scalar_type() == torch::kInt32 &&
+      mixed_qkv.dim() == 3 && mixed_qkv.size(0) == batch_size &&
+      mixed_qkv.size(1) == seq_len && mixed_qkv.size(2) == local_conv_dim &&
+      z.dim() == 4 && z.size(0) == batch_size && z.size(1) == seq_len &&
+      z.size(2) == local_v_heads && z.size(3) == 128 && a.dim() == 3 &&
+      b.dim() == 3 && a.size(0) == batch_size && b.size(0) == batch_size &&
+      a.size(1) == seq_len && b.size(1) == seq_len &&
+      a.size(2) == local_v_heads && b.size(2) == local_v_heads &&
+      mixed_qkv.scalar_type() == torch::kBFloat16 &&
+      z.scalar_type() == torch::kBFloat16 &&
+      a.scalar_type() == torch::kBFloat16 &&
+      b.scalar_type() == torch::kBFloat16 && conv_weight.dim() == 2 &&
+      conv_weight.size(0) == 4 && conv_weight.size(1) == local_conv_dim &&
+      conv_weight.scalar_type() == torch::kBFloat16 && conv_cache.dim() == 3 &&
+      conv_cache.size(1) == checkpoint_stride + 2 &&
+      conv_cache.size(2) == local_conv_dim &&
+      conv_cache.scalar_type() == torch::kBFloat16 && ssm_cache.dim() == 4 &&
+      ssm_cache.size(1) == local_v_heads && ssm_cache.size(2) == 128 &&
+      ssm_cache.size(3) == 128 && ssm_cache.scalar_type() == torch::kFloat32 &&
+      A_log_.numel() == local_v_heads &&
+      A_log_.scalar_type() == torch::kFloat32 &&
+      dt_bias_.numel() == local_v_heads &&
+      dt_bias_.scalar_type() == torch::kFloat32 && norm_weight.numel() == 128 &&
+      norm_weight.scalar_type() == torch::kBFloat16 &&
+      attn_metadata.q_cu_seq_lens.dim() == 1 &&
+      attn_metadata.q_cu_seq_lens.numel() == batch_size + 1 &&
+      attn_metadata.q_cu_seq_lens.scalar_type() == torch::kInt32 &&
+      mixed_qkv.is_contiguous() && z.is_contiguous() && a.is_contiguous() &&
+      b.is_contiguous() && conv_weight.is_contiguous() &&
+      conv_cache.is_contiguous() && ssm_cache.is_contiguous() &&
+      A_log_.is_contiguous() && dt_bias_.is_contiguous() &&
+      norm_weight.is_contiguous() &&
+      attn_metadata.q_cu_seq_lens.is_contiguous() &&
+      logical_state_read_indices.is_contiguous() &&
+      linear_state_read_base_indices.is_contiguous() &&
+      linear_state_base_indices.is_contiguous() &&
+      logical_state_indices.is_contiguous()) {
+    const bool debug_hash_e2e =
+        std::getenv("XLLM_DEBUG_HASH_MEGA_GDN_PREFILL") != nullptr;
+    static thread_local int64_t debug_e2e_call = 0;
+    uint64_t mixed_qkv_hash = 0;
+    uint64_t z_hash = 0;
+    uint64_t a_hash = 0;
+    uint64_t b_hash = 0;
+    const int64_t current_debug_call = debug_e2e_call++;
+    auto packed_mixed_qkv = reshape_qkvz_unpad(attn_metadata, mixed_qkv);
+    auto packed_b = reshape_qkvz_unpad(attn_metadata, b);
+    auto packed_a = reshape_qkvz_unpad(attn_metadata, a);
+    auto packed_z = reshape_qkvz_unpad(attn_metadata, z);
+    if (debug_hash_e2e) {
+      mixed_qkv_hash = hash_last_token(
+          packed_mixed_qkv.view({packed_prefill_tokens, local_conv_dim}));
+      z_hash = hash_last_token(
+          packed_z.view({packed_prefill_tokens, local_v_heads, head_v_dim_}));
+      a_hash = hash_last_token(
+          packed_a.view({packed_prefill_tokens, local_v_heads}));
+      b_hash = hash_last_token(
+          packed_b.view({packed_prefill_tokens, local_v_heads}));
+    }
+    auto fused_norm_out = xllm::kernel::npu::mega_gdn_prefill_op(
+        packed_mixed_qkv.view({packed_prefill_tokens, local_conv_dim}),
+        packed_b.view({packed_prefill_tokens, local_v_heads}),
+        packed_a.view({packed_prefill_tokens, local_v_heads}),
+        packed_z.view({packed_prefill_tokens, local_v_heads, head_v_dim_}),
+        conv_weight,
+        conv_cache,
+        A_log_,
+        dt_bias_,
+        logical_state_read_indices,
+        logical_state_indices,
+        linear_state_read_base_indices,
+        linear_state_base_indices,
+        ssm_cache,
+        attn_metadata.q_cu_seq_lens,
+        norm_weight,
+        prefill_num_matrices);
+    if (std::getenv("XLLM_DEBUG_SYNC_MEGA_GDN_PREFILL") != nullptr) {
+      c10_npu::getCurrentNPUStream().synchronize();
+    }
+    if (debug_hash_e2e) {
+      const int64_t write_state_id = input_params.embedding.linear_state_ids[0];
+      LOG(INFO) << "QWEN35_E2E_HASH rank=" << rank_
+                << " call=" << current_debug_call
+                << " linear_layer=" << current_debug_call % 48
+                << " batch_size=" << batch_size << " seq_len=" << seq_len
+                << " packed_tokens=" << packed_prefill_tokens
+                << " num_matrices=" << prefill_num_matrices << " read_state_id="
+                << input_params.embedding.linear_state_read_ids[0]
+                << " write_state_id="
+                << input_params.embedding.linear_state_ids[0]
+                << " has_initial_state="
+                << input_params.parallel.has_initial_state[0]
+                << " mixed_qkv=" << mixed_qkv_hash << " z=" << z_hash
+                << " a=" << a_hash << " b=" << b_hash
+                << " output=" << hash_last_token(fused_norm_out)
+                << " conv_state="
+                << debug_hash_tensor(conv_cache.select(0, write_state_id))
+                << " ssm_state="
+                << debug_hash_tensor(
+                       ssm_cache.select(0, write_state_id * checkpoint_stride));
+    }
+    auto projected_out = o_proj_->forward(fused_norm_out.view(
+        {packed_prefill_tokens, local_v_heads * head_v_dim_}));
+    if (debug_hash_e2e) {
+      for (int64_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+        const int64_t start = input_params.parallel.query_start_loc[batch_idx];
+        const int64_t end =
+            input_params.parallel.query_start_loc[batch_idx + 1];
+        const int64_t last_token = end - 1;
+        LOG(INFO) << "QWEN35_E2E_SEQUENCE rank=" << rank_
+                  << " call=" << current_debug_call
+                  << " batch_idx=" << batch_idx << " q_len=" << end - start
+                  << " start=" << start << " end=" << end << " read_state_id="
+                  << input_params.embedding.linear_state_read_ids[batch_idx]
+                  << " write_state_id="
+                  << input_params.embedding.linear_state_ids[batch_idx]
+                  << " has_initial_state="
+                  << input_params.parallel.has_initial_state[batch_idx]
+                  << " mixed_qkv="
+                  << debug_hash_tensor(packed_mixed_qkv.select(0, last_token))
+                  << " z=" << debug_hash_tensor(packed_z.select(0, last_token))
+                  << " a=" << debug_hash_tensor(packed_a.select(0, last_token))
+                  << " b=" << debug_hash_tensor(packed_b.select(0, last_token))
+                  << " fused="
+                  << debug_hash_tensor(fused_norm_out.select(0, last_token))
+                  << " projected="
+                  << debug_hash_tensor(projected_out.select(0, last_token));
+      }
+    }
+    if (const char* dump_dir = std::getenv("XLLM_DEBUG_DUMP_GDN_PREFILL_DIR");
+        dump_dir != nullptr && current_debug_call % 48 == 0) {
+      dump_last_token(fused_norm_out,
+                      std::string(dump_dir) + "/e2e_rank" +
+                          std::to_string(rank_) + "_call" +
+                          std::to_string(current_debug_call) + "_seq" +
+                          std::to_string(seq_len) + "_local.bin");
+      const int64_t write_state_id = input_params.embedding.linear_state_ids[0];
+      const std::string dump_prefix = std::string(dump_dir) + "/e2e_rank" +
+                                      std::to_string(rank_) + "_call" +
+                                      std::to_string(current_debug_call) +
+                                      "_seq" + std::to_string(seq_len);
+      dump_tensor(conv_cache.select(0, write_state_id),
+                  dump_prefix + "_conv.bin");
+      dump_tensor(ssm_cache.select(0, write_state_id * checkpoint_stride),
+                  dump_prefix + "_ssm.bin");
+    }
+    if (debug_hash_e2e) {
+      LOG(INFO) << "QWEN35_E2E_O_PROJ_HASH rank=" << rank_
+                << " call=" << current_debug_call
+                << " linear_layer=" << current_debug_call % 48
+                << " seq_len=" << seq_len
+                << " output=" << hash_last_token(projected_out);
+    }
+    return projected_out;
+  }
+
+  const auto& read_state_ids = input_params.embedding.linear_state_read_ids;
+  if (read_state_ids.size() == input_params.embedding.linear_state_ids.size()) {
+    for (size_t row = 0; row < read_state_ids.size(); ++row) {
+      const int32_t read_id = read_state_ids[row];
+      const int32_t write_id = input_params.embedding.linear_state_ids[row];
+      if (read_id < 0 || read_id == write_id) {
+        continue;
+      }
+      CHECK_GE(write_id, 0);
+      CHECK_LT(read_id, conv_cache.size(0));
+      CHECK_LT(write_id, conv_cache.size(0));
+      conv_cache.select(0, write_id).copy_(conv_cache.select(0, read_id));
+      ssm_cache
+          .narrow(0,
+                  static_cast<int64_t>(write_id) * checkpoint_stride,
+                  checkpoint_stride)
+          .copy_(ssm_cache.narrow(
+              0,
+              static_cast<int64_t>(read_id) * checkpoint_stride,
+              checkpoint_stride));
+    }
+  }
   if (!use_spec_verify && is_any_prefill) {
     torch::IntArrayRef num_accepted_tokens_opt;
     std::vector<int64_t> linear_state_indices_vec(
@@ -776,8 +1090,6 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   const bool use_fused_sigmoid_gdn_decode =
       fla_ssm_state_layout && !use_spec_verify && !is_any_prefill &&
       checkpoint_stride == 1;
-  torch::Tensor g;
-  torch::Tensor beta;
   // Compute gated delta net decay and beta terms.
   if (use_spec_verify || attn_metadata.is_chunked_prefill ||
       checkpoint_stride > 1) {
@@ -1040,6 +1352,25 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     // Slice excess padding tokens
     rearranged_norm =
         rearranged_norm.slice(0, 0, original_num_tokens).contiguous();
+  }
+  static thread_local int64_t debug_baseline_call = 0;
+  const int64_t current_baseline_call = debug_baseline_call++;
+  if (const char* dump_dir = std::getenv("XLLM_DEBUG_DUMP_GDN_PREFILL_DIR");
+      dump_dir != nullptr && current_baseline_call % 48 == 0) {
+    dump_last_token(rearranged_norm,
+                    std::string(dump_dir) + "/baseline_rank" +
+                        std::to_string(rank_) + "_call" +
+                        std::to_string(current_baseline_call) + "_seq" +
+                        std::to_string(seq_len) + "_local.bin");
+    const int64_t write_state_id = input_params.embedding.linear_state_ids[0];
+    const std::string dump_prefix = std::string(dump_dir) + "/baseline_rank" +
+                                    std::to_string(rank_) + "_call" +
+                                    std::to_string(current_baseline_call) +
+                                    "_seq" + std::to_string(seq_len);
+    dump_tensor(conv_cache.select(0, write_state_id),
+                dump_prefix + "_conv.bin");
+    dump_tensor(ssm_cache.select(0, write_state_id * checkpoint_stride),
+                dump_prefix + "_ssm.bin");
   }
   if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
     return o_proj_->forward(rearranged_norm,

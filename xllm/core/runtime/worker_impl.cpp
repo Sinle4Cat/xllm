@@ -180,6 +180,8 @@ void ensure_forward_input_device_tensors(ForwardInput& input,
   move_tensor_to_device_if_needed(input.positions, device);
   move_tensor_to_device_if_needed(
       input.input_params.embedding.mtp_shifted_token_ids, device);
+  move_tensor_to_device_if_needed(
+      input.input_params.embedding.linear_state_read_indices, device);
   move_tensor_to_device_if_needed(input.sampling_params.selected_token_idxes,
                                   device);
   move_tensor_to_device_if_needed(input.sampling_params.sample_idxes, device);
@@ -269,7 +271,6 @@ LinearStateInputRows get_mlu_linear_state_rows(ModelInputParams& input_params) {
     input_params.embedding.linear_state_ids = {kPaddingLinearStateId};
     return {{}, 0, /*empty_shard=*/true};
   }
-
   CHECK_GT(sequence_rows, 0)
       << "invalid MLU linear-state input row counts: sequence_rows="
       << sequence_rows << ", active_rows=" << active_rows
@@ -301,11 +302,74 @@ void prepare_input_params_for_linear_attention(ModelInputParams& input_params) {
 #endif
   if (rows.empty_shard) {
     input_params.linear_state_validity_mask.clear();
+#if defined(USE_NPU)
+    input_params.parallel.has_initial_state.clear();
+    input_params.embedding.linear_state_read_ids.clear();
+    input_params.embedding.linear_state_read_indices = torch::Tensor();
+#endif
     return;
   }
   input_params.linear_state_validity_mask =
       build_linear_state_mask(rows.cached_tokens, rows.active_rows);
+#if defined(USE_NPU)
+  const int64_t batch_size = rows.active_rows;
+  CHECK_EQ(input_params.embedding.linear_state_ids.size(),
+           static_cast<size_t>(batch_size))
+      << "linear_state_ids must stay sequence-scoped";
+  CHECK_EQ(input_params.linear_state_validity_mask.size(),
+           static_cast<size_t>(batch_size));
+  if (!input_params.linear_state_cache_ops.empty()) {
+    CHECK_EQ(input_params.linear_state_cache_ops.size(),
+             static_cast<size_t>(batch_size))
+        << "linear_state_cache_ops must stay sequence-scoped";
+  }
+
+  auto& read_ids = input_params.embedding.linear_state_read_ids;
+  read_ids.assign(static_cast<size_t>(batch_size), -1);
+  for (int64_t i = 0; i < batch_size; ++i) {
+    const size_t row = static_cast<size_t>(i);
+    const int32_t live_state_id = input_params.embedding.linear_state_ids[row];
+    if (!input_params.linear_state_cache_ops.empty()) {
+      const auto& cache_op = input_params.linear_state_cache_ops[row];
+      CHECK(cache_op.linear_state_id < 0 ||
+            cache_op.linear_state_id == live_state_id)
+          << "linear state cache destination must match the live state slot";
+      if (cache_op.restore_requested) {
+        if (cache_op.restore_src_slot_id > kPaddingLinearStateId &&
+            live_state_id > kPaddingLinearStateId) {
+          read_ids[row] = cache_op.restore_src_slot_id;
+          input_params.linear_state_validity_mask[row] = 1;
+        } else {
+          input_params.linear_state_validity_mask[row] = 0;
+        }
+        continue;
+      }
+      if (cache_op.reset_requested) {
+        input_params.linear_state_validity_mask[row] = 0;
+        continue;
+      }
+    }
+    if (input_params.linear_state_validity_mask[row] != 0 &&
+        live_state_id > kPaddingLinearStateId) {
+      read_ids[row] = live_state_id;
+    } else if (live_state_id <= kPaddingLinearStateId) {
+      input_params.linear_state_validity_mask[row] = 0;
+    }
+  }
+  input_params.parallel.has_initial_state =
+      input_params.linear_state_validity_mask;
+
+  input_params.embedding.linear_state_read_indices =
+      torch::tensor(read_ids, torch::kInt);
+  if (input_params.embedding.linear_state_indices.defined()) {
+    input_params.embedding.linear_state_read_indices =
+        input_params.embedding.linear_state_read_indices.to(
+            input_params.embedding.linear_state_indices.device(),
+            /*non_blocking=*/true);
+  }
+#endif
 }
+
 #endif
 
 }  // namespace
@@ -915,16 +979,48 @@ void WorkerImpl::prepare_work_before_execute_on_stream(
 #if defined(USE_NPU) || defined(USE_MLU) || defined(USE_CUDA)
     if (has_linear_attention_layers(context_.get_model_args())) {
       prepare_input_params_for_linear_attention(input_params);
+      bool defer_restore_to_prefill_superkernel = false;
+#if defined(USE_NPU)
+      const std::string& model_type = context_.get_model_args().model_type();
+      const bool is_qwen35_model =
+          model_type == "qwen3_5" || model_type == "qwen3_5_text" ||
+          model_type == "qwen3_5_moe" || model_type == "qwen3_5_moe_text";
+      defer_restore_to_prefill_superkernel =
+          std::getenv("XLLM_ENABLE_QWEN35_GDN_PREFILL_E2E") != nullptr &&
+          std::getenv("XLLM_DISABLE_QWEN35_GDN_PREFILL_E2E") == nullptr &&
+          std::getenv("XLLM_DISABLE_QWEN35_GDN_DIRECT_STATE_RESTORE") ==
+              nullptr &&
+          is_qwen35_model && !options_.enable_speculative_decode() &&
+          !enable_schedule_overlap() &&
+          processed_input.input_params.meta.batch_forward_type.no_decode() &&
+          processed_input.input_params.meta.num_sequences >= 1 &&
+          processed_input.input_params.meta.num_sequences <= 8 &&
+          processed_input.input_params.parallel.query_start_loc.size() ==
+              static_cast<size_t>(
+                  processed_input.input_params.meta.num_sequences + 1) &&
+          processed_input.input_params.parallel.query_start_loc.back() >
+              processed_input.input_params.meta.num_sequences;
+#endif
       // Under schedule_overlap chunked prefill the previous chunk's forward
       // runs on compute_stream_ from a worker thread that may not have
       // enqueued its kernels yet when this prepare runs on the main thread.
       // Defer the slot-restore copy to step_for_schedule_overlap (worker
       // thread, on compute_stream_) so stream ordering between chunk N-1
       // writes and chunk N restore is automatic.
-      if (!enable_schedule_overlap()) {
+      if (!enable_schedule_overlap() && !defer_restore_to_prefill_superkernel) {
         restore_linear_state_slots(kv_caches_,
                                    input_params.linear_state_cache_ops,
                                    input_params.linear_state_validity_mask);
+#if defined(USE_NPU)
+        use_live_linear_state_slots(input_params);
+        if (std::getenv("XLLM_DEBUG_SYNC_QWEN35_LINEAR_RESTORE") != nullptr) {
+          const int32_t ret = prepare_stream.synchronize();
+          CHECK_EQ(ret, 0)
+              << "failed to synchronize Qwen3.5 linear state restore, ret="
+              << ret;
+          VLOG(1) << "Qwen3.5 linear state restore debug sync completed";
+        }
+#endif
       }
     }
 #endif

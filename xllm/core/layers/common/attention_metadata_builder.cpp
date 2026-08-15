@@ -95,6 +95,14 @@ void materialize_linear_state_validity(
         << "linear state metadata requires a target device";
     options = torch::TensorOptions().device(device.value());
   }
+#if defined(USE_NPU)
+  // NPU recurrent kernels consume linear_state_validity_mask directly from
+  // ModelInputParams. Creating this compatibility tensor on device performs a
+  // synchronous H2D copy inside ACL graph capture, which is unsupported.
+  if (params.enable_graph) {
+    options = options.device(torch::kCPU);
+  }
+#endif
   options = options.dtype(torch::kBool);
   attn_metadata.has_initial_states =
       attn_metadata.is_dummy && mask_rows == 0

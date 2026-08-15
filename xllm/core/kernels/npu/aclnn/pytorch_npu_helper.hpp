@@ -755,6 +755,11 @@ using ReleaseHugeMemFn = void (*)(void*, bool);
           at::TensorOptions(torch_npu::utils::get_npu_device_type());          \
       workspace_tensor = at::empty({static_cast<int64_t>(workspace_size)},     \
                                    options.dtype(at::kByte));                  \
+      if (std::getenv("XLLM_DEBUG_ZERO_MEGA_GDN_PREFILL_WORKSPACE") !=         \
+              nullptr &&                                                       \
+          std::strcmp(#aclnn_api, "aclnnMegaGdnPrefillOp") == 0) {             \
+        workspace_tensor.zero_();                                              \
+      }                                                                        \
       workspace_addr = const_cast<void*>(workspace_tensor.storage().data());   \
     }                                                                          \
     auto acl_call = [=]() -> int {                                             \

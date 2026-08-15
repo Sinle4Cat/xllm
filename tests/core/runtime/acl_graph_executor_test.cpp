@@ -986,9 +986,9 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
       options,
       /*need_update_attn_mask=*/false,
       /*is_hybrid_linear_attention=*/false);
-  EXPECT_EQ(persistent_param.q_seq_lens().size(0), 30);
-  EXPECT_EQ(persistent_param.kv_seq_lens().size(0), 30);
-  EXPECT_EQ(persistent_param.persistent_block_tables().size(0), 30);
+  EXPECT_EQ(persistent_param.q_seq_lens().size(0), 32);
+  EXPECT_EQ(persistent_param.kv_seq_lens().size(0), 32);
+  EXPECT_EQ(persistent_param.persistent_block_tables().size(0), 32);
 
   constexpr int64_t kValidateRows = 12;
   const torch::TensorOptions int_options =
@@ -1033,8 +1033,87 @@ TEST(AclGraphPersistentParamTest, SpecVerifyMetadataUsesTokenCapacity) {
       options,
       /*need_update_attn_mask=*/false,
       /*is_hybrid_linear_attention=*/true);
-  EXPECT_EQ(hybrid_persistent_param.q_seq_lens().size(0), 10);
-  EXPECT_EQ(hybrid_persistent_param.persistent_block_tables().size(0), 10);
+  EXPECT_EQ(hybrid_persistent_param.q_seq_lens().size(0), 11);
+  EXPECT_EQ(hybrid_persistent_param.persistent_block_tables().size(0), 11);
+
+  speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
+}
+
+TEST(AclGraphPersistentParamTest,
+     HybridMtp4ExpandedMetadataCoversTwentyToThirtyTwoBucket) {
+  SpeculativeConfig& speculative_config = SpeculativeConfig::get_instance();
+  const bool original_enable_atb_spec_kernel =
+      speculative_config.enable_atb_spec_kernel();
+  speculative_config.enable_atb_spec_kernel(false);
+
+  constexpr int32_t kBatchSize = 4;
+  constexpr int32_t kSpecWidth = 5;
+  constexpr int32_t kActualTokens = kBatchSize * kSpecWidth;
+  constexpr int32_t kBucketTokens = 32;
+  constexpr int32_t kBlockTableWidth = 8;
+
+  ModelArgs args;
+  args.model_type("qwen3_5");
+  args.dtype("float32");
+  args.hidden_size(8);
+  args.max_position_embeddings(128);
+
+  runtime::Options options;
+  options.block_size(16);
+  options.max_seqs_per_batch(kBatchSize);
+  options.max_tokens_per_batch(64);
+  options.num_decoding_tokens(kSpecWidth);
+  options.enable_speculative_decode(true);
+  options.is_draft_engine(false);
+
+  const torch::Device device("npu:0");
+  const auto int_options = torch::dtype(torch::kInt).device(device);
+  ::xllm::npu::GraphPersistentParam persistent_param(
+      args,
+      device,
+      options,
+      /*need_update_attn_mask=*/false,
+      /*is_hybrid_linear_attention=*/true);
+
+  ModelInputParams params;
+  params.is_spec_verify = true;
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.meta.num_sequences = kBatchSize;
+  params.meta.q_max_seq_len = kSpecWidth;
+  params.attention.host.q_seq_lens.assign(kBatchSize, kSpecWidth);
+  params.attention.host.kv_seq_lens.assign(kBatchSize, 32);
+  params.attention.device.q_seq_lens =
+      torch::full({kBatchSize}, kSpecWidth, int_options);
+  params.attention.device.kv_seq_lens =
+      torch::full({kBatchSize}, 32, int_options);
+  params.attention.device.new_cache_slots =
+      torch::arange(kActualTokens, int_options);
+  params.attention.device.block_tables =
+      torch::zeros({kBatchSize, kBlockTableWidth}, int_options);
+  params.graph.use_expanded_decode_for_spec_verify_attention = true;
+  params.graph.expanded_kv_seq_lens =
+      torch::full({kActualTokens}, 32, int_options);
+  params.graph.expanded_kv_seq_lens_vec.assign(kActualTokens, 32);
+  params.graph.expanded_block_tables =
+      torch::zeros({kActualTokens, kBlockTableWidth}, int_options);
+
+  const auto tokens = torch::arange(kActualTokens, int_options);
+  const auto positions = torch::arange(kActualTokens, int_options);
+  std::optional<ModelInputParams> capture_params;
+  EXPECT_NO_THROW(capture_params =
+                      persistent_param.update(tokens,
+                                              torch::Tensor(),
+                                              torch::Tensor(),
+                                              positions,
+                                              params,
+                                              kBucketTokens,
+                                              /*return_capture_params=*/true));
+  ASSERT_TRUE(capture_params.has_value());
+  EXPECT_EQ(capture_params->meta.num_sequences, 7);
+  EXPECT_EQ(capture_params->attention.device.q_seq_lens.size(0), 7);
+  EXPECT_EQ(capture_params->attention.device.block_tables.size(0), 7);
+  EXPECT_EQ(capture_params->graph.expanded_kv_seq_lens.numel(), kBucketTokens);
+  EXPECT_EQ(capture_params->graph.expanded_block_tables.size(0), kBucketTokens);
 
   speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
 }
@@ -1072,17 +1151,17 @@ TEST(AclGraphPersistentParamTest,
   params.meta.num_sequences = 1;
   params.meta.q_max_seq_len = kSpecWidth;
   params.attention.host.q_seq_lens = {kSpecWidth};
-  params.attention.host.kv_seq_lens = {20};
+  params.attention.host.kv_seq_lens = {8};
   params.attention.device.q_seq_lens = torch::tensor({kSpecWidth}, int_options);
-  params.attention.device.kv_seq_lens = torch::tensor({20}, int_options);
+  params.attention.device.kv_seq_lens = torch::tensor({8}, int_options);
   params.attention.device.new_cache_slots =
       torch::arange(kSpecWidth, int_options);
   params.attention.device.block_tables =
       torch::zeros({1, kActiveBlockTableWidth}, int_options);
   params.graph.use_expanded_decode_for_spec_verify_attention = true;
   params.graph.expanded_kv_seq_lens =
-      torch::tensor({15, 16, 17, 18, 19, 20}, int_options);
-  params.graph.expanded_kv_seq_lens_vec = {15, 16, 17, 18, 19, 20};
+      torch::tensor({3, 4, 5, 6, 7, 8}, int_options);
+  params.graph.expanded_kv_seq_lens_vec = {3, 4, 5, 6, 7, 8};
   params.graph.expanded_block_tables =
       torch::zeros({kSpecWidth, kActiveBlockTableWidth}, int_options);
 
@@ -1143,13 +1222,13 @@ TEST(AclGraphPersistentParamTest, AuxHiddenStatesUseGraphTokenCapacity) {
 
   ::xllm::npu::GraphPersistentParam target_param(args, device, options);
   target_param.set_aux_hidden_states(aux_hidden_states);
-  EXPECT_EQ(target_param.aux_hidden_states().size(0), 30);
+  EXPECT_EQ(target_param.aux_hidden_states().size(0), 32);
 
   options.is_draft_engine(true);
   ::xllm::npu::GraphPersistentParam draft_param(args, device, options);
   draft_param.set_aux_hidden_states(aux_hidden_states.slice(
       /*dim=*/0, /*start=*/0, /*end=*/options.max_seqs_per_batch()));
-  EXPECT_EQ(draft_param.aux_hidden_states().size(0), 10);
+  EXPECT_EQ(draft_param.aux_hidden_states().size(0), 16);
 
   speculative_config.enable_atb_spec_kernel(original_enable_atb_spec_kernel);
 }
