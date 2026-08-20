@@ -56,6 +56,36 @@ void causal_conv1d_out(const torch::Tensor& output,
                output);
 }
 
+void causal_conv1d_graph_a5_out(const torch::Tensor& output,
+                                const torch::Tensor& x,
+                                const torch::Tensor& weight,
+                                const torch::Tensor& conv_state,
+                                const std::optional<torch::Tensor>& bias_opt,
+                                const torch::Tensor& cache_indices,
+                                int64_t activation_mode,
+                                int64_t pad_slot_id) {
+  check_tensor(output, "output", "causal_conv1d_graph_a5");
+  check_tensor(x, "x", "causal_conv1d_graph_a5");
+  check_tensor(weight, "weight", "causal_conv1d_graph_a5");
+  check_tensor(conv_state, "conv_state", "causal_conv1d_graph_a5");
+  check_tensor(cache_indices, "cache_indices", "causal_conv1d_graph_a5");
+
+  c10::optional<torch::Tensor> bias_tensor = c10::nullopt;
+  if (bias_opt.has_value() && bias_opt.value().defined()) {
+    bias_tensor = bias_opt.value();
+  }
+
+  EXEC_NPU_CMD(aclnnCausalConv1dGraphA5,
+               x,
+               weight,
+               bias_tensor,
+               conv_state,
+               cache_indices,
+               activation_mode,
+               pad_slot_id,
+               output);
+}
+
 torch::Tensor causal_conv1d(const torch::Tensor& x,
                             const torch::Tensor& weight,
                             const torch::Tensor& conv_state,

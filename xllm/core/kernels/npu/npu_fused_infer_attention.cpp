@@ -151,6 +151,91 @@ std::optional<torch::Tensor> to_optional_tensor(
 
 namespace xllm::kernel::npu {
 
+void npu_flash_attention_score_v4_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& attention_mask,
+    int64_t num_heads,
+    double scale,
+    torch::Tensor& output) {
+  check_tensor(query, "query", "npu_flash_attention_score_v4_out");
+  check_tensor(key, "key", "npu_flash_attention_score_v4_out");
+  check_tensor(value, "value", "npu_flash_attention_score_v4_out");
+  CHECK_EQ(query.dim(), 4);
+  CHECK_EQ(key.dim(), 4);
+  CHECK_EQ(value.dim(), 4);
+  CHECK_EQ(query.size(0), key.size(0));
+  CHECK_EQ(key.sizes(), value.sizes());
+  CHECK_EQ(query.size(1), num_heads);
+  CHECK_EQ(output.sizes(), query.sizes());
+
+  const std::optional<torch::Tensor> none_tensor = std::nullopt;
+  const std::optional<torch::IntArrayRef> none_int_array = std::nullopt;
+  const std::optional<torch::Tensor> mask = to_optional_tensor(attention_mask);
+  torch::Tensor softmax_max =
+      torch::empty({query.size(0), num_heads, query.size(2), 8},
+                   query.options().dtype(torch::kFloat32));
+  torch::Tensor softmax_sum = torch::empty_like(softmax_max);
+  torch::Tensor softmax_out = torch::empty({0}, query.options());
+
+  std::string input_layout = "BNSD";
+  char* input_layout_ptr = const_cast<char*>(input_layout.c_str());
+  std::string softmax_layout;
+  char* softmax_layout_ptr = const_cast<char*>(softmax_layout.c_str());
+  double keep_prob = 1.0;
+  int64_t pre_tokens = kSwaIntMax;
+  int64_t next_tokens = kSwaIntMax;
+  int64_t inner_precise = 0;
+  int64_t sparse_mode = 0;
+  CHECK(query.scalar_type() == torch::kBFloat16 ||
+        query.scalar_type() == torch::kFloat16)
+      << "FlashAttentionScoreV4 graph path supports BF16/FP16 only";
+  // FlashAttentionScoreV4 uses its own output dtype attribute encoding:
+  // 0 = FLOAT16, 1 = BFLOAT16 (not aclDataType values).
+  int64_t out_dtype = query.scalar_type() == torch::kBFloat16 ? 1 : 0;
+  int64_t pse_type = 1;
+  int64_t seed = 0;
+  int64_t offset = 0;
+
+  EXEC_NPU_CMD(aclnnFlashAttentionScoreV4,
+               query,
+               key,
+               value,
+               none_tensor,  // real_shift
+               none_tensor,  // drop_mask
+               none_tensor,  // padding_mask
+               mask,
+               none_tensor,  // query_rope
+               none_tensor,  // key_rope
+               none_tensor,  // d_scale_q
+               none_tensor,  // d_scale_k
+               none_tensor,  // d_scale_v
+               none_tensor,  // sink
+               none_int_array,
+               none_int_array,
+               none_int_array,
+               none_int_array,
+               none_int_array,
+               scale,
+               keep_prob,
+               pre_tokens,
+               next_tokens,
+               num_heads,
+               input_layout_ptr,
+               inner_precise,
+               sparse_mode,
+               out_dtype,
+               pse_type,
+               softmax_layout_ptr,
+               seed,
+               offset,
+               softmax_max,
+               softmax_sum,
+               softmax_out,
+               output);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
     const torch::Tensor& query,
     const torch::Tensor& key,
@@ -180,18 +265,67 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
   torch::Tensor softmax_lse =
       infer_softmax_lse(query, num_heads, input_layout, softmax_lse_flag);
 
+  npu_fused_infer_attention_out(query,
+                                key,
+                                value,
+                                atten_mask,
+                                block_table,
+                                actual_seq_lengths,
+                                actual_seq_lengths_kv,
+                                num_heads,
+                                num_key_value_heads,
+                                scale,
+                                block_size,
+                                sparse_mode,
+                                input_layout,
+                                softmax_lse_flag,
+                                is_causal,
+                                output,
+                                softmax_lse);
+
+  return {output, softmax_lse};
+}
+
+void npu_fused_infer_attention_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag,
+    bool is_causal,
+    torch::Tensor& output,
+    torch::Tensor& softmax_lse) {
+  check_tensor(query, "query", "npu_fused_infer_attention_out");
+  check_tensor(key, "key", "npu_fused_infer_attention_out");
+  check_tensor(value, "value", "npu_fused_infer_attention_out");
+  CHECK_GT(num_heads, 0) << "num_heads must be positive";
+  CHECK(!actual_seq_lengths.empty()) << "actual_seq_lengths must not be empty";
+  CHECK(!actual_seq_lengths_kv.empty())
+      << "actual_seq_lengths_kv must not be empty";
+  CHECK(output.defined()) << "output must be preallocated";
+  CHECK(softmax_lse.defined()) << "softmax_lse must be preallocated";
+
   if (is_ascend950() && input_layout == "TND" && !block_table.has_value()) {
     CHECK(!softmax_lse_flag)
         << "Ascend950 torch attention fallback does not return softmax_lse";
-    output = ascend950_packed_causal_attention(query,
-                                               key,
-                                               value,
-                                               actual_seq_lengths,
-                                               actual_seq_lengths_kv,
-                                               num_heads,
-                                               num_key_value_heads,
-                                               scale);
-    return {output, softmax_lse};
+    output.copy_(ascend950_packed_causal_attention(query,
+                                                   key,
+                                                   value,
+                                                   actual_seq_lengths,
+                                                   actual_seq_lengths_kv,
+                                                   num_heads,
+                                                   num_key_value_heads,
+                                                   scale));
+    return;
   }
 
   std::vector<torch::Tensor> key_tensors_vec{key};
@@ -216,11 +350,69 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
   std::string layout = input_layout;
   char* input_layout_ptr = const_cast<char*>(layout.c_str());
   int64_t pre_tokens = kSwaIntMax;
-  int64_t next_tokens = is_causal ? 0 : kSwaIntMax;
+  // Paged decode queries represent the newest token. Even though the
+  // one-token attention call does not need a causal mask tensor, FIA must not
+  // expose unwritten positions from the tail of the current KV block.
+  int64_t next_tokens = 0;
   int64_t inner_precise = 0;
   int64_t antiquant_mode = 0;
   int64_t key_antiquant_mode = 0;
   int64_t value_antiquant_mode = 0;
+  int64_t query_quant_mode = 0;
+  int64_t pse_type = 0;
+
+  if (is_ascend950()) {
+    EXEC_NPU_CMD(aclnnFusedInferAttentionScoreV5,
+                 query,
+                 key_tensors,
+                 value_tensors,
+                 none_tensor,  // pse_shift
+                 atten_mask_tensor,
+                 actual_seq_lengths_opt,
+                 actual_seq_lengths_kv_opt,
+                 none_tensor,  // dequant_scale1
+                 none_tensor,  // quant_scale1
+                 none_tensor,  // dequant_scale2
+                 none_tensor,  // quant_scale2
+                 none_tensor,  // quant_offset2
+                 none_tensor,  // antiquant_scale
+                 none_tensor,  // antiquant_offset
+                 block_table_tensor,
+                 none_tensor,     // query_padding_size
+                 none_tensor,     // kv_padding_size
+                 none_tensor,     // key_antiquant_scale
+                 none_tensor,     // key_antiquant_offset
+                 none_tensor,     // value_antiquant_scale
+                 none_tensor,     // value_antiquant_offset
+                 none_tensor,     // key_shared_prefix
+                 none_tensor,     // value_shared_prefix
+                 none_int_array,  // actual_shared_prefix_len
+                 none_tensor,     // query_rope
+                 none_tensor,     // key_rope
+                 none_tensor,     // key_rope_antiquant_scale
+                 none_tensor,     // dequant_scale_query
+                 none_tensor,     // learnable_sink
+                 none_int_array,  // q_start_idx
+                 none_int_array,  // kv_start_idx
+                 num_heads,
+                 scale,
+                 pre_tokens,
+                 next_tokens,
+                 input_layout_ptr,
+                 num_key_value_heads,
+                 sparse_mode,
+                 inner_precise,
+                 block_size,
+                 antiquant_mode,
+                 softmax_lse_flag,
+                 key_antiquant_mode,
+                 value_antiquant_mode,
+                 query_quant_mode,
+                 pse_type,
+                 output,
+                 softmax_lse);
+    return;
+  }
 
   EXEC_NPU_CMD(aclnnFusedInferAttentionScoreV3,
                query,
@@ -265,8 +457,6 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
                value_antiquant_mode,
                output,
                softmax_lse);
-
-  return {output, softmax_lse};
 }
 
 }  // namespace xllm::kernel::npu

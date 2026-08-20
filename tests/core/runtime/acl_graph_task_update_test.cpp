@@ -19,6 +19,7 @@ limitations under the License.
 #include <torch/torch.h>
 #include <torch_npu/torch_npu.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
 #include <vector>
@@ -33,6 +34,8 @@ limitations under the License.
 #include "core/framework/request/sequence.h"
 #include "core/framework/request/stopping_checker.h"
 #include "core/framework/sampling/sampling_params.h"
+#include "core/kernels/npu/npu_ops_api.h"
+#include "core/kernels/npu/utils.h"
 #include "core/kernels/ops_api.h"
 #include "core/layers/npu/npu_lm_head_impl.h"
 #include "core/layers/npu/npu_word_embedding_impl.h"
@@ -92,6 +95,7 @@ constexpr int64_t kMaxSeqLen = 256;
 constexpr int64_t kVocabSize = 1000;
 constexpr int64_t kNumBlocks = 100;
 constexpr int64_t kBlockSize = 4;
+constexpr int64_t kLinearLayerCount = 48;
 
 constexpr torch::ScalarType kDtype = torch::kFloat16;
 
@@ -108,7 +112,8 @@ class HybridConv1dMockLM final : public CausalLM {
     conv_weight_ =
         register_parameter("conv_weight",
                            torch::randn({kConvKernelSize, kConvChannels},
-                                        torch::dtype(kDtype).device(device)));
+                                        torch::dtype(kDtype).device(device)) *
+                               0.05);
 
     token_embedding_table_ =
         register_parameter("token_embedding",
@@ -136,9 +141,18 @@ class HybridConv1dMockLM final : public CausalLM {
     const bool register_graph_task =
         graph_context != nullptr && graph_context->capturing;
 
+    int64_t linear_layer_limit = kLinearLayerCount;
+    if (const char* value = std::getenv("XLLM_TEST_LINEAR_LAYER_COUNT")) {
+      linear_layer_limit = std::clamp<int64_t>(
+          std::strtoll(value, nullptr, 10), 1, kLinearLayerCount);
+    }
+    int64_t linear_layer = 0;
     for (auto& kv_cache : kv_caches) {
       if (kv_cache.empty() || !kv_cache.get_conv_cache().defined()) {
         continue;
+      }
+      if (linear_layer++ >= linear_layer_limit) {
+        break;
       }
       torch::Tensor conv_cache = kv_cache.get_conv_cache();
       torch::Tensor conv_input =
@@ -158,41 +172,60 @@ class HybridConv1dMockLM final : public CausalLM {
                                 : npu::CausalConv1dGraphBranch::kDecode;
 
         torch::Tensor conv_output = torch::empty_like(conv_input);
-        c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
-        auto event = std::make_shared<c10_npu::NPUEvent>(ACL_EVENT_EXTERNAL);
-        event->block(stream);
-        event->reset(stream);
+        const bool force_legacy_graph_task =
+            std::getenv("XLLM_TEST_CAUSAL_CONV_LEGACY_GRAPH_TASK") != nullptr;
+        if (!is_spec_verify && xllm::kernel::npu::is_ascend950() &&
+            !force_legacy_graph_task) {
+          CHECK(params.embedding.linear_state_indices.defined());
+          auto cache_indices_tensor =
+              params.embedding.linear_state_indices.to(torch::kInt64)
+                  .contiguous();
+          xllm::kernel::npu::causal_conv1d_graph_a5_out(
+              conv_output,
+              conv_input,
+              conv_weight_,
+              conv_cache,
+              std::nullopt,
+              cache_indices_tensor,
+              npu::kCausalConv1dActivationSilu,
+              npu::kCausalConv1dGraphPadSlotId);
+        } else {
+          c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
+          auto event = std::make_shared<c10_npu::NPUEvent>(ACL_EVENT_EXTERNAL);
+          event->block(stream);
+          event->reset(stream);
 
-        c10_npu::graph_task_group_begin(stream);
-        xllm::kernel::causal_conv1d_out(
-            conv_output,
-            conv_input,
-            conv_weight_,
-            conv_cache,
-            std::optional<torch::Tensor>(),
-            torch::IntArrayRef(params.parallel.query_start_loc),
-            torch::IntArrayRef(cache_indices),
-            torch::IntArrayRef(empty_host_args),
-            torch::IntArrayRef(nat_ref),
-            /*activation_mode=*/npu::kCausalConv1dActivationSilu,
-            /*pad_slot_id=*/npu::kCausalConv1dGraphPadSlotId,
-            /*run_mode=*/npu::kCausalConv1dRunModeUpdate);
-        c10_npu::NPUTaskGroupHandle handle =
-            c10_npu::graph_task_group_end(stream);
+          c10_npu::graph_task_group_begin(stream);
+          xllm::kernel::causal_conv1d_out(
+              conv_output,
+              conv_input,
+              conv_weight_,
+              conv_cache,
+              std::optional<torch::Tensor>(),
+              torch::IntArrayRef(params.parallel.query_start_loc),
+              torch::IntArrayRef(cache_indices),
+              torch::IntArrayRef(empty_host_args),
+              torch::IntArrayRef(nat_ref),
+              /*activation_mode=*/npu::kCausalConv1dActivationSilu,
+              /*pad_slot_id=*/npu::kCausalConv1dGraphPadSlotId,
+              /*run_mode=*/npu::kCausalConv1dRunModeUpdate);
+          c10_npu::NPUTaskGroupHandle handle =
+              c10_npu::graph_task_group_end(stream);
 
-        npu::CausalConv1dGraphTask task;
-        task.output = conv_output;
-        task.x = conv_input;
-        task.weight = conv_weight_;
-        task.conv_state = conv_cache;
-        task.bias = std::nullopt;
-        task.activation_mode = npu::kCausalConv1dActivationSilu;
-        task.pad_slot_id = npu::kCausalConv1dGraphPadSlotId;
-        task.run_mode = npu::kCausalConv1dRunModeUpdate;
-        task.branch = branch;
-        task.handle = handle;
-        task.event = std::move(event);
-        graph_context->causal_conv1d_tasks.emplace_back(std::move(task));
+          npu::CausalConv1dGraphTask task;
+          task.output = conv_output;
+          task.x = conv_input;
+          task.weight = conv_weight_;
+          task.conv_state = conv_cache;
+          task.bias = std::nullopt;
+          task.activation_mode = npu::kCausalConv1dActivationSilu;
+          task.pad_slot_id = npu::kCausalConv1dGraphPadSlotId;
+          task.run_mode = npu::kCausalConv1dRunModeUpdate;
+          task.branch = branch;
+          task.handle = handle;
+          task.event = std::move(event);
+          graph_context->causal_conv1d_tasks.emplace_back(std::move(task));
+        }
 
         auto conv_proj =
             torch::zeros({num_tokens, kHiddenSize}, conv_input.options());
@@ -200,26 +233,44 @@ class HybridConv1dMockLM final : public CausalLM {
         hidden = hidden + conv_proj;
       } else {
         torch::Tensor conv_output = torch::empty_like(conv_input);
-        xllm::kernel::causal_conv1d_out(
-            conv_output,
-            conv_input,
-            conv_weight_,
-            conv_cache,
-            std::optional<torch::Tensor>(),
-            torch::IntArrayRef(params.parallel.query_start_loc),
-            torch::IntArrayRef(cache_indices),
-            torch::IntArrayRef(empty_host_args),
-            torch::IntArrayRef(nat_ref),
-            /*activation_mode=*/npu::kCausalConv1dActivationSilu,
-            /*pad_slot_id=*/npu::kCausalConv1dGraphPadSlotId,
-            /*run_mode=*/npu::kCausalConv1dRunModeUpdate);
+        const bool force_graph_a5_eager =
+            std::getenv("XLLM_TEST_CAUSAL_CONV_GRAPH_A5_EAGER") != nullptr;
+        if (!is_spec_verify && force_graph_a5_eager &&
+            xllm::kernel::npu::is_ascend950()) {
+          CHECK(params.embedding.linear_state_indices.defined());
+          auto cache_indices_tensor =
+              params.embedding.linear_state_indices.to(torch::kInt64)
+                  .contiguous();
+          xllm::kernel::npu::causal_conv1d_graph_a5_out(
+              conv_output,
+              conv_input,
+              conv_weight_,
+              conv_cache,
+              std::nullopt,
+              cache_indices_tensor,
+              npu::kCausalConv1dActivationSilu,
+              npu::kCausalConv1dGraphPadSlotId);
+        } else {
+          xllm::kernel::causal_conv1d_out(
+              conv_output,
+              conv_input,
+              conv_weight_,
+              conv_cache,
+              std::optional<torch::Tensor>(),
+              torch::IntArrayRef(params.parallel.query_start_loc),
+              torch::IntArrayRef(cache_indices),
+              torch::IntArrayRef(empty_host_args),
+              torch::IntArrayRef(nat_ref),
+              /*activation_mode=*/npu::kCausalConv1dActivationSilu,
+              /*pad_slot_id=*/npu::kCausalConv1dGraphPadSlotId,
+              /*run_mode=*/npu::kCausalConv1dRunModeUpdate);
+        }
 
         auto conv_proj =
             torch::zeros({num_tokens, kHiddenSize}, conv_input.options());
         conv_proj.slice(/*dim=*/1, 0, kConvChannels).copy_(conv_output);
         hidden = hidden + conv_proj;
       }
-      break;
     }
 
     hidden = linear_->forward(hidden);
@@ -320,13 +371,15 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
 
   std::vector<KVCache> create_hybrid_kv_caches() {
     std::vector<KVCache> kv_caches;
-    auto conv_cache =
-        torch::zeros({kNumBlocks, kConvKernelSize - 1, kConvChannels},
-                     torch::dtype(kDtype).device(*device_));
-    auto ssm_cache = torch::zeros({kNumBlocks, 8, 64, 64},
-                                  torch::dtype(kDtype).device(*device_));
-    kv_caches.emplace_back(
-        LinearAttentionKVCacheTensors{conv_cache, ssm_cache});
+    for (int64_t layer = 0; layer < kLinearLayerCount; ++layer) {
+      auto conv_cache =
+          torch::zeros({kNumBlocks, kConvKernelSize - 1, kConvChannels},
+                       torch::dtype(kDtype).device(*device_));
+      auto ssm_cache = torch::zeros({kNumBlocks, 8, 64, 64},
+                                    torch::dtype(kDtype).device(*device_));
+      kv_caches.emplace_back(
+          LinearAttentionKVCacheTensors{conv_cache, ssm_cache});
+    }
 
     auto k_cache = torch::randn({kNumBlocks, kBlockSize * kHiddenSize},
                                 torch::dtype(kDtype).device(*device_));
@@ -337,10 +390,15 @@ class AclGraphTaskUpdateTest : public ::testing::Test {
 
   std::vector<KVCache> clone_kv_caches(const std::vector<KVCache>& src) {
     std::vector<KVCache> cloned;
-    cloned.emplace_back(LinearAttentionKVCacheTensors{
-        src[0].get_conv_cache().clone(), src[0].get_ssm_cache().clone()});
-    cloned.emplace_back(KVCacheTensors{src[1].get_k_cache().clone(),
-                                       src[1].get_v_cache().clone()});
+    for (const auto& cache : src) {
+      if (cache.get_conv_cache().defined()) {
+        cloned.emplace_back(LinearAttentionKVCacheTensors{
+            cache.get_conv_cache().clone(), cache.get_ssm_cache().clone()});
+      } else {
+        cloned.emplace_back(KVCacheTensors{cache.get_k_cache().clone(),
+                                           cache.get_v_cache().clone()});
+      }
+    }
     return cloned;
   }
 
@@ -515,11 +573,33 @@ TEST_F(AclGraphTaskUpdateTest, CaptureReplayVsEagerDecodeBranch) {
                                    {forward_input.input_params});
 
   EXPECT_EQ(eager_out.hidden_states.sizes(), graph_out.hidden_states.sizes());
+  const auto hidden_diff = (eager_out.hidden_states.to(torch::kFloat32) -
+                            graph_out.hidden_states.to(torch::kFloat32))
+                               .abs();
+  for (size_t layer = 0; layer < std::min(kv_eager.size(), kv_graph.size());
+       ++layer) {
+    const auto eager_conv = kv_eager[layer].get_conv_cache();
+    const auto graph_conv = kv_graph[layer].get_conv_cache();
+    if (!eager_conv.defined() || !graph_conv.defined()) {
+      continue;
+    }
+    const float max_conv_diff =
+        (eager_conv.to(torch::kFloat32) - graph_conv.to(torch::kFloat32))
+            .abs()
+            .max()
+            .item<float>();
+    if (max_conv_diff != 0.0f) {
+      LOG(ERROR) << "Decode branch first conv-state mismatch: layer=" << layer
+                 << " max_abs=" << max_conv_diff;
+      break;
+    }
+  }
   EXPECT_TRUE(torch::allclose(eager_out.hidden_states.to(torch::kFloat32),
                               graph_out.hidden_states.to(torch::kFloat32),
                               /*rtol=*/1e-2,
                               /*atol=*/1e-2))
-      << "Decode branch: eager vs graph mismatch";
+      << "Decode branch: eager vs graph mismatch, max_abs="
+      << hidden_diff.max().item<float>();
 }
 
 TEST_F(AclGraphTaskUpdateTest,

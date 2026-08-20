@@ -24,6 +24,7 @@ limitations under the License.
 #include <tuple>
 
 #include "xllm/core/kernels/npu/npu_ops_api.h"
+#include "xllm/core/kernels/npu/utils.h"
 #include "xllm/core/kernels/ops_api.h"
 #include "xllm/core/platform/npu/acl_graph_task_update_context.h"
 
@@ -643,6 +644,15 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       local_v_heads == 4 || local_v_heads == 6 || local_v_heads == 8 ||
       local_v_heads == 12 || local_v_heads == 16 || local_v_heads == 24 ||
       local_v_heads == 32 || local_v_heads == 48 || local_v_heads == 64;
+  // PR #41's Ascend950 synchronization path is used only for the head shapes
+  // that pass the A5 prefill accuracy matrix.  V1/K1 and V3/K1 can expose
+  // stale state, while V64/K16 exceeds the verified intra-block schedule and
+  // produces an inaccurate output.  Keep those shapes on the existing
+  // unfused path.  A2/A3 retain their complete prefill-superkernel routing
+  // table.
+  const bool supported_prefill_super_op_soc_shape =
+      !xllm::kernel::npu::is_ascend950() ||
+      (local_v_heads != 1 && local_v_heads != 3 && local_v_heads != 64);
   bool used_direct_prefill_qkv = false;
 
   torch::Tensor conv_cache = kv_cache.get_conv_cache();
@@ -742,6 +752,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       packed_prefill_tokens <= 2048 && supported_qwen35_tp &&
       num_k_heads_ % tp_size_ == 0 && num_v_heads_ % tp_size_ == 0 &&
       local_q_heads > 0 && supported_prefill_super_op_heads &&
+      supported_prefill_super_op_soc_shape &&
       local_v_heads % local_q_heads == 0 && head_k_dim_ == 128 &&
       head_v_dim_ == 128 && std::abs(norm_->eps() - 1e-6) < 1e-12 &&
       logical_state_read_indices.dim() == 1 &&
@@ -789,6 +800,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       linear_state_read_base_indices.is_contiguous() &&
       linear_state_base_indices.is_contiguous() &&
       logical_state_indices.is_contiguous()) {
+    LOG_FIRST_N(INFO, 1) << "Using MegaGdnPrefillOp rank=" << rank_
+                         << " batch_size=" << batch_size
+                         << " packed_tokens=" << packed_prefill_tokens
+                         << " local_q_heads=" << local_q_heads
+                         << " local_v_heads=" << local_v_heads;
     const bool debug_hash_e2e =
         std::getenv("XLLM_DEBUG_HASH_MEGA_GDN_PREFILL") != nullptr;
     static thread_local int64_t debug_e2e_call = 0;
@@ -1018,6 +1034,43 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     const std::vector<int64_t> linear_state_indices_host(
         input_params.embedding.linear_state_ids.begin(),
         input_params.embedding.linear_state_ids.end());
+    auto run_causal_conv1d_decode = [&]() -> torch::Tensor {
+      // The generated TileLang causal-conv decode kernel is not compatible
+      // with Ascend950. Use the custom ACLNN implementation on A5 while
+      // preserving the existing A2/A3 path byte-for-byte below.
+      if (xllm::kernel::npu::is_ascend950()) {
+        const std::vector<int64_t> empty_initial_state_mode;
+        const std::vector<int64_t> empty_num_accepted_tokens;
+        return xllm::kernel::causal_conv1d(
+            conv_input,
+            conv_weight,
+            conv_cache,
+            std::optional<torch::Tensor>(),
+            torch::IntArrayRef(input_params.parallel.query_start_loc),
+            torch::IntArrayRef(linear_state_indices_host),
+            torch::IntArrayRef(empty_initial_state_mode),
+            torch::IntArrayRef(empty_num_accepted_tokens),
+            xllm::npu::kCausalConv1dActivationSilu,
+            xllm::npu::kCausalConv1dGraphPadSlotId,
+            xllm::npu::kCausalConv1dRunModeUpdate);
+      }
+
+      auto conv_input_2d = conv_input.dim() == 3
+                               ? conv_input.reshape({-1, conv_input.size(-1)})
+                               : conv_input;
+      xllm::kernel::CausalConv1dUpdateParams conv1d_params;
+      conv1d_params.x = conv_input_2d;
+      conv1d_params.conv_state = conv_cache;
+      conv1d_params.weight = conv_weight;
+      conv1d_params.conv_state_indices = logical_state_indices;
+      conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
+      conv1d_params.max_query_len = attn_metadata.max_query_len;
+      auto output = xllm::kernel::causal_conv1d_update(conv1d_params);
+      if (conv_input.dim() == 3) {
+        output = output.view({conv_input.size(0), -1, output.size(-1)});
+      }
+      return output;
+    };
     if (register_conv1d_graph_update) {
       if (use_spec_verify) {
         const auto conv1d_branch =
@@ -1032,22 +1085,36 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             linear_state_indices_host,
             num_accepted,
             conv1d_branch);
+      } else if (xllm::kernel::npu::is_ascend950()) {
+        // This A5-only decode op consumes persistent slot IDs on device. Its
+        // host tiling depends only on shape, so replay does not require one
+        // updateable IntArray task group per GDN layer.
+        CHECK(conv_input.dim() == 2 ||
+              (conv_input.dim() == 3 && conv_input.size(1) == 1))
+            << "A5 graph causal_conv1d decode expects [batch, dim] or "
+               "[batch, 1, dim] input";
+        auto graph_conv_input =
+            conv_input.dim() == 3
+                ? conv_input.reshape({-1, conv_input.size(-1)})
+                : conv_input;
+        CHECK_EQ(graph_conv_input.size(0), logical_state_indices.numel())
+            << "A5 graph causal_conv1d slot IDs must match decode rows";
+        auto cache_indices_tensor =
+            logical_state_indices.to(torch::kInt64).contiguous();
+        torch::Tensor output = torch::empty_like(graph_conv_input);
+        xllm::kernel::npu::causal_conv1d_graph_a5_out(
+            output,
+            graph_conv_input,
+            conv_weight,
+            conv_cache,
+            std::nullopt,
+            cache_indices_tensor,
+            xllm::npu::kCausalConv1dActivationSilu,
+            xllm::npu::kCausalConv1dGraphPadSlotId);
+        mixed_qkv =
+            conv_input.dim() == 3 ? output.view(conv_input.sizes()) : output;
       } else {
-        auto conv_input_2d = conv_input.dim() == 3
-                                 ? conv_input.reshape({-1, conv_input.size(-1)})
-                                 : conv_input;
-        xllm::kernel::CausalConv1dUpdateParams conv1d_params;
-        conv1d_params.x = conv_input_2d;
-        conv1d_params.conv_state = conv_cache;
-        conv1d_params.weight = conv_weight;
-        conv1d_params.conv_state_indices = logical_state_indices;
-        conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
-        conv1d_params.max_query_len = attn_metadata.max_query_len;
-        mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);
-        if (conv_input.dim() == 3) {
-          mixed_qkv =
-              mixed_qkv.view({conv_input.size(0), -1, mixed_qkv.size(-1)});
-        }
+        mixed_qkv = run_causal_conv1d_decode();
       }
     } else {
       if (use_spec_verify) {
@@ -1067,21 +1134,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             xllm::npu::kCausalConv1dRunModeUpdate);
         mixed_qkv = output;
       } else {
-        auto conv_input_2d = conv_input.dim() == 3
-                                 ? conv_input.reshape({-1, conv_input.size(-1)})
-                                 : conv_input;
-        xllm::kernel::CausalConv1dUpdateParams conv1d_params;
-        conv1d_params.x = conv_input_2d;
-        conv1d_params.conv_state = conv_cache;
-        conv1d_params.weight = conv_weight;
-        conv1d_params.conv_state_indices = logical_state_indices;
-        conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
-        conv1d_params.max_query_len = attn_metadata.max_query_len;
-        mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);
-        if (conv_input.dim() == 3) {
-          mixed_qkv =
-              mixed_qkv.view({conv_input.size(0), -1, mixed_qkv.size(-1)});
-        }
+        mixed_qkv = run_causal_conv1d_decode();
       }
     }
     mixed_qkv = reshape_projected_tokens_with_pad(attn_metadata, mixed_qkv);
@@ -1092,7 +1145,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       checkpoint_stride == 1;
   // Compute gated delta net decay and beta terms.
   if (use_spec_verify || attn_metadata.is_chunked_prefill ||
-      checkpoint_stride > 1) {
+      checkpoint_stride > 1 || xllm::kernel::npu::is_ascend950()) {
+    // The generated A5 gating/update AOT kernels are not reliable on the
+    // current Ascend950 runtime. Keep A2/A3 on their fused path and preserve
+    // the explicit FP32 softplus formulation for both A5 prefill and decode.
     beta = torch::sigmoid(b);
     torch::Tensor A_log_exp = A_log_.exp();
     torch::Tensor a_float = a.to(torch::kFloat32);
@@ -1273,7 +1329,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
                                        : last_recurrent_state.transpose(-1, -2);
     ssm_cache.index_put_({linear_state_base_indices},
                          state_to_store.to(ssm_cache.dtype()));
-  } else if (checkpoint_stride > 1) {
+  } else if (checkpoint_stride > 1 || xllm::kernel::npu::is_ascend950()) {
     auto ssm_state =
         torch::index_select(ssm_cache, 0, linear_state_base_indices);
     if (!fla_ssm_state_layout) {

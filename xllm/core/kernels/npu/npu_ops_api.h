@@ -51,6 +51,17 @@ void batch_decode(const torch::Tensor& query,
                   const torch::Tensor& seq_lens,
                   torch::Tensor& output);
 
+// Graph-safe FlashAttentionScoreV4 with caller-owned outputs. The mask follows
+// ACLNN semantics: true entries are excluded from attention.
+void npu_flash_attention_score_v4_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& attention_mask,
+    int64_t num_heads,
+    double scale,
+    torch::Tensor& output);
+
 void apply_rotary(torch::Tensor& query,
                   torch::Tensor& key,
                   const torch::Tensor& cos,
@@ -73,6 +84,25 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
     const std::string& input_layout,
     bool softmax_lse_flag = false,
     bool is_causal = true);
+
+void npu_fused_infer_attention_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag,
+    bool is_causal,
+    torch::Tensor& output,
+    torch::Tensor& softmax_lse);
 
 void batch_chunked_paged_prefill(const torch::Tensor& query,
                                  const torch::Tensor& k_cache,
@@ -435,6 +465,17 @@ void causal_conv1d_out(const torch::Tensor& output,
                        int64_t activation_mode,
                        int64_t pad_slot_id,
                        int64_t run_mode);
+
+// Ascend950 decode-only variant for ACL graph capture/replay. cache_indices is
+// consumed on device and is deliberately not a host value-dependent input.
+void causal_conv1d_graph_a5_out(const torch::Tensor& output,
+                                const torch::Tensor& x,
+                                const torch::Tensor& weight,
+                                const torch::Tensor& conv_state,
+                                const std::optional<torch::Tensor>& bias_opt,
+                                const torch::Tensor& cache_indices,
+                                int64_t activation_mode,
+                                int64_t pad_slot_id);
 
 bool has_mega_moe();
 

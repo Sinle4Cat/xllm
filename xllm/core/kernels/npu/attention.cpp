@@ -38,6 +38,44 @@ void ascend950_paged_attention(const torch::Tensor& query,
   CHECK_EQ(seq_lens.numel(), batch_size);
   CHECK_EQ(block_table.size(0), batch_size);
 
+  // ACL graph replay updates block_table and seq_lens in place. Keep every
+  // operation device-side and make tensor shapes depend only on the graph's
+  // block-table-width bucket so replay remains correct for changing KV lengths.
+  if (!seq_lens.device().is_cpu()) {
+    const int64_t num_blocks = block_table.size(1);
+    const int64_t max_seq_len = num_blocks * block_size;
+    torch::Tensor block_indices = block_table.reshape({-1}).to(torch::kLong);
+    torch::Tensor key =
+        k_cache.index_select(0, block_indices)
+            .reshape({batch_size, max_seq_len, num_kv_heads, head_size});
+    torch::Tensor value =
+        v_cache.index_select(0, block_indices)
+            .reshape({batch_size, max_seq_len, num_kv_heads, head_size});
+    key = xllm::kernel::npu::expand_kv_heads(key, num_heads, num_kv_heads)
+              .permute({0, 2, 1, 3});
+    value = xllm::kernel::npu::expand_kv_heads(value, num_heads, num_kv_heads)
+                .permute({0, 2, 1, 3});
+    const torch::Tensor query_4d = query.unsqueeze(2);
+    const torch::Tensor positions =
+        torch::arange(max_seq_len, seq_lens.options()).view({1, 1, 1, -1});
+    const torch::Tensor attention_mask =
+        positions < seq_lens.view({batch_size, 1, 1, 1});
+    // Use the same FlashAttentionScoreV4 kernel selected by eager SDPA, while
+    // keeping all buffers graph-owned and all sequence-length masking on the
+    // device. ACLNN mask semantics are the inverse of PyTorch SDPA semantics.
+    torch::Tensor graph_output = torch::empty_like(query_4d);
+    xllm::kernel::npu::npu_flash_attention_score_v4_out(
+        query_4d,
+        key,
+        value,
+        std::make_optional(attention_mask.logical_not()),
+        num_heads,
+        scale,
+        graph_output);
+    output.copy_(graph_output.squeeze(2));
+    return;
+  }
+
   const torch::Tensor seq_lens_cpu =
       seq_lens.device().is_cpu() ? seq_lens : seq_lens.to(torch::kCPU);
   for (int64_t batch_index = 0; batch_index < batch_size; ++batch_index) {

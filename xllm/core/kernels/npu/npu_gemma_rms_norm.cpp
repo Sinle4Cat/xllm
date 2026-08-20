@@ -13,10 +13,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <torch_npu/csrc/aten/CustomFunctions.h>
+
 #include <vector>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/npu_ops_api.h"
+#include "core/kernels/npu/utils.h"
 
 namespace xllm::kernel::npu {
 
@@ -25,6 +28,16 @@ void npu_gemma_rms_norm(const torch::Tensor& x,
                         double epsilon,
                         torch::Tensor& rstd_out,
                         torch::Tensor& y_out) {
+  if (is_ascend950()) {
+    // Gemma-style RMSNorm is regular RMSNorm with an effective (1 + gamma)
+    // weight. CANN 9.0 has no GemmaRmsNorm binary for Ascend950.
+    auto result =
+        at_npu::native::custom_ops::npu_rms_norm(x, gamma + 1.0, epsilon);
+    y_out = std::get<0>(result);
+    rstd_out = std::get<1>(result);
+    return;
+  }
+
   int64_t dim_x = x.dim();
   int64_t dim_gamma = gamma.dim();
   int64_t diff = dim_x - dim_gamma;

@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <dlfcn.h>
+
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
@@ -104,10 +106,31 @@ torch::Tensor mega_gdn_prefill_op(const torch::Tensor& mixed_qkv,
   auto masks = get_or_create_masks(mixed_qkv.device());
   uint32_t ffts_len = 0;
   uint64_t ffts_addr = 0;
-  const auto status = rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
-  CHECK_EQ(status, 0) << "rtGetC2cCtrlAddr failed for mega_gdn_prefill_op";
-  CHECK_GT(ffts_len, 0)
-      << "rtGetC2cCtrlAddr returned an empty FFTS control region";
+  if (is_ascend950()) {
+    void* hardware_sync_addr = nullptr;
+    using GetHardwareSyncAddrFn = aclError (*)(void**);
+    GetHardwareSyncAddrFn get_hardware_sync_addr =
+        reinterpret_cast<GetHardwareSyncAddrFn>(
+            dlsym(RTLD_DEFAULT, "aclrtGetHardwareSyncAddr"));
+    CHECK(get_hardware_sync_addr != nullptr)
+        << "aclrtGetHardwareSyncAddr is unavailable in the runtime";
+    const aclError status = get_hardware_sync_addr(&hardware_sync_addr);
+    const bool address_not_required =
+        status == ACL_ERROR_RT_FEATURE_NOT_SUPPORT;
+    CHECK(address_not_required ||
+          (status == ACL_SUCCESS && hardware_sync_addr != nullptr))
+        << "aclrtGetHardwareSyncAddr failed for mega_gdn_prefill_op, status="
+        << status;
+    if (!address_not_required) {
+      ffts_addr = static_cast<uint64_t>(
+          reinterpret_cast<uintptr_t>(hardware_sync_addr));
+    }
+  } else {
+    const auto status = rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
+    CHECK_EQ(status, 0) << "rtGetC2cCtrlAddr failed for mega_gdn_prefill_op";
+    CHECK_GT(ffts_len, 0)
+        << "rtGetC2cCtrlAddr returned an empty FFTS control region";
+  }
   CHECK_GT(num_matrices, 0) << "num_matrices must be positive";
   int64_t ffts_addr_arg = static_cast<int64_t>(ffts_addr);
 

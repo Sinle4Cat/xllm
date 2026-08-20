@@ -16,6 +16,7 @@ limitations under the License.
 #include "attention.h"
 
 #include "kernels/npu/npu_ops_api.h"
+#include "kernels/npu/utils.h"
 #include "kernels/ops_api.h"
 
 namespace xllm {
@@ -158,6 +159,13 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
     kv_seq_lens = attn_metadata.kv_seq_lens_host;
   } else {
     // Fallback if host tensor isn't prepared.
+    kv_seq_lens = attn_metadata.kv_seq_lens;
+  }
+
+  // The Ascend950 graph-safe composite attention consumes the persistent
+  // device lengths. CPU lengths would be frozen when the graph is captured.
+  if (attn_metadata.enable_cuda_graph && !tiling_data.defined() &&
+      xllm::kernel::npu::is_ascend950()) {
     kv_seq_lens = attn_metadata.kv_seq_lens;
   }
 

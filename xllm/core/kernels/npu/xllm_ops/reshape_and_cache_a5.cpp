@@ -26,11 +26,16 @@ void reshape_and_cache_a5(const torch::Tensor& key,
   CHECK_EQ(key.dim(), 3) << "key must be [num_tokens, num_heads, head_dim].";
   CHECK_EQ(value.sizes(), key.sizes()) << "value shape must match key.";
   CHECK_EQ(key_cache.dim(), 4)
-      << "key_cache must be [num_blocks, block_size, num_heads, head_dim].";
+      << "key_cache must be a four-dimensional cache tensor.";
   CHECK_EQ(value_cache.sizes(), key_cache.sizes())
       << "value_cache shape must match key_cache.";
-  CHECK_EQ(key.size(1), key_cache.size(2)) << "KV head count mismatch.";
-  CHECK_EQ(key.size(2), key_cache.size(3)) << "KV head dimension mismatch.";
+  const bool physical_nz =
+      key_cache.size(3) == 16 &&
+      key_cache.size(1) * key_cache.size(3) == key.size(1) * key.size(2);
+  if (!physical_nz) {
+    CHECK_EQ(key.size(1), key_cache.size(2)) << "KV head count mismatch.";
+    CHECK_EQ(key.size(2), key_cache.size(3)) << "KV head dimension mismatch.";
+  }
   CHECK_EQ(slot_mapping.dim(), 1) << "slot_mapping must be one-dimensional.";
   CHECK_EQ(slot_mapping.numel(), key.size(0))
       << "slot_mapping length must match num_tokens.";

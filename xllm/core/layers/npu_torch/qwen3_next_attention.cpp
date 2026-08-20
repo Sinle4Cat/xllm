@@ -21,9 +21,35 @@ limitations under the License.
 #include <vector>
 
 #include "common/flash_comm1_context.h"
+#include "xllm/core/kernels/npu/npu_ops_api.h"
+#include "xllm/core/kernels/npu/utils.h"
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+std::pair<torch::Tensor, torch::Tensor> apply_graph_partial_neox_mrope(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& merged_cos_sin,
+    int64_t rotary_dim) {
+  CHECK_EQ(rotary_dim % 2, 0);
+  const int64_t half_rotary_dim = rotary_dim / 2;
+  torch::Tensor cos_half = merged_cos_sin.slice(-1, 0, half_rotary_dim);
+  torch::Tensor sin_half =
+      merged_cos_sin.slice(-1, half_rotary_dim, rotary_dim);
+  torch::Tensor cos = at::cat({cos_half, cos_half}, -1).unsqueeze(1);
+  torch::Tensor sin = at::cat({sin_half, sin_half}, -1).unsqueeze(1);
+  torch::Tensor query_rot = query.slice(-1, 0, rotary_dim).contiguous();
+  torch::Tensor key_rot = key.slice(-1, 0, rotary_dim).contiguous();
+  xllm::kernel::npu::apply_rotary(
+      query_rot, key_rot, cos, sin, /*input_layout=*/"BSND");
+  return {at::cat({query_rot, query.slice(-1, rotary_dim, query.size(-1))}, -1),
+          at::cat({key_rot, key.slice(-1, rotary_dim, key.size(-1))}, -1)};
+}
+
+}  // namespace
 
 Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
     const ModelArgs& args,
@@ -113,9 +139,40 @@ Qwen3NextAttentionImpl::Qwen3NextAttentionImpl(
   rms_norm_eps_ = args.rms_norm_eps();
   mrope_section_ = args.rope_scaling_mrope_section();
   is_interleaved_ = args.rope_scaling_mrope_interleaved();
+  if (mrope_section_.size() == 3 && rotary_dim_ > 0) {
+    const int64_t half_rotary_dim = rotary_dim_ / 2;
+    std::vector<int64_t> gather_indices(rotary_dim_);
+    const int64_t t_len = mrope_section_[0];
+    const int64_t h_len = mrope_section_[1];
+    const int64_t w_len = mrope_section_[2];
+    for (int64_t i = 0; i < half_rotary_dim; ++i) {
+      int64_t axis = 0;
+      if (is_interleaved_) {
+        if ((i % 3) == 1 && i <= 3 * h_len) {
+          axis = 1;
+        } else if ((i % 3) == 2 && i <= 3 * w_len) {
+          axis = 2;
+        }
+      } else if (i >= t_len + h_len) {
+        axis = 2;
+      } else if (i >= t_len) {
+        axis = 1;
+      }
+      gather_indices[i] = axis * rotary_dim_ + i;
+      gather_indices[half_rotary_dim + i] =
+          axis * rotary_dim_ + half_rotary_dim + i;
+    }
+    mrope_gather_indices_ =
+        register_buffer("mrope_gather_indices",
+                        torch::tensor(gather_indices,
+                                      torch::TensorOptions()
+                                          .dtype(torch::kLong)
+                                          .device(options.device())));
+  }
   use_fused_qkv_ = false;
-  if (attn_output_gate_ && !mrope_section_.empty() &&
-      mrope_section_.size() == 3 && rotary_dim_ > 0 &&
+  if (!xllm::kernel::npu::is_ascend950() && attn_output_gate_ &&
+      !mrope_section_.empty() && mrope_section_.size() == 3 &&
+      rotary_dim_ > 0 &&
       xllm::kernel::has_split_qkv_rmsnorm_mrope_specialization(
           num_heads_, num_kv_heads_, head_dim_)) {
     mrope_gather_pattern_ =
@@ -155,7 +212,6 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
   }
 
   auto qkv = qkv_proj_->forward(h);
-
   if (use_fused_qkv_) {
     const int64_t T = qkv.size(0);
     xllm::kernel::SplitQkvRmsnormMropeParams params;
@@ -205,14 +261,35 @@ torch::Tensor Qwen3NextAttentionImpl::forward(
   q = std::get<0>(q_norm_->forward(q_3d)).view({T, q_size_});
   auto k_3d = k.view({T, num_kv_heads_, head_dim_});
   k = std::get<0>(k_norm_->forward(k_3d)).view({T, kv_size_});
+  if (xllm::kernel::npu::is_ascend950()) {
+    // The A5 reshape-and-cache path requires a dense value tensor. The
+    // fallback Q|G|K|V slice retains the parent projection's row stride.
+    v = v.contiguous();
+  }
 
-  rotary_emb_->forward(positions, q, k);
+  if (attn_metadata.enable_cuda_graph && xllm::kernel::npu::is_ascend950() &&
+      mrope_cos_sin.defined() && mrope_gather_indices_.defined()) {
+    CHECK_EQ(mrope_cos_sin.size(0), T);
+    // q_3d and k_3d were created as views of the projection slices before
+    // q_norm_/k_norm_ replaced q and k. Rebuild the views from the normalized
+    // tensors; rotating the stale projection views makes every non-rotary
+    // channel wrong as well and causes graph decode to drift from eager.
+    q_3d = q.view({T, num_heads_, head_dim_});
+    k_3d = k.view({T, num_kv_heads_, head_dim_});
+    torch::Tensor merged_cos_sin =
+        mrope_cos_sin.index_select(-1, mrope_gather_indices_);
+    std::tie(q_3d, k_3d) =
+        apply_graph_partial_neox_mrope(q_3d, k_3d, merged_cos_sin, rotary_dim_);
+    q = q_3d.view({T, q_size_});
+    k = k_3d.view({T, kv_size_});
+  } else {
+    rotary_emb_->forward(positions, q, k);
+  }
   auto out = std::get<0>(attn_->forward(attn_metadata, q, k, v, kv_cache));
 
   if (attn_output_gate_) {
     out = out * torch::sigmoid(gate);
   }
-
   if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
     return o_proj_->forward(out, row_parallel_reduce_mode_for_fc1(*fc1_ctx));
   }

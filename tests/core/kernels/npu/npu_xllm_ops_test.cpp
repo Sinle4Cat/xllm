@@ -26,6 +26,7 @@ limitations under the License.
 #include <torch/extension.h>
 #include <torch/torch.h>
 
+#include <cmath>
 #include <filesystem>
 #include <limits>
 #include <optional>
@@ -35,7 +36,30 @@ limitations under the License.
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/xllm_torch_ops.h"
 
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+#endif
+
+#include "torch_npu/csrc/core/npu/NPUGraph.h"
+#include "torch_npu/csrc/core/npu/NPUGuard.h"
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+
 namespace py = pybind11;
+
+namespace xllm::kernel::npu {
+std::pair<torch::Tensor, torch::Tensor> apply_npu_partial_rotary_embedding(
+    const torch::Tensor& positions,
+    torch::Tensor& query,
+    torch::Tensor& key,
+    int64_t head_size,
+    int64_t rotary_dim,
+    const torch::Tensor& cos_sin_cache,
+    bool is_neox_style);
+}  // namespace xllm::kernel::npu
 
 namespace xllm {
 namespace {
@@ -616,6 +640,807 @@ torch.npu.synchronize()
 assert graph_result.data_ptr() == output_address
 assert output.data_ptr() == output_address
 )PY");
+}
+
+TEST_F(NpuXllmOpsTest, FlashAttentionScoreV4MaskedDecodeMatchesSdpa) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kBatch = 1;
+  constexpr int64_t kHeads = 6;
+  constexpr int64_t kSeqLen = 384;
+  constexpr int64_t kValidLen = 133;
+  constexpr int64_t kHeadDim = 256;
+  const double scale = 1.0 / std::sqrt(static_cast<double>(kHeadDim));
+  auto options = torch::TensorOptions()
+                     .device(torch::kPrivateUse1)
+                     .dtype(torch::kBFloat16);
+  torch::manual_seed(20260817);
+  auto query = torch::randn({kBatch, kHeads, 1, kHeadDim}, options);
+  auto key = torch::randn({kBatch, kHeads, kSeqLen, kHeadDim}, options);
+  auto value = torch::randn_like(key);
+  auto positions = torch::arange(
+      kSeqLen,
+      torch::TensorOptions().device(torch::kPrivateUse1).dtype(torch::kInt32));
+  auto acl_mask = positions.ge(kValidLen).view({kBatch, 1, 1, kSeqLen});
+
+  auto output = torch::empty_like(query);
+  kernel::npu::npu_flash_attention_score_v4_out(
+      query, key, value, acl_mask, kHeads, scale, output);
+  auto reference =
+      torch::scaled_dot_product_attention(query,
+                                          key.narrow(2, 0, kValidLen),
+                                          value.narrow(2, 0, kValidLen),
+                                          /*attn_mask=*/std::nullopt,
+                                          /*dropout_p=*/0.0,
+                                          /*is_causal=*/false,
+                                          /*scale=*/scale);
+  c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+      ->synchronizeDevice(0);
+  auto error =
+      (output.to(torch::kFloat32) - reference.to(torch::kFloat32)).abs().cpu();
+  LOG(INFO) << "FlashAttentionScoreV4 vs SDPA max_abs="
+            << error.max().item<float>()
+            << ", mean_abs=" << error.mean().item<float>();
+  EXPECT_TRUE(torch::allclose(output.to(torch::kFloat32),
+                              reference.to(torch::kFloat32),
+                              /*rtol=*/1e-3,
+                              /*atol=*/1e-3));
+}
+
+TEST_F(NpuXllmOpsTest, Ascend950PagedAttentionDeviceLengthsMatchCpuLengths) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kBatch = 2;
+  constexpr int64_t kHeads = 6;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 256;
+  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kNumBlocks = 8;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+  auto options = torch::TensorOptions()
+                     .device(torch::kPrivateUse1)
+                     .dtype(torch::kBFloat16);
+  torch::manual_seed(20260817);
+  auto query = torch::randn({kBatch, kHeads, kHeadDim}, options);
+  auto key_cache =
+      torch::randn({kNumBlocks, kBlockSize, kKvHeads, kHeadDim}, options);
+  auto value_cache = torch::randn_like(key_cache);
+  auto block_table_cpu = torch::tensor(
+      {{2, 5, 1}, {7, 0, 4}}, torch::TensorOptions().dtype(torch::kInt32));
+  auto block_table = block_table_cpu.to(torch::kPrivateUse1);
+  auto seq_lens_cpu =
+      torch::tensor({133, 259}, torch::TensorOptions().dtype(torch::kInt32));
+  auto seq_lens_device = seq_lens_cpu.to(torch::kPrivateUse1);
+
+  auto eager_output = torch::empty_like(query);
+  auto device_output = torch::empty_like(query);
+  kernel::npu::batch_decode(query,
+                            key_cache,
+                            value_cache,
+                            scale,
+                            block_table,
+                            seq_lens_cpu,
+                            eager_output);
+  kernel::npu::batch_decode(query,
+                            key_cache,
+                            value_cache,
+                            scale,
+                            block_table,
+                            seq_lens_device,
+                            device_output);
+  c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+      ->synchronizeDevice(0);
+  auto error =
+      (device_output.to(torch::kFloat32) - eager_output.to(torch::kFloat32))
+          .abs()
+          .cpu();
+  LOG(INFO) << "Ascend950 device-length paged attention vs CPU-length path "
+            << "max_abs=" << error.max().item<float>()
+            << ", mean_abs=" << error.mean().item<float>()
+            << ", mismatches=" << error.ne(0).sum().item<int64_t>();
+  EXPECT_TRUE(torch::equal(device_output, eager_output));
+}
+
+TEST_F(NpuXllmOpsTest, Ascend950PagedAttentionGraphReplayTracksInputs) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kBatch = 2;
+  constexpr int64_t kHeads = 6;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 256;
+  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kNumBlocks = 10;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+  auto npu_options = torch::TensorOptions()
+                         .device(torch::kPrivateUse1)
+                         .dtype(torch::kBFloat16);
+  auto cpu_int_options = torch::TensorOptions().dtype(torch::kInt32);
+  torch::manual_seed(20260817);
+
+  const auto query_base = torch::randn({kBatch, kHeads, kHeadDim}, npu_options);
+  const auto query_changed =
+      torch::randn({kBatch, kHeads, kHeadDim}, npu_options);
+  const auto key_cache_base =
+      torch::randn({kNumBlocks, kBlockSize, kKvHeads, kHeadDim}, npu_options);
+  const auto value_cache_base = torch::randn_like(key_cache_base);
+  const auto key_cache_changed = torch::randn_like(key_cache_base);
+  const auto value_cache_changed = torch::randn_like(value_cache_base);
+  const auto block_table_base_cpu =
+      torch::tensor({{2, 5, 1}, {7, 0, 4}}, cpu_int_options);
+  const auto block_table_changed_cpu =
+      torch::tensor({{6, 3, 8}, {1, 9, 2}}, cpu_int_options);
+  const auto seq_lens_base_cpu = torch::tensor({133, 259}, cpu_int_options);
+  const auto seq_lens_changed_cpu = torch::tensor({257, 129}, cpu_int_options);
+
+  // These tensors retain their addresses for the full lifetime of the graph.
+  auto graph_query = query_base.clone();
+  auto graph_key_cache = key_cache_base.clone();
+  auto graph_value_cache = value_cache_base.clone();
+  auto graph_block_table = block_table_base_cpu.to(torch::kPrivateUse1);
+  auto graph_seq_lens = seq_lens_base_cpu.to(torch::kPrivateUse1);
+  auto graph_output = torch::empty_like(graph_query);
+
+  c10_npu::NPUStream capture_stream = c10_npu::getStreamFromPool(true, 0);
+  c10_npu::NPUGraph graph;
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    kernel::npu::batch_decode(graph_query,
+                              graph_key_cache,
+                              graph_value_cache,
+                              scale,
+                              graph_block_table,
+                              graph_seq_lens,
+                              graph_output);
+  }
+  capture_stream.synchronize();
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    graph.capture_begin(
+        {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+    kernel::npu::batch_decode(graph_query,
+                              graph_key_cache,
+                              graph_value_cache,
+                              scale,
+                              graph_block_table,
+                              graph_seq_lens,
+                              graph_output);
+    graph.capture_end();
+  }
+  capture_stream.synchronize();
+
+  auto replay_and_compare = [&](const char* name,
+                                const torch::Tensor& query,
+                                const torch::Tensor& key_cache,
+                                const torch::Tensor& value_cache,
+                                const torch::Tensor& block_table_cpu,
+                                const torch::Tensor& seq_lens_cpu) {
+    auto block_table_device = block_table_cpu.to(torch::kPrivateUse1);
+    auto seq_lens_device = seq_lens_cpu.to(torch::kPrivateUse1);
+    {
+      c10_npu::NPUStreamGuard stream_guard(capture_stream);
+      graph_query.copy_(query);
+      graph_key_cache.copy_(key_cache);
+      graph_value_cache.copy_(value_cache);
+      graph_block_table.copy_(block_table_device);
+      graph_seq_lens.copy_(seq_lens_device);
+      graph.replay();
+    }
+    capture_stream.synchronize();
+
+    auto eager_output = torch::empty_like(graph_output);
+    kernel::npu::batch_decode(graph_query,
+                              graph_key_cache,
+                              graph_value_cache,
+                              scale,
+                              graph_block_table,
+                              seq_lens_cpu,
+                              eager_output);
+    c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->synchronizeDevice(0);
+    const auto error =
+        (graph_output.to(torch::kFloat32) - eager_output.to(torch::kFloat32))
+            .abs()
+            .cpu();
+    const int64_t mismatches = error.ne(0).sum().item<int64_t>();
+    LOG(INFO) << "Paged attention graph replay case=" << name
+              << ", max_abs=" << error.max().item<float>()
+              << ", mean_abs=" << error.mean().item<float>()
+              << ", mismatches=" << mismatches;
+    EXPECT_EQ(mismatches, 0) << "graph replay froze or lost " << name;
+  };
+
+  replay_and_compare("unchanged",
+                     query_base,
+                     key_cache_base,
+                     value_cache_base,
+                     block_table_base_cpu,
+                     seq_lens_base_cpu);
+  replay_and_compare("query",
+                     query_changed,
+                     key_cache_base,
+                     value_cache_base,
+                     block_table_base_cpu,
+                     seq_lens_base_cpu);
+  replay_and_compare("seq_lens",
+                     query_base,
+                     key_cache_base,
+                     value_cache_base,
+                     block_table_base_cpu,
+                     seq_lens_changed_cpu);
+  replay_and_compare("block_table",
+                     query_base,
+                     key_cache_base,
+                     value_cache_base,
+                     block_table_changed_cpu,
+                     seq_lens_base_cpu);
+  replay_and_compare("kv_cache",
+                     query_base,
+                     key_cache_changed,
+                     value_cache_changed,
+                     block_table_base_cpu,
+                     seq_lens_base_cpu);
+}
+
+TEST_F(NpuXllmOpsTest, Ascend950CacheWriteThenAttentionGraphReplay) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kBatch = 2;
+  constexpr int64_t kHeads = 6;
+  constexpr int64_t kKvHeads = 2;
+  constexpr int64_t kHeadDim = 256;
+  constexpr int64_t kBlockSize = 128;
+  constexpr int64_t kNumBlocks = 10;
+  const float scale = 1.0f / std::sqrt(static_cast<float>(kHeadDim));
+  auto npu_options = torch::TensorOptions()
+                         .device(torch::kPrivateUse1)
+                         .dtype(torch::kBFloat16);
+  auto cpu_int_options = torch::TensorOptions().dtype(torch::kInt32);
+  torch::manual_seed(20260818);
+
+  const auto query_base = torch::randn({kBatch, kHeads, kHeadDim}, npu_options);
+  const auto query_changed =
+      torch::randn({kBatch, kHeads, kHeadDim}, npu_options);
+  const auto new_key_base =
+      torch::randn({kBatch, kKvHeads, kHeadDim}, npu_options);
+  const auto new_value_base = torch::randn_like(new_key_base);
+  const auto new_key_changed = torch::randn_like(new_key_base);
+  const auto new_value_changed = torch::randn_like(new_value_base);
+  const auto cache_base =
+      torch::randn({kNumBlocks, kBlockSize, kKvHeads, kHeadDim}, npu_options);
+  const auto value_cache_base = torch::randn_like(cache_base);
+  const auto block_table_cpu =
+      torch::tensor({{2, 5, 1}, {7, 0, 4}}, cpu_int_options);
+  const auto block_table = block_table_cpu.to(torch::kPrivateUse1);
+  const auto seq_lens_base_cpu = torch::tensor({133, 259}, cpu_int_options);
+  const auto seq_lens_changed_cpu = torch::tensor({257, 129}, cpu_int_options);
+  // Each slot is the final token selected by its corresponding sequence.
+  const auto slots_base_cpu =
+      torch::tensor({5 * kBlockSize + 4, 4 * kBlockSize + 2}, cpu_int_options);
+  const auto slots_changed_cpu =
+      torch::tensor({1 * kBlockSize + 0, 0 * kBlockSize + 0}, cpu_int_options);
+
+  auto graph_query = query_base.clone();
+  auto graph_new_key = new_key_base.clone();
+  auto graph_new_value = new_value_base.clone();
+  auto graph_key_cache = cache_base.clone();
+  auto graph_value_cache = value_cache_base.clone();
+  auto graph_block_table = block_table.clone();
+  auto graph_seq_lens = seq_lens_base_cpu.to(torch::kPrivateUse1);
+  auto graph_slots = slots_base_cpu.to(torch::kPrivateUse1);
+  auto graph_output = torch::empty_like(graph_query);
+
+  auto run_graph_body = [&]() {
+    std::optional<torch::Tensor> value = graph_new_value;
+    std::optional<torch::Tensor> value_cache = graph_value_cache;
+    kernel::npu::reshape_paged_cache(
+        graph_new_key, value, graph_key_cache, value_cache, graph_slots);
+    kernel::npu::batch_decode(graph_query,
+                              graph_key_cache,
+                              graph_value_cache,
+                              scale,
+                              graph_block_table,
+                              graph_seq_lens,
+                              graph_output);
+  };
+
+  c10_npu::NPUStream capture_stream = c10_npu::getStreamFromPool(true, 0);
+  c10_npu::NPUGraph graph;
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    run_graph_body();
+  }
+  capture_stream.synchronize();
+  graph_key_cache.copy_(cache_base);
+  graph_value_cache.copy_(value_cache_base);
+  c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+      ->synchronizeDevice(0);
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    graph.capture_begin(
+        {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+    run_graph_body();
+    graph.capture_end();
+  }
+  capture_stream.synchronize();
+
+  auto replay_and_compare = [&](const char* name,
+                                const torch::Tensor& query,
+                                const torch::Tensor& new_key,
+                                const torch::Tensor& new_value,
+                                const torch::Tensor& seq_lens_cpu,
+                                const torch::Tensor& slots_cpu) {
+    const auto seq_lens_device = seq_lens_cpu.to(torch::kPrivateUse1);
+    const auto slots_device = slots_cpu.to(torch::kPrivateUse1);
+    {
+      c10_npu::NPUStreamGuard stream_guard(capture_stream);
+      graph_query.copy_(query);
+      graph_new_key.copy_(new_key);
+      graph_new_value.copy_(new_value);
+      graph_key_cache.copy_(cache_base);
+      graph_value_cache.copy_(value_cache_base);
+      graph_seq_lens.copy_(seq_lens_device);
+      graph_slots.copy_(slots_device);
+      graph.replay();
+    }
+    capture_stream.synchronize();
+
+    auto eager_key_cache = cache_base.clone();
+    auto eager_value_cache_tensor = value_cache_base.clone();
+    auto eager_key = new_key;
+    std::optional<torch::Tensor> eager_value = new_value;
+    std::optional<torch::Tensor> eager_value_cache = eager_value_cache_tensor;
+    kernel::npu::reshape_paged_cache(eager_key,
+                                     eager_value,
+                                     eager_key_cache,
+                                     eager_value_cache,
+                                     slots_device);
+    auto eager_output = torch::empty_like(graph_output);
+    kernel::npu::batch_decode(query,
+                              eager_key_cache,
+                              eager_value_cache_tensor,
+                              scale,
+                              block_table,
+                              seq_lens_cpu,
+                              eager_output);
+    c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->synchronizeDevice(0);
+
+    const auto output_error =
+        (graph_output.to(torch::kFloat32) - eager_output.to(torch::kFloat32))
+            .abs()
+            .cpu();
+    const int64_t output_mismatches = output_error.ne(0).sum().item<int64_t>();
+    const int64_t key_cache_mismatches =
+        graph_key_cache.ne(eager_key_cache).sum().cpu().item<int64_t>();
+    const int64_t value_cache_mismatches =
+        graph_value_cache.ne(eager_value_cache_tensor)
+            .sum()
+            .cpu()
+            .item<int64_t>();
+    LOG(INFO) << "Cache-write graph replay case=" << name
+              << ", output_max_abs=" << output_error.max().item<float>()
+              << ", output_mismatches=" << output_mismatches
+              << ", key_cache_mismatches=" << key_cache_mismatches
+              << ", value_cache_mismatches=" << value_cache_mismatches;
+    EXPECT_EQ(key_cache_mismatches, 0) << name;
+    EXPECT_EQ(value_cache_mismatches, 0) << name;
+    EXPECT_EQ(output_mismatches, 0) << name;
+  };
+
+  replay_and_compare("unchanged",
+                     query_base,
+                     new_key_base,
+                     new_value_base,
+                     seq_lens_base_cpu,
+                     slots_base_cpu);
+  replay_and_compare("new_kv",
+                     query_base,
+                     new_key_changed,
+                     new_value_changed,
+                     seq_lens_base_cpu,
+                     slots_base_cpu);
+  replay_and_compare("query_seq_and_slot",
+                     query_changed,
+                     new_key_changed,
+                     new_value_changed,
+                     seq_lens_changed_cpu,
+                     slots_changed_cpu);
+}
+
+TEST_F(NpuXllmOpsTest, Ascend950RecurrentStateGraphReplayTracksInputs) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kBatch = 2;
+  constexpr int64_t kKeyHeads = 2;
+  constexpr int64_t kValueHeads = 4;
+  constexpr int64_t kHeadDim = 128;
+  constexpr int64_t kStateSlots = 6;
+  auto bf16_options = torch::TensorOptions()
+                          .device(torch::kPrivateUse1)
+                          .dtype(torch::kBFloat16);
+  auto fp32_options = bf16_options.dtype(torch::kFloat32);
+  auto int_options = bf16_options.dtype(torch::kInt32);
+  torch::manual_seed(20260817);
+
+  const auto q_base =
+      torch::randn({kBatch, 1, kKeyHeads, kHeadDim}, bf16_options);
+  const auto k_base = torch::randn_like(q_base);
+  const auto v_base =
+      torch::randn({kBatch, 1, kValueHeads, kHeadDim}, bf16_options);
+  const auto g_base =
+      torch::randn({kBatch, 1, kValueHeads}, fp32_options) * 0.01;
+  const auto beta_base =
+      torch::sigmoid(torch::randn({kBatch, 1, kValueHeads}, bf16_options));
+  const auto cache_base = torch::randn(
+      {kStateSlots, kValueHeads, kHeadDim, kHeadDim}, fp32_options);
+  const auto indices_base = torch::tensor({0, 3}, int_options);
+
+  const auto q_changed = torch::randn_like(q_base);
+  const auto k_changed = torch::randn_like(k_base);
+  const auto v_changed = torch::randn_like(v_base);
+  const auto g_changed =
+      torch::randn({kBatch, 1, kValueHeads}, fp32_options) * 0.01;
+  const auto beta_changed =
+      torch::sigmoid(torch::randn({kBatch, 1, kValueHeads}, bf16_options));
+  const auto indices_changed = torch::tensor({2, 5}, int_options);
+
+  auto graph_q = q_base.clone();
+  auto graph_k = k_base.clone();
+  auto graph_v = v_base.clone();
+  auto graph_g = g_base.clone();
+  auto graph_beta = beta_base.clone();
+  auto graph_cache = cache_base.clone();
+  auto graph_indices = indices_base.clone();
+  auto graph_output = torch::empty_like(v_base);
+
+  auto recurrent_step = [](const torch::Tensor& query,
+                           const torch::Tensor& key,
+                           const torch::Tensor& value,
+                           const torch::Tensor& g,
+                           const torch::Tensor& beta,
+                           torch::Tensor& state_cache,
+                           const torch::Tensor& state_indices,
+                           torch::Tensor& output) {
+    auto q_norm =
+        query / torch::sqrt(torch::sum(torch::square(query), -1, true) + 1e-6);
+    auto k_norm =
+        key / torch::sqrt(torch::sum(torch::square(key), -1, true) + 1e-6);
+    q_norm = q_norm.transpose(1, 2).contiguous().to(torch::kFloat32);
+    k_norm = k_norm.transpose(1, 2).contiguous().to(torch::kFloat32);
+    auto value_fp32 = value.transpose(1, 2).contiguous().to(torch::kFloat32);
+    auto beta_fp32 = beta.transpose(1, 2).contiguous().to(torch::kFloat32);
+    auto g_fp32 = g.transpose(1, 2).contiguous().to(torch::kFloat32);
+    q_norm =
+        q_norm.unsqueeze(2)
+            .expand({kBatch, kKeyHeads, kValueHeads / kKeyHeads, 1, kHeadDim})
+            .reshape({kBatch, kValueHeads, 1, kHeadDim})
+            .contiguous();
+    k_norm =
+        k_norm.unsqueeze(2)
+            .expand({kBatch, kKeyHeads, kValueHeads / kKeyHeads, 1, kHeadDim})
+            .reshape({kBatch, kValueHeads, 1, kHeadDim})
+            .contiguous();
+    q_norm = q_norm * (1.0 / std::sqrt(static_cast<double>(kHeadDim)));
+
+    auto state = torch::index_select(state_cache, 0, state_indices);
+    auto q_t = q_norm.select(2, 0);
+    auto k_t = k_norm.select(2, 0);
+    auto v_t = value_fp32.select(2, 0);
+    auto g_t = g_fp32.select(2, 0).exp().unsqueeze(-1).unsqueeze(-1);
+    auto beta_t = beta_fp32.select(2, 0).unsqueeze(-1);
+    state = state * g_t;
+    auto kv_mem = torch::sum(state * k_t.unsqueeze(-1), -2);
+    auto delta = (v_t - kv_mem) * beta_t;
+    state = state + k_t.unsqueeze(-1) * delta.unsqueeze(-2);
+    auto step_output = torch::sum(state * q_t.unsqueeze(-1), -2)
+                           .unsqueeze(2)
+                           .transpose(1, 2)
+                           .contiguous()
+                           .to(value.scalar_type());
+    output.copy_(step_output);
+    state_cache.index_put_({state_indices}, state);
+  };
+
+  auto run_graph_body = [&]() {
+    recurrent_step(graph_q,
+                   graph_k,
+                   graph_v,
+                   graph_g,
+                   graph_beta,
+                   graph_cache,
+                   graph_indices,
+                   graph_output);
+  };
+
+  c10_npu::NPUStream capture_stream = c10_npu::getStreamFromPool(true, 0);
+  c10_npu::NPUGraph graph;
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    run_graph_body();
+  }
+  capture_stream.synchronize();
+  graph_cache.copy_(cache_base);
+  c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+      ->synchronizeDevice(0);
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    graph.capture_begin(
+        {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+    run_graph_body();
+    graph.capture_end();
+  }
+  capture_stream.synchronize();
+
+  auto replay_and_compare = [&](const char* name,
+                                const torch::Tensor& query,
+                                const torch::Tensor& key,
+                                const torch::Tensor& value,
+                                const torch::Tensor& g,
+                                const torch::Tensor& beta,
+                                const torch::Tensor& indices) {
+    {
+      c10_npu::NPUStreamGuard stream_guard(capture_stream);
+      graph_q.copy_(query);
+      graph_k.copy_(key);
+      graph_v.copy_(value);
+      graph_g.copy_(g);
+      graph_beta.copy_(beta);
+      graph_cache.copy_(cache_base);
+      graph_indices.copy_(indices);
+      graph.replay();
+    }
+    capture_stream.synchronize();
+
+    auto eager_cache = cache_base.clone();
+    auto eager_output = torch::empty_like(graph_output);
+    recurrent_step(
+        query, key, value, g, beta, eager_cache, indices, eager_output);
+    c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->synchronizeDevice(0);
+
+    const auto output_error =
+        (graph_output.to(torch::kFloat32) - eager_output.to(torch::kFloat32))
+            .abs()
+            .cpu();
+    const auto cache_error = (graph_cache - eager_cache).abs().cpu();
+    LOG(INFO) << "Recurrent graph replay case=" << name
+              << ", output_max_abs=" << output_error.max().item<float>()
+              << ", output_mismatches="
+              << output_error.ne(0).sum().item<int64_t>()
+              << ", cache_max_abs=" << cache_error.max().item<float>()
+              << ", cache_mismatches="
+              << cache_error.ne(0).sum().item<int64_t>();
+    EXPECT_EQ(output_error.ne(0).sum().item<int64_t>(), 0) << name;
+    EXPECT_EQ(cache_error.ne(0).sum().item<int64_t>(), 0) << name;
+  };
+
+  replay_and_compare(
+      "unchanged", q_base, k_base, v_base, g_base, beta_base, indices_base);
+  replay_and_compare("changed_inputs_and_slots",
+                     q_changed,
+                     k_changed,
+                     v_changed,
+                     g_changed,
+                     beta_changed,
+                     indices_changed);
+}
+
+TEST_F(NpuXllmOpsTest, Ascend950GraphMropeMatchesPartialRotaryEmbedding) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kTokens = 8;
+  constexpr int64_t kQueryHeads = 6;
+  constexpr int64_t kKeyHeads = 1;
+  constexpr int64_t kHeadDim = 256;
+  constexpr int64_t kRotaryDim = 64;
+  constexpr int64_t kMaxPosition = 512;
+  const std::vector<int64_t> mrope_section = {11, 11, 10};
+  auto bf16_options = torch::TensorOptions()
+                          .device(torch::kPrivateUse1)
+                          .dtype(torch::kBFloat16);
+  auto int_options = bf16_options.dtype(torch::kInt32);
+  torch::manual_seed(20260817);
+
+  auto inv_freq =
+      1.0 /
+      torch::pow(
+          10000000.0,
+          torch::arange(0, kRotaryDim, 2, bf16_options.dtype(torch::kFloat32)) /
+              static_cast<double>(kRotaryDim));
+  auto frequencies = torch::einsum(
+      "i,j->ij",
+      {torch::arange(0, kMaxPosition, 1, bf16_options.dtype(torch::kFloat32)),
+       inv_freq});
+  auto cos_sin_cache = torch::cat({frequencies.cos(), frequencies.sin()}, -1)
+                           .to(torch::kBFloat16)
+                           .contiguous();
+  auto temporal_positions =
+      torch::tensor({17, 18, 19, 20, 21, 22, 23, 24}, int_options);
+  auto positions = temporal_positions.unsqueeze(0).expand({3, kTokens}).clone();
+  auto query = torch::randn({kTokens, kQueryHeads * kHeadDim}, bf16_options);
+  auto key = torch::randn({kTokens, kKeyHeads * kHeadDim}, bf16_options);
+
+  auto eager_query_input = query;
+  auto eager_key_input = key;
+  auto [eager_query, eager_key] =
+      kernel::npu::apply_npu_partial_rotary_embedding(temporal_positions,
+                                                      eager_query_input,
+                                                      eager_key_input,
+                                                      kHeadDim,
+                                                      kRotaryDim,
+                                                      cos_sin_cache,
+                                                      /*is_neox_style=*/true);
+
+  auto selected =
+      cos_sin_cache.index_select(0, positions.permute({1, 0}).reshape({-1}))
+          .view({kTokens, 3 * kRotaryDim});
+  std::vector<int64_t> gather_indices(kRotaryDim);
+  const int64_t half = kRotaryDim / 2;
+  for (int64_t i = 0; i < half; ++i) {
+    int64_t axis = 0;
+    if ((i % 3) == 1 && i <= 3 * mrope_section[1]) {
+      axis = 1;
+    } else if ((i % 3) == 2 && i <= 3 * mrope_section[2]) {
+      axis = 2;
+    }
+    gather_indices[i] = axis * kRotaryDim + i;
+    gather_indices[half + i] = axis * kRotaryDim + half + i;
+  }
+  auto gather = torch::tensor(
+      gather_indices,
+      torch::TensorOptions().device(torch::kPrivateUse1).dtype(torch::kLong));
+  auto merged = selected.index_select(-1, gather);
+  auto cos_half = merged.slice(-1, 0, half);
+  auto sin_half = merged.slice(-1, half, kRotaryDim);
+  auto cos = torch::cat({cos_half, cos_half}, -1).unsqueeze(1);
+  auto sin = torch::cat({sin_half, sin_half}, -1).unsqueeze(1);
+  auto rotate = [&](const torch::Tensor& flat, int64_t heads) {
+    auto input = flat.view({kTokens, heads, kHeadDim});
+    auto input_rot = input.slice(-1, 0, kRotaryDim).contiguous();
+    auto unused_key = input_rot.clone();
+    kernel::npu::apply_rotary(
+        input_rot, unused_key, cos, sin, /*input_layout=*/"BSND");
+    return torch::cat({input_rot, input.slice(-1, kRotaryDim, kHeadDim)}, -1)
+        .view_as(flat);
+  };
+  auto graph_query = rotate(query, kQueryHeads);
+  auto graph_key = rotate(key, kKeyHeads);
+  c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+      ->synchronizeDevice(0);
+
+  auto query_error =
+      (graph_query.to(torch::kFloat32) - eager_query.to(torch::kFloat32))
+          .abs()
+          .cpu();
+  auto key_error =
+      (graph_key.to(torch::kFloat32) - eager_key.to(torch::kFloat32))
+          .abs()
+          .cpu();
+  LOG(INFO) << "Graph mRoPE vs eager partial rotary: q_max_abs="
+            << query_error.max().item<float>()
+            << ", q_mismatches=" << query_error.ne(0).sum().item<int64_t>()
+            << ", k_max_abs=" << key_error.max().item<float>()
+            << ", k_mismatches=" << key_error.ne(0).sum().item<int64_t>();
+  EXPECT_TRUE(torch::allclose(graph_query.to(torch::kFloat32),
+                              eager_query.to(torch::kFloat32),
+                              /*rtol=*/1e-3,
+                              /*atol=*/1e-3));
+  EXPECT_TRUE(torch::allclose(graph_key.to(torch::kFloat32),
+                              eager_key.to(torch::kFloat32),
+                              /*rtol=*/1e-3,
+                              /*atol=*/1e-3));
+}
+
+TEST_F(NpuXllmOpsTest, Ascend950GraphMropeRotaryCaptureReplayTracksInputs) {
+  if (!is_npu_available() || !is_ascend950_device()) {
+    GTEST_SKIP() << "requires an Ascend950 NPU";
+  }
+
+  constexpr int64_t kTokens = 8;
+  constexpr int64_t kQueryHeads = 6;
+  constexpr int64_t kKeyHeads = 1;
+  constexpr int64_t kRotaryDim = 64;
+  auto options = torch::TensorOptions()
+                     .device(torch::kPrivateUse1)
+                     .dtype(torch::kBFloat16);
+  torch::manual_seed(20260818);
+
+  auto query_base = torch::randn({kTokens, kQueryHeads, kRotaryDim}, options);
+  auto key_base = torch::randn({kTokens, kKeyHeads, kRotaryDim}, options);
+  auto query_changed = torch::randn_like(query_base);
+  auto key_changed = torch::randn_like(key_base);
+  auto cos_base = torch::randn({kTokens, 1, kRotaryDim}, options);
+  auto sin_base = torch::randn_like(cos_base);
+  auto cos_changed = torch::randn_like(cos_base);
+  auto sin_changed = torch::randn_like(sin_base);
+
+  auto graph_query = query_base.clone();
+  auto graph_key = key_base.clone();
+  auto graph_cos = cos_base.clone();
+  auto graph_sin = sin_base.clone();
+  auto graph_query_output = torch::empty_like(graph_query);
+  auto graph_key_output = torch::empty_like(graph_key);
+  auto run_graph_body = [&]() {
+    auto query = graph_query.contiguous();
+    auto key = graph_key.contiguous();
+    kernel::npu::apply_rotary(
+        query, key, graph_cos, graph_sin, /*input_layout=*/"BSND");
+    graph_query_output.copy_(query);
+    graph_key_output.copy_(key);
+  };
+
+  c10_npu::NPUStream capture_stream = c10_npu::getStreamFromPool(true, 0);
+  c10_npu::NPUGraph graph;
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    run_graph_body();
+  }
+  capture_stream.synchronize();
+  {
+    c10_npu::NPUStreamGuard stream_guard(capture_stream);
+    graph.capture_begin(
+        {0, 0}, aclmdlRICaptureMode::ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL);
+    run_graph_body();
+    graph.capture_end();
+  }
+  capture_stream.synchronize();
+
+  auto replay_and_compare = [&](const char* name,
+                                const torch::Tensor& query,
+                                const torch::Tensor& key,
+                                const torch::Tensor& cos,
+                                const torch::Tensor& sin) {
+    {
+      c10_npu::NPUStreamGuard stream_guard(capture_stream);
+      graph_query.copy_(query);
+      graph_key.copy_(key);
+      graph_cos.copy_(cos);
+      graph_sin.copy_(sin);
+      graph.replay();
+    }
+    capture_stream.synchronize();
+
+    auto eager_query = query.clone();
+    auto eager_key = key.clone();
+    kernel::npu::apply_rotary(
+        eager_query, eager_key, cos, sin, /*input_layout=*/"BSND");
+    c10::impl::getDeviceGuardImpl(c10::DeviceType::PrivateUse1)
+        ->synchronizeDevice(0);
+    auto query_error = (graph_query_output.to(torch::kFloat32) -
+                        eager_query.to(torch::kFloat32))
+                           .abs()
+                           .cpu();
+    auto key_error =
+        (graph_key_output.to(torch::kFloat32) - eager_key.to(torch::kFloat32))
+            .abs()
+            .cpu();
+    LOG(INFO) << "Graph rotary replay case=" << name
+              << ", q_max_abs=" << query_error.max().item<float>()
+              << ", q_mismatches=" << query_error.ne(0).sum().item<int64_t>()
+              << ", k_max_abs=" << key_error.max().item<float>()
+              << ", k_mismatches=" << key_error.ne(0).sum().item<int64_t>();
+    EXPECT_EQ(query_error.ne(0).sum().item<int64_t>(), 0) << name;
+    EXPECT_EQ(key_error.ne(0).sum().item<int64_t>(), 0) << name;
+  };
+
+  replay_and_compare("unchanged", query_base, key_base, cos_base, sin_base);
+  replay_and_compare("changed_inputs_and_positions",
+                     query_changed,
+                     key_changed,
+                     cos_changed,
+                     sin_changed);
 }
 
 }  // namespace
