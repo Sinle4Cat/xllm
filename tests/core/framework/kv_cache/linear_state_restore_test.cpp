@@ -90,6 +90,19 @@ LinearStateTestCache make_cache(int64_t num_slots = 4,
   return cache;
 }
 
+TEST(LinearStateRestoreTest, ModelWithoutLinearCacheIgnoresSharedCacheOps) {
+  std::vector<KVCache> kv_caches;
+  kv_caches.emplace_back();
+  LinearStateCacheOp reset;
+  reset.linear_state_id = 2;
+  reset.reset_requested = true;
+  std::vector<int64_t> validity_mask = {1};
+
+  restore_linear_state_slots(kv_caches, {reset}, validity_mask);
+
+  EXPECT_EQ(validity_mask, std::vector<int64_t>({1}));
+}
+
 TEST(LinearStateRestoreTest, ColdStartClearsOnlyLiveSlotAndMarksItCold) {
   LinearStateTestCache cache = make_cache(/*num_slots=*/4,
                                           /*checkpoint_stride=*/2);

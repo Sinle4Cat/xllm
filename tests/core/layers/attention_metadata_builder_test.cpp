@@ -112,6 +112,30 @@ TEST(AttentionMetadataBuilderTest,
       "linear state mask row count mismatch");
 }
 
+#if defined(USE_NPU)
+TEST(AttentionMetadataBuilderTest,
+     AclGraphKeepsCanonicalInitialStateMaskOnHost) {
+  ModelInputParams params = make_params();
+  params.meta.batch_forward_type = BatchForwardType::CHUNKED_PREFILL;
+  params.enable_graph = true;
+  params.embedding.linear_state_indices = torch::Tensor();
+  params.attention.device.q_seq_lens = torch::Tensor();
+  params.attention.device.kv_seq_lens = torch::Tensor();
+  params.attention.device.q_cu_seq_lens = torch::Tensor();
+
+  AttentionMetadata metadata =
+      AttentionMetadataBuilder::build(params,
+                                      /*enable_mla=*/false,
+                                      /*attn_mask=*/{},
+                                      torch::Device("npu:0"));
+
+  ASSERT_TRUE(metadata.has_initial_states.defined());
+  EXPECT_EQ(metadata.has_initial_states.device(), torch::Device(torch::kCPU));
+  EXPECT_TRUE(torch::equal(metadata.has_initial_states,
+                           torch::tensor({false, true, false}, torch::kBool)));
+}
+#endif
+
 TEST(AttentionMetadataBuilderTest, DecodeDoesNotMaterializeInitialStateMask) {
   ModelInputParams params = make_params();
   params.meta.batch_forward_type = BatchForwardType::DECODE;

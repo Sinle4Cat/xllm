@@ -55,4 +55,8 @@ void restore_linear_state_slots(
     const std::vector<LinearStateCacheOp>& cache_ops,
     LinearStateValidityMask& validity_mask);
 
+// After a physical restore has copied checkpoints into each request's live
+// slot, make recurrent kernels consume that live slot. Cold starts remain -1.
+void use_live_linear_state_slots(ModelInputParams& input_params);
+
 }  // namespace xllm

@@ -173,6 +173,9 @@ void restore_linear_state_slots(
       << ", validity_mask=" << validity_mask.size();
 
   const int32_t num_slots = discover_num_slots(kv_caches);
+  if (num_slots == 0) {
+    return;
+  }
   CHECK_GT(num_slots, kPaddingLinearStateId)
       << "linear-state operations require an allocated recurrent cache";
   const auto is_real_slot = [num_slots](int32_t slot_id) {
@@ -238,6 +241,32 @@ void restore_linear_state_slots(
             << live_slot_id << ", src_slot_id=" << src_slot_id;
   }
   flush_resets();
+}
+
+void use_live_linear_state_slots(ModelInputParams& input_params) {
+#if defined(USE_NPU)
+  input_params.parallel.has_initial_state =
+      input_params.linear_state_validity_mask;
+  auto& read_ids = input_params.embedding.linear_state_read_ids;
+  read_ids.resize(input_params.embedding.linear_state_ids.size(), -1);
+  for (size_t i = 0; i < read_ids.size(); ++i) {
+    if (i < input_params.linear_state_validity_mask.size() &&
+        input_params.linear_state_validity_mask[i] != 0) {
+      read_ids[i] = input_params.embedding.linear_state_ids[i];
+    }
+  }
+
+  input_params.embedding.linear_state_read_indices =
+      torch::tensor(read_ids, torch::kInt);
+  if (input_params.embedding.linear_state_indices.defined()) {
+    input_params.embedding.linear_state_read_indices =
+        input_params.embedding.linear_state_read_indices.to(
+            input_params.embedding.linear_state_indices.device(),
+            /*non_blocking=*/true);
+  }
+#else
+  (void)input_params;
+#endif
 }
 
 }  // namespace xllm
