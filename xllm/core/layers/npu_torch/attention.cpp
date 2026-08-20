@@ -18,9 +18,85 @@ limitations under the License.
 #include "kernels/npu/npu_ops_api.h"
 #include "kernels/npu/utils.h"
 #include "kernels/ops_api.h"
+#include "xllm/core/platform/npu/acl_graph_task_update_context.h"
 
 namespace xllm {
 namespace layer {
+
+namespace {
+
+void run_paged_attention_graph_update(
+    const std::shared_ptr<xllm::npu::AclGraphTaskUpdateContext>& graph_context,
+    const torch::Tensor& query,
+    const torch::Tensor& key_cache,
+    const torch::Tensor& value_cache,
+    const torch::Tensor& block_table,
+    const std::vector<int64_t>& key_value_seq_lens,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    torch::Tensor& output,
+    xllm::npu::PagedAttentionGraphBranch branch) {
+  CHECK(graph_context != nullptr && graph_context->capturing)
+      << "paged attention graph update can only be registered during capture";
+  CHECK_EQ(key_value_seq_lens.size(), query.size(0))
+      << "paged attention capture lengths must match query batch";
+
+  c10_npu::NPUStream stream = c10_npu::getCurrentNPUStream();
+  auto event = std::make_shared<c10_npu::NPUEvent>(ACL_EVENT_EXTERNAL);
+  event->block(stream);
+  event->reset(stream);
+
+  std::vector<int64_t> query_seq_lens(query.size(0), 1);
+  torch::Tensor key_cache_bsh =
+      key_cache.view({key_cache.size(0),
+                      key_cache.size(1),
+                      key_cache.size(2) * key_cache.size(3)});
+  torch::Tensor value_cache_bsh =
+      value_cache.view({value_cache.size(0),
+                        value_cache.size(1),
+                        value_cache.size(2) * value_cache.size(3)});
+  torch::Tensor softmax_lse =
+      torch::empty({0}, query.options().dtype(torch::kFloat32));
+  c10_npu::graph_task_group_begin(stream);
+  xllm::kernel::npu::npu_fused_infer_attention_out(
+      query,
+      key_cache_bsh,
+      value_cache_bsh,
+      std::nullopt,
+      std::make_optional(block_table),
+      query_seq_lens,
+      key_value_seq_lens,
+      num_heads,
+      num_key_value_heads,
+      scale,
+      key_cache.size(1),
+      /*sparse_mode=*/0,
+      /*input_layout=*/"BSND",
+      /*softmax_lse_flag=*/false,
+      /*is_causal=*/false,
+      output,
+      softmax_lse);
+  c10_npu::NPUTaskGroupHandle handle = c10_npu::graph_task_group_end(stream);
+
+  xllm::npu::PagedAttentionGraphTask task;
+  task.output = output;
+  task.softmax_lse = std::move(softmax_lse);
+  task.query = query;
+  task.key_cache = std::move(key_cache_bsh);
+  task.value_cache = std::move(value_cache_bsh);
+  task.block_table = block_table;
+  task.num_heads = num_heads;
+  task.num_key_value_heads = num_key_value_heads;
+  task.scale = scale;
+  task.block_size = key_cache.size(1);
+  task.branch = branch;
+  task.handle = handle;
+  task.event = std::move(event);
+  graph_context->paged_attention_tasks.emplace_back(std::move(task));
+}
+
+}  // namespace
 
 AttentionImpl::AttentionImpl(int64_t num_heads,
                              int64_t head_size,
@@ -162,12 +238,35 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
     kv_seq_lens = attn_metadata.kv_seq_lens;
   }
 
-  // The Ascend950 graph-safe composite attention consumes the persistent
-  // device lengths. CPU lengths would be frozen when the graph is captured.
-  if (attn_metadata.enable_cuda_graph &&
-      !attn_metadata.expanded_decode.enabled && !tiling_data.defined() &&
-      xllm::kernel::npu::is_ascend950()) {
-    kv_seq_lens = attn_metadata.kv_seq_lens;
+  auto graph_context = attn_metadata.acl_graph_task_update_context;
+  if (attn_metadata.enable_cuda_graph && xllm::kernel::npu::is_ascend950() &&
+      !tiling_data.defined() && graph_context != nullptr &&
+      graph_context->capturing) {
+    CHECK(v_cache.has_value() && v_cache->defined())
+        << "paged attention graph update requires a value cache";
+    std::vector<int64_t> key_value_seq_lens;
+    xllm::npu::PagedAttentionGraphBranch branch;
+    if (attn_metadata.expanded_decode.enabled) {
+      key_value_seq_lens.assign(
+          attn_metadata.expanded_decode.kv_seq_lens_host_vec.begin(),
+          attn_metadata.expanded_decode.kv_seq_lens_host_vec.end());
+      branch = xllm::npu::PagedAttentionGraphBranch::kExpandedDecode;
+    } else {
+      key_value_seq_lens = attn_metadata.kv_seq_lens_host_vec;
+      branch = xllm::npu::PagedAttentionGraphBranch::kDecode;
+    }
+    run_paged_attention_graph_update(graph_context,
+                                     query,
+                                     k_cache,
+                                     v_cache.value(),
+                                     block_table,
+                                     key_value_seq_lens,
+                                     num_heads_,
+                                     num_kv_heads_,
+                                     scale_,
+                                     output,
+                                     branch);
+    return;
   }
 
   if (tiling_data.defined()) {

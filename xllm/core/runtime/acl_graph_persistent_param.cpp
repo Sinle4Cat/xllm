@@ -32,6 +32,7 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/kernels/npu/utils.h"
 #include "core/layers/common/expanded_decode_metadata_builder.h"
 #include "core/util/utils.h"
 
@@ -232,7 +233,9 @@ GraphPersistentParam::GraphPersistentParam(const ModelArgs& args,
   need_update_attention_plan_ =
       (args.model_type() != "deepseek_v32" &&
        !util::is_deepseek_v4_model_type(args.model_type()) &&
-       args.model_type() != "glm_moe_dsa" && !supports_mla_graph_kv_bucketing_);
+       args.model_type() != "glm_moe_dsa" &&
+       !supports_mla_graph_kv_bucketing_ &&
+       !(args.model_type() == "qwen3_5_text" && kernel::npu::is_ascend950()));
 
   // Check if mRoPE is used (for VLM models like qwen2-vl)
   use_mrope_ = !args.rope_scaling_mrope_section().empty();

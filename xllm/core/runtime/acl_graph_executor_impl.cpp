@@ -639,7 +639,7 @@ bool AclGraph::update_paged_attention_graph_tasks(
         task.scale,
         task.block_size,
         /*sparse_mode=*/0,
-        /*input_layout=*/"BNSD",
+        /*input_layout=*/"BSND",
         /*softmax_lse_flag=*/false,
         /*is_causal=*/false,
         task.output,
