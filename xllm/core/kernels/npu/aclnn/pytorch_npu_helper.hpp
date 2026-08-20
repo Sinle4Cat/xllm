@@ -760,19 +760,47 @@ using ReleaseHugeMemFn = void (*)(void*, bool);
         << "call " #aclnn_api " failed, detail:" << aclGetRecentErrMsg();      \
     void* workspace_addr = nullptr;                                            \
     at::Tensor workspace_tensor;                                               \
+    bool initialize_a5_gdn_soft_sync = false;                                  \
     if (workspace_size != 0) {                                                 \
       at::TensorOptions options =                                              \
           at::TensorOptions(torch_npu::utils::get_npu_device_type());          \
       workspace_tensor = at::empty({static_cast<int64_t>(workspace_size)},     \
                                    options.dtype(at::kByte));                  \
-      if (std::getenv("XLLM_DEBUG_ZERO_MEGA_GDN_PREFILL_WORKSPACE") !=         \
-              nullptr &&                                                       \
-          std::strcmp(#aclnn_api, "aclnnMegaGdnPrefillOp") == 0) {             \
-        workspace_tensor.zero_();                                              \
-      }                                                                        \
       workspace_addr = const_cast<void*>(workspace_tensor.storage().data());   \
+      if (std::strcmp(#aclnn_api, "aclnnMegaGdnPrefillOp") == 0 ||             \
+          std::strcmp(#aclnn_api, "aclnnMegaGdnMtpDecode") == 0) {             \
+        const char* workspace_soc_name = aclrtGetSocName();                    \
+        initialize_a5_gdn_soft_sync =                                          \
+            workspace_soc_name != nullptr &&                                   \
+            std::strstr(workspace_soc_name, "Ascend950") != nullptr;           \
+      }                                                                        \
+      if (initialize_a5_gdn_soft_sync) {                                       \
+        constexpr int64_t kReservedWorkspaceBytes = 16 * 1024 * 1024;          \
+        constexpr int64_t kSoftSyncWorkspaceBytes = 4 * 1024;                  \
+        CHECK_GE(workspace_size,                                               \
+                 static_cast<uint64_t>(kReservedWorkspaceBytes +               \
+                                       kSoftSyncWorkspaceBytes))               \
+            << #aclnn_api << " workspace is too small for A5 software sync";   \
+      }                                                                        \
     }                                                                          \
-    auto acl_call = [=]() -> int {                                             \
+    auto acl_call = [=, workspace_lifetime = workspace_tensor]() -> int {      \
+      /* Keep asynchronous OpCommand workspace storage alive until launch. */  \
+      (void)workspace_lifetime;                                                \
+      if (initialize_a5_gdn_soft_sync) {                                       \
+        constexpr int64_t kReservedWorkspaceBytes = 16 * 1024 * 1024;          \
+        constexpr int64_t kSoftSyncWorkspaceBytes = 4 * 1024;                  \
+        void* soft_sync_workspace =                                            \
+            static_cast<uint8_t*>(workspace_addr) + kReservedWorkspaceBytes;   \
+        /* Reset and kernel submission must remain adjacent in task order. */  \
+        const aclError memset_status =                                         \
+            aclrtMemsetAsync(soft_sync_workspace,                              \
+                             kSoftSyncWorkspaceBytes,                          \
+                             0,                                                \
+                             kSoftSyncWorkspaceBytes,                          \
+                             acl_stream);                                      \
+        CHECK_EQ(memset_status, ACL_SUCCESS)                                   \
+            << "failed to clear " #aclnn_api << " A5 software-sync workspace"; \
+      }                                                                        \
       using OpApiFunc =                                                        \
           int (*)(void*, uint64_t, ::aclOpExecutor*, const aclrtStream);       \
       OpApiFunc op_api_func = reinterpret_cast<OpApiFunc>(op_api_func_addr);   \

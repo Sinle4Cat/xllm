@@ -1281,6 +1281,9 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const bool static_mtp_variant = uses_static_mtp_graph_task_variant(
       params_single, bucket_num_tokens, options_.block_size());
+  size_t graph_count_after_capture = 0;
+  size_t graph_pool_count_after_capture = 0;
+  size_t graph_stream_count_after_capture = 0;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
     if (static_mtp_variant) {
@@ -1295,7 +1298,16 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     // shared_ptr keeps a replay/prepare that already left the map alive if a
     // later capture evicts this static variant.
     active_slot.graphs[graph_key] = graph;
+    graph_count_after_capture = get_graph_count();
+    graph_pool_count_after_capture = get_graph_memory_pool_count();
+    graph_stream_count_after_capture = get_graph_capture_stream_count();
   }
+  LOG(INFO) << "ACL graph inventory after capture: graphs="
+            << graph_count_after_capture
+            << ", pools=" << graph_pool_count_after_capture
+            << ", capture_streams=" << graph_stream_count_after_capture
+            << ", active_pool=(" << active_slot.graph_pool.first << ", "
+            << active_slot.graph_pool.second << ")";
 
   // Return the output from capture (no need to replay since capture
   // already executed)

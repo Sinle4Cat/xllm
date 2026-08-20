@@ -16,6 +16,8 @@ limitations under the License.
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <glog/logging.h>
 
+#include <cstdlib>
+
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/utils.h"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
@@ -126,7 +128,8 @@ void reshape_paged_cache(torch::Tensor& key,
                          const torch::Tensor& slot_mapping) {
   CHECK(value.has_value()) << "NPU reshape_paged_cache requires value.";
   CHECK(v_cache.has_value()) << "NPU reshape_paged_cache requires v_cache.";
-  if (is_ascend950()) {
+  if (is_ascend950() &&
+      std::getenv("XLLM_DISABLE_RESHAPE_AND_CACHE_A5") == nullptr) {
     reshape_and_cache_a5(
         key, value.value(), k_cache, v_cache.value(), slot_mapping);
     return;

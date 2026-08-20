@@ -164,7 +164,8 @@ void AttentionImpl::decoder_forward(torch::Tensor& query,
 
   // The Ascend950 graph-safe composite attention consumes the persistent
   // device lengths. CPU lengths would be frozen when the graph is captured.
-  if (attn_metadata.enable_cuda_graph && !tiling_data.defined() &&
+  if (attn_metadata.enable_cuda_graph &&
+      !attn_metadata.expanded_decode.enabled && !tiling_data.defined() &&
       xllm::kernel::npu::is_ascend950()) {
     kv_seq_lens = attn_metadata.kv_seq_lens;
   }
