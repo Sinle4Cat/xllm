@@ -349,6 +349,23 @@ torch::Tensor npu_recurrent_gated_delta_rule(
     const std::optional<torch::Tensor>& g,
     const std::optional<torch::Tensor>& gk);
 
+torch::Tensor mega_gdn_prefill_op(const torch::Tensor& mixed_qkv,
+                                  const torch::Tensor& b,
+                                  const torch::Tensor& a,
+                                  const torch::Tensor& z,
+                                  const torch::Tensor& conv_weight,
+                                  torch::Tensor& conv_state,
+                                  const torch::Tensor& a_log,
+                                  const torch::Tensor& dt_bias,
+                                  const torch::Tensor& conv_state_read_indices,
+                                  const torch::Tensor& conv_state_write_indices,
+                                  const torch::Tensor& ssm_state_read_indices,
+                                  const torch::Tensor& ssm_state_write_indices,
+                                  torch::Tensor& ssm_cache,
+                                  const torch::Tensor& cu_seqlens,
+                                  const torch::Tensor& norm_weight,
+                                  int64_t num_matrices);
+
 std::tuple<torch::Tensor,
            torch::Tensor,
            torch::Tensor,
