@@ -37,6 +37,7 @@ limitations under the License.
 #include "core/framework/speculative/mtp_async_state.h"
 #include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/kernels/npu/utils.h"
 #include "core/kernels/ops_api.h"
 #include "core/platform/device.h"
 #include "core/platform/npu/acl_graph_task_update_context.h"
@@ -625,25 +626,71 @@ bool AclGraph::update_paged_attention_graph_tasks(
         << "paged attention graph update lengths must match capture batch";
     std::vector<int64_t> query_seq_lens(task.query.size(0), 1);
 
+    if (xllm::kernel::npu::is_ascend950() && !task.workspace.defined()) {
+      // Allocate once outside capture and retain it with the graph task. The
+      // max-workspace API deliberately covers all later KV sequence lengths.
+      task.workspace =
+          xllm::kernel::npu::npu_fused_infer_attention_graph_workspace(
+              task.query,
+              task.key_cache,
+              task.value_cache,
+              std::nullopt,
+              std::make_optional(task.block_table),
+              query_seq_lens,
+              key_value_seq_lens,
+              task.num_heads,
+              task.num_key_value_heads,
+              task.scale,
+              task.block_size,
+              /*sparse_mode=*/0,
+              /*input_layout=*/"BSND",
+              /*softmax_lse_flag=*/false);
+      VLOG(kGraphExecutorLogVerboseLevel)
+          << "allocated persistent A5 paged-attention graph workspace: "
+          << task.workspace.nbytes() << " bytes";
+    }
+
     c10_npu::graph_task_update_begin(update_stream, task.handle);
-    xllm::kernel::npu::npu_fused_infer_attention_out(
-        task.query,
-        task.key_cache,
-        task.value_cache,
-        std::nullopt,
-        std::make_optional(task.block_table),
-        query_seq_lens,
-        key_value_seq_lens,
-        task.num_heads,
-        task.num_key_value_heads,
-        task.scale,
-        task.block_size,
-        /*sparse_mode=*/0,
-        /*input_layout=*/"BSND",
-        /*softmax_lse_flag=*/false,
-        /*is_causal=*/false,
-        task.output,
-        task.softmax_lse);
+    if (xllm::kernel::npu::is_ascend950()) {
+      CHECK(task.workspace.defined());
+      xllm::kernel::npu::npu_fused_infer_attention_graph_out(
+          task.query,
+          task.key_cache,
+          task.value_cache,
+          std::nullopt,
+          std::make_optional(task.block_table),
+          query_seq_lens,
+          key_value_seq_lens,
+          task.num_heads,
+          task.num_key_value_heads,
+          task.scale,
+          task.block_size,
+          /*sparse_mode=*/0,
+          /*input_layout=*/"BSND",
+          /*softmax_lse_flag=*/false,
+          task.workspace,
+          task.output,
+          task.softmax_lse);
+    } else {
+      xllm::kernel::npu::npu_fused_infer_attention_out(
+          task.query,
+          task.key_cache,
+          task.value_cache,
+          std::nullopt,
+          std::make_optional(task.block_table),
+          query_seq_lens,
+          key_value_seq_lens,
+          task.num_heads,
+          task.num_key_value_heads,
+          task.scale,
+          task.block_size,
+          /*sparse_mode=*/0,
+          /*input_layout=*/"BSND",
+          /*softmax_lse_flag=*/false,
+          /*is_causal=*/false,
+          task.output,
+          task.softmax_lse);
+    }
     c10_npu::graph_task_update_end(update_stream);
     if (task.event != nullptr) {
       task.event->record(update_stream);

@@ -785,6 +785,10 @@ struct ModelEmbeddingInput {
   // IntTensor: [n_seq]
   torch::Tensor linear_state_indices;
 
+  // Optional BoolTensor: [n_seq]. MTP draft forwards use this stable device
+  // tensor to distinguish restored recurrent state from zero initialization.
+  torch::Tensor linear_state_validity_mask;
+
   // Source slots consumed by recurrent-state kernels. A negative id means
   // that the sequence starts from a zero state.
   std::vector<int32_t> linear_state_read_ids;
@@ -812,6 +816,8 @@ struct ModelEmbeddingInput {
     out.embedding_ids = embedding_ids;
     out.linear_state_ids = linear_state_ids;
     out.linear_state_indices = safe_to(linear_state_indices, device, true);
+    out.linear_state_validity_mask =
+        safe_to(linear_state_validity_mask, device, true);
     out.linear_state_read_ids = linear_state_read_ids;
     out.linear_state_read_indices =
         safe_to(linear_state_read_indices, device, true);
@@ -1035,6 +1041,10 @@ struct ModelInputParams {
     params.linear_state_cache_ops = linear_state_cache_ops;
     params.linear_state_validity_mask = linear_state_validity_mask;
     params.is_spec_verify = is_spec_verify;
+    params.is_mtp_draft = is_mtp_draft;
+    params.mtp_draft_q_seq_lens_host = mtp_draft_q_seq_lens_host;
+    params.mtp_draft_q_cu_seq_lens =
+        safe_to(mtp_draft_q_cu_seq_lens, device, true);
     params.num_accepted_tokens = safe_to(num_accepted_tokens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
 #if defined(USE_MUSA)
@@ -1169,6 +1179,13 @@ struct ModelInputParams {
   LinearStateValidityMask linear_state_validity_mask;
 
   bool is_spec_verify = false;
+  // True only for MTP draft-model forwards. This prevents ordinary short
+  // prefills from entering the draft recurrent-state contract.
+  bool is_mtp_draft = false;
+  // Attention may represent one logical sequence with one or two token rows,
+  // while the draft GDN kernel updates one recurrent state sequentially.
+  std::vector<int32_t> mtp_draft_q_seq_lens_host;
+  torch::Tensor mtp_draft_q_cu_seq_lens;
   // Propagated to AttentionMetadata for caller-managed cacheless prefill.
   bool prefill_without_cache = false;
   torch::Tensor num_accepted_tokens;

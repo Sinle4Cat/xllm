@@ -68,6 +68,10 @@ struct CausalConv1dGraphTask {
 struct PagedAttentionGraphTask {
   torch::Tensor output;
   torch::Tensor softmax_lse;
+  // A5 graph-task updates must keep their FIA workspace alive for the
+  // lifetime of the captured task. Allocating a new workspace on every
+  // update makes the graph retain one allocator block per decode step.
+  torch::Tensor workspace;
   torch::Tensor query;
   torch::Tensor key_cache;
   torch::Tensor value_cache;

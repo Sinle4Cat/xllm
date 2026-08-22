@@ -128,6 +128,7 @@ torch::Tensor npu_mega_gdn_mtp_decode(const torch::Tensor& qkv,
 
   torch::Tensor conv_out = torch::empty_like(qkv);
   torch::Tensor out = torch::empty_like(z);
+  bool fla_ssm_state_layout = true;
   EXEC_NPU_CMD(aclnnMegaGdnMtpDecode,
                qkv,
                z,
@@ -142,6 +143,7 @@ torch::Tensor npu_mega_gdn_mtp_decode(const torch::Tensor& qkv,
                write_state_indices,
                num_accepted_tokens,
                norm_weight,
+               fla_ssm_state_layout,
                conv_out,
                conv_state,
                ssm_state,

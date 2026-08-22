@@ -646,6 +646,59 @@ bool can_use_mega_gdn_mtp_decode(const torch::Tensor& qkv,
   return true;
 }
 
+bool has_valid_mega_gdn_draft_metadata(const ModelInputParams& input_params,
+                                       int64_t total_tokens,
+                                       int64_t num_state_slots) {
+  if (!input_params.is_mtp_draft || input_params.is_spec_verify ||
+      total_tokens <= 0 || num_state_slots <= 0) {
+    return false;
+  }
+  const auto& q_seq_lens = input_params.mtp_draft_q_seq_lens_host;
+  const auto& write_ids = input_params.embedding.linear_state_ids;
+  const auto& read_ids = input_params.embedding.linear_state_read_ids;
+  const auto& validity = input_params.linear_state_validity_mask;
+  const size_t batch_size = q_seq_lens.size();
+  if (batch_size == 0 || batch_size > 32 || write_ids.size() != batch_size ||
+      read_ids.size() != batch_size || validity.size() != batch_size) {
+    return false;
+  }
+
+  int64_t grouped_tokens = 0;
+  for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    const int32_t q_seq_len = q_seq_lens[batch_idx];
+    const int32_t read_id = read_ids[batch_idx];
+    const int32_t write_id = write_ids[batch_idx];
+    const int64_t has_initial_state = validity[batch_idx];
+    if ((q_seq_len != 1 && q_seq_len != 2) || write_id < 0 ||
+        write_id >= num_state_slots ||
+        (has_initial_state != 0 && has_initial_state != 1) ||
+        (has_initial_state == 1 &&
+         (read_id < 0 || read_id >= num_state_slots)) ||
+        (has_initial_state == 0 && read_id != -1 &&
+         (read_id < 0 || read_id >= num_state_slots))) {
+      return false;
+    }
+    grouped_tokens += q_seq_len;
+  }
+  if (grouped_tokens != total_tokens) {
+    return false;
+  }
+
+  for (size_t write_idx = 0; write_idx < batch_size; ++write_idx) {
+    for (size_t other_idx = 0; other_idx < batch_size; ++other_idx) {
+      if (write_idx == other_idx) {
+        continue;
+      }
+      if (write_ids[write_idx] == write_ids[other_idx] ||
+          (validity[other_idx] != 0 &&
+           write_ids[write_idx] == read_ids[other_idx])) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 torch::Tensor run_causal_conv1d_graph_update(
     const std::shared_ptr<xllm::npu::AclGraphTaskUpdateContext>& graph_context,
     const torch::Tensor& x,
@@ -989,6 +1042,96 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       graph_context != nullptr && graph_context->capturing;
 
   const auto& norm_weight = norm_->weight();
+
+  const int64_t draft_batch_size =
+      static_cast<int64_t>(input_params.mtp_draft_q_seq_lens_host.size());
+  const torch::Tensor& draft_q_cu_seq_lens =
+      input_params.mtp_draft_q_cu_seq_lens;
+  const torch::Tensor& draft_state_validity_mask =
+      input_params.embedding.linear_state_validity_mask;
+  const int64_t draft_num_state_slots = conv_cache.size(0);
+  if (xllm::kernel::npu::is_ascend950() &&
+      std::getenv("XLLM_DISABLE_MEGA_GDN_DRAFT_DECODE") == nullptr &&
+      has_valid_mega_gdn_draft_metadata(
+          input_params, original_num_tokens, draft_num_state_slots) &&
+      checkpoint_stride == 1 && supported_qwen35_tp &&
+      num_k_heads_ % tp_size_ == 0 && num_v_heads_ % tp_size_ == 0 &&
+      head_k_dim_ == 128 && head_v_dim_ == 128 &&
+      has_supported_mega_gdn_geometry(local_conv_dim, local_v_heads) &&
+      std::abs(norm_->eps() - 1e-6) < 1e-12 && mixed_qkv.dim() == 3 &&
+      mixed_qkv.size(0) == batch_size && mixed_qkv.size(1) == seq_len &&
+      mixed_qkv.size(2) == local_conv_dim && z.dim() == 4 &&
+      z.size(0) == batch_size && z.size(1) == seq_len &&
+      z.size(2) == local_v_heads && z.size(3) == head_v_dim_ && a.dim() == 3 &&
+      b.dim() == 3 && a.sizes() == b.sizes() && a.size(0) == batch_size &&
+      a.size(1) == seq_len && a.size(2) == local_v_heads &&
+      conv_weight.dim() == 2 &&
+      conv_weight.sizes() == torch::IntArrayRef({4, local_conv_dim}) &&
+      conv_cache.dim() == 3 && conv_cache.size(1) == 3 &&
+      conv_cache.size(2) == local_conv_dim && ssm_cache.dim() == 4 &&
+      ssm_cache.sizes() == torch::IntArrayRef({draft_num_state_slots,
+                                               local_v_heads,
+                                               head_v_dim_,
+                                               head_k_dim_}) &&
+      logical_state_indices.dim() == 1 &&
+      logical_state_indices.numel() == draft_batch_size &&
+      logical_state_read_indices.dim() == 1 &&
+      logical_state_read_indices.numel() == draft_batch_size &&
+      draft_q_cu_seq_lens.defined() && draft_q_cu_seq_lens.dim() == 1 &&
+      draft_q_cu_seq_lens.numel() == draft_batch_size + 1 &&
+      draft_q_cu_seq_lens.scalar_type() == torch::kInt32 &&
+      draft_state_validity_mask.defined() &&
+      draft_state_validity_mask.dim() == 1 &&
+      draft_state_validity_mask.numel() == draft_batch_size &&
+      draft_state_validity_mask.scalar_type() == torch::kBool &&
+      draft_q_cu_seq_lens.device() == device &&
+      draft_state_validity_mask.device() == device &&
+      draft_q_cu_seq_lens.is_contiguous() &&
+      draft_state_validity_mask.is_contiguous()) {
+    torch::Tensor draft_read_state_indices = input_params.enable_graph
+                                                 ? logical_state_indices
+                                                 : logical_state_read_indices;
+    draft_read_state_indices = torch::where(draft_state_validity_mask,
+                                            draft_read_state_indices,
+                                            logical_state_indices)
+                                   .contiguous();
+    torch::Tensor packed_qkv = reshape_qkvz_unpad(attn_metadata, mixed_qkv)
+                                   .view({original_num_tokens, local_conv_dim});
+    torch::Tensor packed_z =
+        reshape_qkvz_unpad(attn_metadata, z)
+            .view({original_num_tokens, local_v_heads, head_v_dim_});
+    torch::Tensor packed_b = reshape_qkvz_unpad(attn_metadata, b)
+                                 .view({original_num_tokens, local_v_heads});
+    torch::Tensor packed_a = reshape_qkvz_unpad(attn_metadata, a)
+                                 .view({original_num_tokens, local_v_heads});
+    LOG_FIRST_N(INFO, 1)
+        << "Using MegaGdnDraftDecode for Qwen3.5 MTP draft: batch="
+        << draft_batch_size << ", tokens=" << original_num_tokens
+        << ", graph=" << input_params.enable_graph;
+    torch::Tensor norm_out =
+        xllm::kernel::mega_gdn_draft_decode(packed_qkv,
+                                            packed_z,
+                                            packed_b,
+                                            packed_a,
+                                            conv_weight,
+                                            conv_cache,
+                                            A_log_,
+                                            dt_bias_,
+                                            ssm_cache,
+                                            draft_read_state_indices,
+                                            logical_state_indices,
+                                            draft_q_cu_seq_lens,
+                                            draft_state_validity_mask,
+                                            norm_weight);
+    torch::Tensor rearranged_norm =
+        norm_out.reshape({original_num_tokens, local_v_heads * head_v_dim_});
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(rearranged_norm,
+                              row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
+    return o_proj_->forward(rearranged_norm);
+  }
+
   int64_t packed_prefill_tokens = 0;
   int64_t prefill_num_matrices = 0;
   bool prefill_lengths_valid =
@@ -1038,8 +1181,9 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   }
   if (std::getenv("XLLM_ENABLE_QWEN35_GDN_PREFILL_E2E") != nullptr &&
       std::getenv("XLLM_DISABLE_QWEN35_GDN_PREFILL_E2E") == nullptr &&
-      !use_spec_verify && is_any_prefill && fla_ssm_state_layout &&
-      prefill_lengths_valid && prefill_state_metadata_valid &&
+      !use_spec_verify && !input_params.is_mtp_draft && is_any_prefill &&
+      fla_ssm_state_layout && prefill_lengths_valid &&
+      prefill_state_metadata_valid &&
       packed_prefill_tokens == original_num_tokens && supported_qwen35_tp &&
       num_k_heads_ % tp_size_ == 0 && num_v_heads_ % tp_size_ == 0 &&
       local_q_heads > 0 && supported_prefill_super_op_heads &&
@@ -1135,7 +1279,14 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         attn_metadata.q_cu_seq_lens,
         norm_weight,
         prefill_num_matrices);
-    if (std::getenv("XLLM_DEBUG_SYNC_MEGA_GDN_PREFILL") != nullptr) {
+    // Ascend950 does not provide coherent cross-AIV business-data caches at
+    // the kernel/ACL-graph boundary.  The Prefill Super kernel publishes the
+    // persistent Conv/SSM state consumed by the first decode graph replay, so
+    // complete that publication before the scheduler can enqueue decode work
+    // on another stream.  Without this fence, a reused graph slot can retain
+    // stale state and collapse generation to a repeated token stream.
+    if (xllm::kernel::npu::is_ascend950() ||
+        std::getenv("XLLM_DEBUG_SYNC_MEGA_GDN_PREFILL") != nullptr) {
       c10_npu::getCurrentNPUStream().synchronize();
     }
     if (debug_hash_e2e) {

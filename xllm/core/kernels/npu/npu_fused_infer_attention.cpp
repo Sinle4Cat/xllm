@@ -13,8 +13,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <ATen/core/dispatch/Dispatcher.h>
 #include <ATen/ops/scaled_dot_product_attention.h>
 #include <glog/logging.h>
+#include <torch_npu/csrc/aten/CustomFunctions.h>
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "core/kernels/npu/npu_ops_api.h"
@@ -145,6 +147,77 @@ std::optional<torch::Tensor> to_optional_tensor(
     return tensor_opt.value();
   }
   return std::nullopt;
+}
+
+std::vector<c10::SymInt> to_symints(const std::vector<int64_t>& values) {
+  std::vector<c10::SymInt> result;
+  result.reserve(values.size());
+  for (const int64_t value : values) {
+    result.emplace_back(value);
+  }
+  return result;
+}
+
+void dispatch_fia_out_with_workspace(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<c10::SymInt>& actual_seq_lengths,
+    const std::vector<c10::SymInt>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    double scale,
+    int64_t num_key_value_heads,
+    int64_t sparse_mode,
+    int64_t block_size,
+    bool softmax_lse_flag,
+    const torch::Tensor& workspace,
+    torch::Tensor& output,
+    torch::Tensor& softmax_lse) {
+  // The candidate torch_npu exports a generated C++ out wrapper whose
+  // reference-return signature differs from its registered schema. Use the
+  // boxed schema (the same path as Python's `.out`) so both torch_npu layouts
+  // remain ABI-compatible.
+  static const c10::OperatorHandle op =
+      c10::Dispatcher::singleton().findSchemaOrThrow(
+          "npu::npu_fused_infer_attention_score", "out");
+  const c10::IValue none;
+  std::vector<c10::IValue> stack;
+  stack.reserve(42);
+  stack.emplace_back(query);
+  stack.emplace_back(key);
+  stack.emplace_back(value);
+  stack.emplace_back(none);  // pse_shift
+  stack.emplace_back(atten_mask.has_value() ? c10::IValue(*atten_mask) : none);
+  stack.emplace_back(actual_seq_lengths);
+  stack.emplace_back(actual_seq_lengths_kv);
+  for (int i = 0; i < 11; ++i) {
+    stack.emplace_back(none);  // quantization inputs
+  }
+  stack.emplace_back(block_table.has_value() ? c10::IValue(*block_table)
+                                             : none);
+  for (int i = 0; i < 8; ++i) {
+    stack.emplace_back(none);  // padding, shared-prefix, and rope inputs
+  }
+  stack.emplace_back(num_heads);
+  stack.emplace_back(scale);
+  stack.emplace_back(kSwaIntMax);
+  stack.emplace_back(/*next_tokens=*/0);
+  stack.emplace_back(std::string("BSND"));
+  stack.emplace_back(num_key_value_heads);
+  stack.emplace_back(sparse_mode);
+  stack.emplace_back(/*inner_precise=*/0);
+  stack.emplace_back(block_size);
+  stack.emplace_back(/*antiquant_mode=*/0);
+  stack.emplace_back(/*key_antiquant_mode=*/0);
+  stack.emplace_back(/*value_antiquant_mode=*/0);
+  stack.emplace_back(softmax_lse_flag);
+  stack.emplace_back(workspace);
+  stack.emplace_back(std::vector<at::Tensor>{output, softmax_lse});
+  CHECK_EQ(stack.size(), 42);
+  op.callBoxed(stack);
+  CHECK_EQ(stack.size(), 2);
 }
 
 }  // namespace
@@ -457,6 +530,138 @@ void npu_fused_infer_attention_out(
                value_antiquant_mode,
                output,
                softmax_lse);
+}
+
+torch::Tensor npu_fused_infer_attention_graph_workspace(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag) {
+  CHECK(is_ascend950())
+      << "persistent FIA graph workspace is only enabled on Ascend950";
+  check_tensor(query, "query", "npu_fused_infer_attention_graph_workspace");
+  check_tensor(key, "key", "npu_fused_infer_attention_graph_workspace");
+  check_tensor(value, "value", "npu_fused_infer_attention_graph_workspace");
+  CHECK(!actual_seq_lengths.empty()) << "actual_seq_lengths must not be empty";
+  CHECK(!actual_seq_lengths_kv.empty())
+      << "actual_seq_lengths_kv must not be empty";
+
+  const std::optional<torch::Tensor> none_tensor = std::nullopt;
+  const std::optional<torch::Tensor> atten_mask_tensor =
+      to_optional_tensor(atten_mask);
+  const std::optional<torch::Tensor> block_table_tensor =
+      to_optional_tensor(block_table);
+  const std::vector<c10::SymInt> query_lengths = to_symints(actual_seq_lengths);
+  const std::vector<c10::SymInt> key_value_lengths =
+      to_symints(actual_seq_lengths_kv);
+  const at::OptionalSymIntArrayRef no_lengths = std::nullopt;
+
+  return at_npu::native::custom_ops::
+      _npu_fused_infer_attention_score_get_max_workspace(
+          query,
+          key,
+          value,
+          none_tensor,  // pse_shift
+          atten_mask_tensor,
+          c10::SymIntArrayRef(query_lengths),
+          c10::SymIntArrayRef(key_value_lengths),
+          none_tensor,  // dequant_scale1
+          none_tensor,  // quant_scale1
+          none_tensor,  // dequant_scale2
+          none_tensor,  // quant_scale2
+          none_tensor,  // quant_offset2
+          none_tensor,  // antiquant_scale
+          none_tensor,  // antiquant_offset
+          none_tensor,  // key_antiquant_scale
+          none_tensor,  // key_antiquant_offset
+          none_tensor,  // value_antiquant_scale
+          none_tensor,  // value_antiquant_offset
+          block_table_tensor,
+          none_tensor,  // query_padding_size
+          none_tensor,  // kv_padding_size
+          none_tensor,  // key_shared_prefix
+          none_tensor,  // value_shared_prefix
+          no_lengths,   // actual_shared_prefix_len
+          none_tensor,  // query_rope
+          none_tensor,  // key_rope
+          none_tensor,  // key_rope_antiquant_scale
+          num_heads,
+          scale,
+          kSwaIntMax,
+          /*next_tokens=*/0,
+          input_layout,
+          num_key_value_heads,
+          sparse_mode,
+          /*inner_precise=*/0,
+          block_size,
+          /*antiquant_mode=*/0,
+          /*key_antiquant_mode=*/0,
+          /*value_antiquant_mode=*/0,
+          softmax_lse_flag);
+}
+
+void npu_fused_infer_attention_graph_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag,
+    const torch::Tensor& workspace,
+    torch::Tensor& output,
+    torch::Tensor& softmax_lse) {
+  CHECK(is_ascend950())
+      << "persistent FIA graph workspace is only enabled on Ascend950";
+  check_tensor(query, "query", "npu_fused_infer_attention_graph_out");
+  check_tensor(key, "key", "npu_fused_infer_attention_graph_out");
+  check_tensor(value, "value", "npu_fused_infer_attention_graph_out");
+  check_tensor(workspace, "workspace", "npu_fused_infer_attention_graph_out");
+  CHECK(output.defined()) << "output must be preallocated";
+  CHECK(softmax_lse.defined()) << "softmax_lse must be preallocated";
+
+  const std::optional<torch::Tensor> atten_mask_tensor =
+      to_optional_tensor(atten_mask);
+  const std::optional<torch::Tensor> block_table_tensor =
+      to_optional_tensor(block_table);
+  const std::vector<c10::SymInt> query_lengths = to_symints(actual_seq_lengths);
+  const std::vector<c10::SymInt> key_value_lengths =
+      to_symints(actual_seq_lengths_kv);
+  CHECK_EQ(input_layout, "BSND")
+      << "persistent FIA graph update currently supports BSND only";
+  dispatch_fia_out_with_workspace(query,
+                                  key,
+                                  value,
+                                  atten_mask_tensor,
+                                  block_table_tensor,
+                                  query_lengths,
+                                  key_value_lengths,
+                                  num_heads,
+                                  scale,
+                                  num_key_value_heads,
+                                  sparse_mode,
+                                  block_size,
+                                  softmax_lse_flag,
+                                  workspace,
+                                  output,
+                                  softmax_lse);
 }
 
 }  // namespace xllm::kernel::npu
