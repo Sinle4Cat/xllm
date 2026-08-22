@@ -64,7 +64,8 @@ torch::Tensor mega_gdn_mtp_decode(const torch::Tensor& qkv,
                                   const torch::Tensor& read_state_indices,
                                   const torch::Tensor& write_state_indices,
                                   const torch::Tensor& num_accepted_tokens,
-                                  const torch::Tensor& norm_weight) {
+                                  const torch::Tensor& norm_weight,
+                                  bool fla_ssm_state_layout) {
   CHECK(qkv.defined()) << "mega_gdn_mtp_decode: qkv is not defined";
   const torch::Device device = qkv.device();
   check_dtype_and_contiguous(qkv, torch::kBFloat16, device, "qkv");
@@ -134,7 +135,8 @@ torch::Tensor mega_gdn_mtp_decode(const torch::Tensor& qkv,
   CHECK(num_accepted_tokens.sizes() == torch::IntArrayRef({batch_size}));
   CHECK(norm_weight.sizes() == torch::IntArrayRef({kHeadDim}));
 
-  if (std::getenv("XLLM_USE_TILELANG_MTP_SEGMENTED") != nullptr &&
+  if (fla_ssm_state_layout &&
+      std::getenv("XLLM_USE_TILELANG_MTP_SEGMENTED") != nullptr &&
       tilelang::has_mega_gdn_mtp_decode_segmented_specialization(
           batch_size,
           num_state_slots,
@@ -172,6 +174,7 @@ torch::Tensor mega_gdn_mtp_decode(const torch::Tensor& qkv,
                write_state_indices,
                num_accepted_tokens,
                norm_weight,
+               fla_ssm_state_layout,
                conv_out,
                conv_state,
                ssm_state,

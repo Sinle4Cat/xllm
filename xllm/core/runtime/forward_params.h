@@ -247,6 +247,7 @@ inline void clear_contiguous_input_buffer_tensor_targets(
   params.embedding.linear_state_read_indices = torch::Tensor();
   params.embedding.linear_state_write_indices = torch::Tensor();
   params.num_accepted_tokens = torch::Tensor();
+  params.mtp_draft_q_cu_seq_lens = torch::Tensor();
   params.embedding.mtp_bootstrap_embeddings = torch::Tensor();
   params.block_copy.src_block_indices = torch::Tensor();
   params.block_copy.dst_block_indices = torch::Tensor();
@@ -300,6 +301,8 @@ inline bool add_model_tensors_to_plan(const ModelInputParams& source,
          plan.add(source.embedding.linear_state_write_indices,
                   &target.embedding.linear_state_write_indices) &&
          plan.add(source.num_accepted_tokens, &target.num_accepted_tokens) &&
+         plan.add(source.mtp_draft_q_cu_seq_lens,
+                  &target.mtp_draft_q_cu_seq_lens) &&
          plan.add(source.embedding.mtp_bootstrap_embeddings,
                   &target.embedding.mtp_bootstrap_embeddings) &&
          plan.add(source.block_copy.src_block_indices,

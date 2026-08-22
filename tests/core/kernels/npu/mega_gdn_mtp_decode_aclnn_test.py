@@ -144,10 +144,15 @@ class _AclnnMegaGdnMtpDecode:
             self._custom_lib.aclnnMegaGdnMtpDecodeGetWorkspaceSize
         )
         self._get_workspace_size.restype = ctypes.c_int
-        self._get_workspace_size.argtypes = [ctypes.c_void_p] * 17 + [
+        self._get_workspace_size.argtypes = (
+            [ctypes.c_void_p] * 13
+            + [ctypes.c_bool]
+            + [ctypes.c_void_p] * 4
+            + [
             ctypes.POINTER(ctypes.c_uint64),
             ctypes.POINTER(ctypes.c_void_p),
-        ]
+            ]
+        )
         self._run = self._custom_lib.aclnnMegaGdnMtpDecode
         self._run.restype = ctypes.c_int
         self._run.argtypes = [
@@ -262,7 +267,9 @@ class _AclnnMegaGdnMtpDecode:
                 workspace_size = ctypes.c_uint64(0)
                 executor = ctypes.c_void_p()
                 status = self._get_workspace_size(
-                    *acl_tensors,
+                    *acl_tensors[:13],
+                    True,
+                    *acl_tensors[13:],
                     ctypes.byref(workspace_size),
                     ctypes.byref(executor),
                 )

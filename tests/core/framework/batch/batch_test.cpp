@@ -2072,6 +2072,63 @@ TEST(MegaGdnMtpDecodeRouteTest, SupportsConfiguredSpeculativeTokenCounts) {
   }
 }
 
+TEST(MegaGdnMtpDecodeRouteTest, SupportsOperatorHeadGeometry) {
+  EXPECT_TRUE(layer::detail::is_supported_mega_gdn_head_geometry(
+      /*num_k_heads=*/8,
+      /*num_v_heads=*/24,
+      /*head_k_dim=*/128,
+      /*head_v_dim=*/128));
+  EXPECT_TRUE(layer::detail::is_supported_mega_gdn_head_geometry(
+      /*num_k_heads=*/4,
+      /*num_v_heads=*/8,
+      /*head_k_dim=*/128,
+      /*head_v_dim=*/128));
+  EXPECT_TRUE(layer::detail::is_supported_mega_gdn_head_geometry(
+      /*num_k_heads=*/16,
+      /*num_v_heads=*/32,
+      /*head_k_dim=*/128,
+      /*head_v_dim=*/128));
+
+  EXPECT_FALSE(layer::detail::is_supported_mega_gdn_head_geometry(
+      /*num_k_heads=*/3,
+      /*num_v_heads=*/6,
+      /*head_k_dim=*/128,
+      /*head_v_dim=*/128));
+  EXPECT_FALSE(layer::detail::is_supported_mega_gdn_head_geometry(
+      /*num_k_heads=*/4,
+      /*num_v_heads=*/20,
+      /*head_k_dim=*/128,
+      /*head_v_dim=*/128));
+  EXPECT_FALSE(layer::detail::is_supported_mega_gdn_head_geometry(
+      /*num_k_heads=*/4,
+      /*num_v_heads=*/8,
+      /*head_k_dim=*/64,
+      /*head_v_dim=*/128));
+}
+
+TEST(MegaGdnMtpDecodeRouteTest, AcceptsDenseMixedVerifyBatches) {
+  for (const int64_t batch_size : {1, 2, 4, 8}) {
+    for (int64_t speculative_tokens = 1; speculative_tokens <= 16;
+         ++speculative_tokens) {
+      const int64_t sequence_length = speculative_tokens + 1;
+      const std::vector<int32_t> q_seq_lens(
+          static_cast<size_t>(batch_size),
+          static_cast<int32_t>(sequence_length));
+      EXPECT_TRUE(layer::detail::is_dense_mega_gdn_mtp_verify_batch(
+          batch_size * sequence_length, sequence_length, q_seq_lens));
+    }
+  }
+}
+
+TEST(MegaGdnMtpDecodeRouteTest, RejectsRaggedOrMismatchedMixedVerifyBatches) {
+  EXPECT_FALSE(layer::detail::is_dense_mega_gdn_mtp_verify_batch(
+      /*total_tokens=*/9, /*sequence_length=*/5, /*q_seq_lens=*/{5, 4}));
+  EXPECT_FALSE(layer::detail::is_dense_mega_gdn_mtp_verify_batch(
+      /*total_tokens=*/10, /*sequence_length=*/5, /*q_seq_lens=*/{5, 4}));
+  EXPECT_FALSE(layer::detail::is_dense_mega_gdn_mtp_verify_batch(
+      /*total_tokens=*/9, /*sequence_length=*/5, /*q_seq_lens=*/{5, 5}));
+}
+
 TEST(MegaGdnMtpDecodeRouteTest, RejectsNonDenseAndAcceptsGraphVerify) {
   EXPECT_FALSE(layer::detail::can_use_mega_gdn_mtp_decode(
       /*use_spec_verify=*/true,

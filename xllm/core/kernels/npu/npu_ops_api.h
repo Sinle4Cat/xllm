@@ -359,7 +359,24 @@ torch::Tensor mega_gdn_decode(const torch::Tensor& qkv,
                               torch::Tensor& ssm_state,
                               const torch::Tensor& read_state_indices,
                               const torch::Tensor& write_state_indices,
-                              const torch::Tensor& norm_weight);
+                              const torch::Tensor& norm_weight,
+                              bool fla_ssm_state_layout = true);
+
+torch::Tensor mega_gdn_draft_decode(const torch::Tensor& qkv,
+                                    const torch::Tensor& z,
+                                    const torch::Tensor& b,
+                                    const torch::Tensor& a,
+                                    const torch::Tensor& conv_weight,
+                                    torch::Tensor& conv_state,
+                                    const torch::Tensor& a_log,
+                                    const torch::Tensor& dt_bias,
+                                    torch::Tensor& ssm_state,
+                                    const torch::Tensor& read_state_indices,
+                                    const torch::Tensor& write_state_indices,
+                                    const torch::Tensor& q_cu_seq_lens,
+                                    const torch::Tensor& state_validity_mask,
+                                    const torch::Tensor& norm_weight,
+                                    bool fla_ssm_state_layout = true);
 
 torch::Tensor mega_gdn_mtp_decode(const torch::Tensor& qkv,
                                   const torch::Tensor& z,
@@ -373,7 +390,8 @@ torch::Tensor mega_gdn_mtp_decode(const torch::Tensor& qkv,
                                   const torch::Tensor& read_state_indices,
                                   const torch::Tensor& write_state_indices,
                                   const torch::Tensor& num_accepted_tokens,
-                                  const torch::Tensor& norm_weight);
+                                  const torch::Tensor& norm_weight,
+                                  bool fla_ssm_state_layout = true);
 
 torch::Tensor qwen35_gdn_prefill_super_op(const torch::Tensor& mixed_qkv,
                                           const torch::Tensor& z,

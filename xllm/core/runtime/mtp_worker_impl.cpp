@@ -18,9 +18,14 @@ limitations under the License.
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <memory>
+#include <optional>
+#include <sstream>
 
 #include "common/metrics.h"
 #if defined(USE_NPU) || defined(USE_MLU)
@@ -74,6 +79,211 @@ bool should_broadcast_spec_tokens(const ParallelArgs& parallel_args,
 }
 
 constexpr int64_t kMaxSpecVerifyGraphUpdateBlockTableWidth = (1 << 15) - 1;
+
+bool debug_index_selected(const char* values,
+                          int64_t index,
+                          const char* environment_name) {
+  CHECK(values != nullptr);
+  const char* cursor = values;
+  while (*cursor != '\0') {
+    char* end = nullptr;
+    const int64_t candidate = std::strtoll(cursor, &end, /*base=*/10);
+    CHECK(end != cursor && candidate >= 0)
+        << environment_name
+        << " must be a comma-separated list of non-negative integers";
+    if (candidate == index) {
+      return true;
+    }
+    if (*end == '\0') {
+      return false;
+    }
+    CHECK_EQ(*end, ',')
+        << environment_name
+        << " must be a comma-separated list of non-negative integers";
+    cursor = end + 1;
+  }
+  return false;
+}
+
+std::string read_mtp_debug_capture_positions() {
+  const char* config_file =
+      std::getenv("XLLM_DEBUG_MTP_CAPTURE_BASE_POSITIONS_FILE");
+  if (config_file != nullptr) {
+    std::ifstream input(config_file);
+    CHECK(input) << "failed to read MTP debug capture config " << config_file;
+    std::ostringstream contents;
+    contents << input.rdbuf();
+    return contents.str();
+  }
+  const char* positions = std::getenv("XLLM_DEBUG_MTP_CAPTURE_BASE_POSITIONS");
+  return positions == nullptr ? std::string() : std::string(positions);
+}
+
+struct MtpDebugPositionMatch {
+  std::vector<int64_t> rows;
+  std::vector<int32_t> base_positions;
+};
+
+MtpDebugPositionMatch find_mtp_debug_position_match(
+    const ForwardInput& validate_input,
+    int64_t num_val_tokens) {
+  MtpDebugPositionMatch match;
+  const std::string selected_positions = read_mtp_debug_capture_positions();
+  if (selected_positions.empty()) {
+    return match;
+  }
+
+  const torch::Tensor& positions = validate_input.positions_host;
+  CHECK(positions.defined() && positions.device().is_cpu() &&
+        positions.scalar_type() == torch::kInt32 && positions.is_contiguous())
+      << "MTP debug position capture requires contiguous CPU int32 positions";
+  CHECK_EQ(positions.numel() % num_val_tokens, 0);
+  const int64_t batch_size = positions.numel() / num_val_tokens;
+  const int32_t* values = positions.data_ptr<int32_t>();
+  for (int64_t row = 0; row < batch_size; ++row) {
+    const int32_t base_position = values[row * num_val_tokens];
+    if (debug_index_selected(selected_positions.c_str(),
+                             base_position,
+                             "MTP debug capture positions")) {
+      match.rows.push_back(row);
+      match.base_positions.push_back(base_position);
+    }
+  }
+  return match;
+}
+
+std::string join_debug_indices(const std::vector<int64_t>& values) {
+  std::ostringstream output;
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) {
+      output << ',';
+    }
+    output << values[index];
+  }
+  return output.str();
+}
+
+std::string join_debug_positions(const std::vector<int32_t>& values) {
+  std::ostringstream output;
+  for (size_t index = 0; index < values.size(); ++index) {
+    if (index != 0) {
+      output << ',';
+    }
+    output << values[index];
+  }
+  return output.str();
+}
+
+class ScopedMtpGdnLayerDump {
+ public:
+  explicit ScopedMtpGdnLayerDump(const MtpDebugPositionMatch& match) {
+    if (match.rows.empty() ||
+        std::getenv("XLLM_DEBUG_MEGA_GDN_MTP_LAYER_DUMP_DIR") == nullptr) {
+      return;
+    }
+    const std::string rows = join_debug_indices(match.rows);
+    const std::string positions = join_debug_positions(match.base_positions);
+    CHECK_EQ(setenv("XLLM_DEBUG_MEGA_GDN_MTP_LAYER_DUMP_ACTIVE_ROWS",
+                    rows.c_str(),
+                    /*overwrite=*/1),
+             0);
+    CHECK_EQ(setenv("XLLM_DEBUG_MEGA_GDN_MTP_LAYER_DUMP_ACTIVE_POSITIONS",
+                    positions.c_str(),
+                    /*overwrite=*/1),
+             0);
+    enabled_ = true;
+  }
+
+  ~ScopedMtpGdnLayerDump() {
+    if (enabled_) {
+      CHECK_EQ(unsetenv("XLLM_DEBUG_MEGA_GDN_MTP_LAYER_DUMP_ACTIVE_ROWS"), 0);
+      CHECK_EQ(unsetenv("XLLM_DEBUG_MEGA_GDN_MTP_LAYER_DUMP_ACTIVE_POSITIONS"),
+               0);
+    }
+  }
+
+ private:
+  bool enabled_ = false;
+};
+
+void dump_mtp_logits_trace(const ForwardInput& input,
+                           const ForwardInput& validate_input,
+                           const std::vector<ForwardOutput>& draft_outputs,
+                           const ForwardOutput& target_output,
+                           const SampleOutput& validate_output,
+                           const MtpDebugPositionMatch& position_match,
+                           int32_t global_rank,
+                           int64_t num_val_tokens) {
+  const char* dump_dir = std::getenv("XLLM_DEBUG_MTP_LOGITS_DIR");
+  const auto& request_ids = input.input_params.embedding.request_ids;
+  if (dump_dir == nullptr || global_rank != 0 || request_ids.empty()) {
+    return;
+  }
+
+  static std::atomic<int64_t> round_counter{0};
+  const int64_t round = round_counter.fetch_add(1);
+  const int64_t batch_size = static_cast<int64_t>(request_ids.size());
+  CHECK(target_output.logits.defined());
+  CHECK_EQ(target_output.logits.size(0), batch_size * num_val_tokens);
+
+  std::filesystem::path round_dir =
+      std::filesystem::path(dump_dir) / ("round_" + std::to_string(round));
+  std::error_code error;
+  std::filesystem::create_directories(round_dir, error);
+  CHECK(!error) << "failed to create MTP logits dump directory " << round_dir
+                << ": " << error.message();
+
+  const int64_t vocab_size = target_output.logits.size(-1);
+  torch::Tensor logits =
+      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
+  auto [top2_values, top2_indices] =
+      torch::topk(logits.to(torch::kFloat32), 2, /*dim=*/-1);
+  torch::save(top2_values.cpu(),
+              (round_dir / "target_top2_values.pt").string());
+  torch::save(top2_indices.cpu(),
+              (round_dir / "target_top2_indices.pt").string());
+  torch::save(target_output.sample_output.next_tokens.cpu(),
+              (round_dir / "target_next_tokens.pt").string());
+  torch::save(validate_output.next_tokens.cpu(),
+              (round_dir / "accepted_tokens.pt").string());
+  torch::save(validate_input.positions.cpu(),
+              (round_dir / "positions.pt").string());
+
+  std::vector<torch::Tensor> draft_token_columns;
+  draft_token_columns.reserve(draft_outputs.size());
+  for (const ForwardOutput& draft_output : draft_outputs) {
+    draft_token_columns.emplace_back(
+        draft_output.sample_output.next_tokens.flatten());
+  }
+  if (!draft_token_columns.empty()) {
+    torch::save(torch::stack(draft_token_columns, /*dim=*/1).cpu(),
+                (round_dir / "draft_tokens.pt").string());
+  }
+
+  const char* full_round_value =
+      std::getenv("XLLM_DEBUG_MTP_LOGITS_FULL_ROUND");
+  if (!position_match.rows.empty() ||
+      (full_round_value != nullptr &&
+       debug_index_selected(
+           full_round_value, round, "XLLM_DEBUG_MTP_LOGITS_FULL_ROUND"))) {
+    torch::save(logits.cpu(), (round_dir / "target_logits_full.pt").string());
+  }
+
+  std::ofstream metadata(round_dir / "metadata.tsv");
+  CHECK(metadata) << "failed to open MTP logits metadata under " << round_dir;
+  metadata << "round\t" << round << '\n';
+  metadata << "batch_size\t" << batch_size << '\n';
+  metadata << "num_val_tokens\t" << num_val_tokens << '\n';
+  for (size_t index = 0; index < position_match.rows.size(); ++index) {
+    metadata << "capture_row\t" << position_match.rows[index] << '\t'
+             << position_match.base_positions[index] << '\n';
+  }
+  for (int64_t row = 0; row < batch_size; ++row) {
+    metadata << "request_id\t" << row << '\t' << request_ids[row] << '\n';
+  }
+  LOG(INFO) << "[MTP_LOGITS_DUMP] round=" << round
+            << ", batch_size=" << batch_size << ", dir=" << round_dir;
+}
 
 // Speculative state is replicated across every model rank within one DP
 // replica. With orthogonal CP x TP, tp_group_ covers only one CP shard, while
@@ -1458,12 +1668,19 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
   ForwardInput target_prepared;
   fill_validate_input_from_draft_outputs(
       draft_outputs, validate_input, *compute_stream_);
-  ForwardOutput target_output = run_llm_no_sync_impl(*impl_,
-                                                     validate_input,
-                                                     *compute_stream_,
-                                                     *compute_stream_,
-                                                     target_prepared)
-                                    .value();
+  const int64_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  const MtpDebugPositionMatch debug_position_match =
+      find_mtp_debug_position_match(validate_input, num_val_tokens);
+  ForwardOutput target_output;
+  {
+    ScopedMtpGdnLayerDump layer_dump_scope(debug_position_match);
+    target_output = run_llm_no_sync_impl(*impl_,
+                                         validate_input,
+                                         *compute_stream_,
+                                         *compute_stream_,
+                                         target_prepared)
+                        .value();
+  }
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
 
@@ -1486,11 +1703,18 @@ std::optional<ForwardOutput> MTPWorkerImpl::run_validate(
     c10::StreamGuard stream_guard = compute_stream_->set_stream_guard();
     val_output = validate(input.sampling_params, draft_outputs, target_output);
   }
+  dump_mtp_logits_trace(input,
+                        validate_input,
+                        draft_outputs,
+                        target_output,
+                        val_output,
+                        debug_position_match,
+                        parallel_args_.rank(),
+                        num_val_tokens);
   COUNTER_ADD(speculative_execution_latency_seconds_validation,
               timer.elapsed_seconds());
 
   const int64_t batch_size = val_output.next_tokens.size(0);
-  const int64_t num_val_tokens = options_.num_speculative_tokens() + 1;
   CHECK_EQ(validate_input.positions.numel(), batch_size * num_val_tokens)
       << "validate positions must contain one row per speculative token";
   const torch::Tensor& validate_kv_seq_lens =
@@ -2103,6 +2327,7 @@ void MTPWorkerImpl::prepare_validate_inputs(const ForwardInput& input,
   if (use_chunked_prefill_spec_verify_path()) {
     input_params.embedding.input_embedding = torch::Tensor();
     input_params.is_spec_verify = true;
+    input_params.is_mtp_draft = false;
     if (!input_params.attention.host.q_seq_lens.empty()) {
       std::vector<int32_t> q_cu_seq_lens_vec;
       q_cu_seq_lens_vec.reserve(input_params.meta.num_sequences + 1);
@@ -2345,8 +2570,10 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   }
   std::vector<torch::Tensor> expanded_embeddings;
   std::vector<int32_t> selected_row_idx;
+  std::vector<int32_t> draft_gdn_q_seq_lens;
   expanded_embeddings.reserve(num_sequences * 2);
   selected_row_idx.reserve(num_sequences);
+  draft_gdn_q_seq_lens.reserve(num_sequences);
 
   auto to_worker_device = [this](const torch::Tensor& tensor) {
     if (!tensor.defined() || tensor.device() == device_) {
@@ -2407,6 +2634,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       specBuilder::update_kv_seq_lens_and_max(
           buf.out_kv_seq_lens, kv_len, buf.meta.kv_max_seq_len);
       selected_row_idx.emplace_back(2 * seq_id + 1);
+      draft_gdn_q_seq_lens.emplace_back(2);
       continue;
     }
     const bool use_two_rows =
@@ -2430,6 +2658,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     selected_row_idx.emplace_back(
         static_cast<int32_t>(expanded_embeddings.size()));
     add_row(state.token_id, /*position_offset=*/0, state.embedding);
+    draft_gdn_q_seq_lens.emplace_back(use_two_rows ? 2 : 1);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
@@ -2485,6 +2714,27 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     }
   }
   input_params.attention.rebuild_device_buffer(device_);
+
+  input_params.is_mtp_draft = true;
+  input_params.mtp_draft_q_seq_lens_host = draft_gdn_q_seq_lens;
+  std::vector<int32_t> draft_gdn_q_cu_seq_lens;
+  draft_gdn_q_cu_seq_lens.reserve(draft_gdn_q_seq_lens.size() + 1);
+  draft_gdn_q_cu_seq_lens.emplace_back(0);
+  for (int32_t q_len : draft_gdn_q_seq_lens) {
+    draft_gdn_q_cu_seq_lens.emplace_back(draft_gdn_q_cu_seq_lens.back() +
+                                         q_len);
+  }
+  input_params.mtp_draft_q_cu_seq_lens =
+      safe_to(specBuilder::make_cpu_int_tensor(draft_gdn_q_cu_seq_lens),
+              torch::TensorOptions().dtype(torch::kInt32).device(device_),
+              /*non_blocking=*/true);
+  if (!input_params.embedding.linear_state_validity_mask.defined() ||
+      input_params.embedding.linear_state_validity_mask.numel() !=
+          num_sequences) {
+    input_params.embedding.linear_state_validity_mask = torch::tensor(
+        input_params.linear_state_validity_mask,
+        torch::TensorOptions().dtype(torch::kBool).device(device_));
+  }
 
   input_params.embedding.input_embedding = torch::stack(expanded_embeddings);
 
@@ -2585,6 +2835,12 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
       std::move(input_params.attention.host.q_cu_seq_lens),
       buf.meta.kv_max_seq_len,
       std::move(buf.out_kv_seq_lens));
+  input_params.is_mtp_draft = true;
+  input_params.mtp_draft_q_seq_lens_host.assign(num_sequences, 1);
+  input_params.mtp_draft_q_cu_seq_lens = torch::arange(
+      0,
+      num_sequences + 1,
+      torch::TensorOptions().dtype(torch::kInt32).device(device_));
   if (supports_explicit_spec_verify_replay_update()) {
     input_params.attention.host.q_cu_seq_lens.clear();
     input_params.attention.host.q_cu_seq_lens.reserve(

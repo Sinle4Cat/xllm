@@ -22,6 +22,7 @@ cc_library(
     npu_gemma_rms_norm.cpp
     npu_block_sparse_attention.cpp
     npu_rain_fusion_attention.cpp
+    npu_mega_gdn_draft_decode.cpp
     npu_mega_gdn_decode.cpp
     npu_qwen35_gdn_prefill_super_op.cpp
     npu_grouped_matmul.cpp

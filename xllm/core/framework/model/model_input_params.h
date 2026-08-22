@@ -1046,6 +1046,10 @@ struct ModelInputParams {
     params.linear_state_cache_ops = linear_state_cache_ops;
     params.linear_state_validity_mask = linear_state_validity_mask;
     params.is_spec_verify = is_spec_verify;
+    params.is_mtp_draft = is_mtp_draft;
+    params.mtp_draft_q_seq_lens_host = mtp_draft_q_seq_lens_host;
+    params.mtp_draft_q_cu_seq_lens =
+        safe_to(mtp_draft_q_cu_seq_lens, device, true);
     params.num_accepted_tokens_host = num_accepted_tokens_host;
     params.mtp_topk_state =
         mtp_topk_state == nullptr ? nullptr : mtp_topk_state->to(device);
@@ -1097,6 +1101,7 @@ struct ModelInputParams {
               << parallel.dp_global_token_nums
               << ", dp_is_decode: " << parallel.dp_is_decode;
     LOG(INFO) << "ModelInputParams: is_spec_verify is " << is_spec_verify;
+    LOG(INFO) << "ModelInputParams: is_mtp_draft is " << is_mtp_draft;
     print_tensor(num_accepted_tokens,
                  "ModelInputParams: num_accepted_tokens",
                  /*max_elements=*/4);
@@ -1173,6 +1178,13 @@ struct ModelInputParams {
   LinearStateValidityMask linear_state_validity_mask;
 
   bool is_spec_verify = false;
+  // True only for MTP draft-model forwards. The explicit marker prevents
+  // ordinary short prefills from entering the draft GDN state contract.
+  bool is_mtp_draft = false;
+  // Attention may expand one two-token logical sequence into two decode rows,
+  // while GDN must update one recurrent state sequentially across both tokens.
+  std::vector<int32_t> mtp_draft_q_seq_lens_host;
+  torch::Tensor mtp_draft_q_cu_seq_lens;
   // Propagated to AttentionMetadata for caller-managed cacheless prefill.
   bool prefill_without_cache = false;
   torch::Tensor num_accepted_tokens;

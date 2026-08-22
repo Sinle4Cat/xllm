@@ -30,7 +30,8 @@ torch::Tensor mega_gdn_decode(const torch::Tensor& qkv,
                               torch::Tensor& ssm_state,
                               const torch::Tensor& read_state_indices,
                               const torch::Tensor& write_state_indices,
-                              const torch::Tensor& norm_weight) {
+                              const torch::Tensor& norm_weight,
+                              bool fla_ssm_state_layout) {
   check_tensor(qkv, "qkv", "mega_gdn_decode");
   check_tensor(z, "z", "mega_gdn_decode");
   check_tensor(conv_state, "conv_state", "mega_gdn_decode");
@@ -53,6 +54,7 @@ torch::Tensor mega_gdn_decode(const torch::Tensor& qkv,
                read_state_indices,
                write_state_indices,
                norm_weight,
+               fla_ssm_state_layout,
                conv_out,
                conv_state,
                ssm_state,
