@@ -589,7 +589,7 @@ bool can_use_mega_gdn_mtp_decode(const torch::Tensor& qkv,
   const int64_t sequence_length = checkpoint_stride;
   const int64_t conv_dim = qkv.size(2);
   const int64_t num_value_heads = z.size(2);
-  if (batch_size < 1 || batch_size > 4 || sequence_length < 2 ||
+  if (batch_size < 1 || batch_size > 32 || sequence_length < 2 ||
       sequence_length > 17 || padded_sequence_length < sequence_length ||
       original_num_tokens > padded_batch_size * padded_sequence_length ||
       z.sizes() != torch::IntArrayRef({padded_batch_size,
@@ -1135,7 +1135,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   int64_t packed_prefill_tokens = 0;
   int64_t prefill_num_matrices = 0;
   bool prefill_lengths_valid =
-      batch_size >= 1 && batch_size <= 8 && seq_len > 1 &&
+      batch_size >= 1 && batch_size <= 32 && seq_len > 1 &&
       attn_metadata.q_seq_lens_vec.size() == static_cast<size_t>(batch_size) &&
       input_params.parallel.query_start_loc.size() ==
           static_cast<size_t>(batch_size + 1) &&
@@ -1548,6 +1548,15 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     return o_proj_->forward(rearranged_norm);
   }
 
+  if (xllm::kernel::npu::is_ascend950() && input_params.enable_graph) {
+    LOG(FATAL) << "Qwen3.5 Ascend950 graph execution requires a Mega GDN "
+                  "Prefill, Decode, MTP Decode, or Draft Decode route; "
+                  "small-operator fallback is disabled. batch="
+               << batch_size << ", sequence_length=" << seq_len
+               << ", spec_verify=" << use_spec_verify
+               << ", mtp_draft=" << input_params.is_mtp_draft;
+  }
+
   const auto& read_state_ids = input_params.embedding.linear_state_read_ids;
   if (read_state_ids.size() == input_params.embedding.linear_state_ids.size()) {
     for (size_t row = 0; row < read_state_ids.size(); ++row) {
@@ -1709,34 +1718,6 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             linear_state_indices_host,
             num_accepted,
             conv1d_branch);
-      } else if (xllm::kernel::npu::is_ascend950()) {
-        // This A5-only decode op consumes persistent slot IDs on device. Its
-        // host tiling depends only on shape, so replay does not require one
-        // updateable IntArray task group per GDN layer.
-        CHECK(conv_input.dim() == 2 ||
-              (conv_input.dim() == 3 && conv_input.size(1) == 1))
-            << "A5 graph causal_conv1d decode expects [batch, dim] or "
-               "[batch, 1, dim] input";
-        auto graph_conv_input =
-            conv_input.dim() == 3
-                ? conv_input.reshape({-1, conv_input.size(-1)})
-                : conv_input;
-        CHECK_EQ(graph_conv_input.size(0), logical_state_indices.numel())
-            << "A5 graph causal_conv1d slot IDs must match decode rows";
-        auto cache_indices_tensor =
-            logical_state_indices.to(torch::kInt64).contiguous();
-        torch::Tensor output = torch::empty_like(graph_conv_input);
-        xllm::kernel::npu::causal_conv1d_graph_a5_out(
-            output,
-            graph_conv_input,
-            conv_weight,
-            conv_cache,
-            std::nullopt,
-            cache_indices_tensor,
-            xllm::npu::kCausalConv1dActivationSilu,
-            xllm::npu::kCausalConv1dGraphPadSlotId);
-        mixed_qkv =
-            conv_input.dim() == 3 ? output.view(conv_input.sizes()) : output;
       } else {
         mixed_qkv = run_causal_conv1d_decode();
       }

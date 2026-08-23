@@ -504,17 +504,6 @@ void causal_conv1d_out(const torch::Tensor& output,
                        int64_t pad_slot_id,
                        int64_t run_mode);
 
-// Ascend950 decode-only variant for ACL graph capture/replay. cache_indices is
-// consumed on device and is deliberately not a host value-dependent input.
-void causal_conv1d_graph_a5_out(const torch::Tensor& output,
-                                const torch::Tensor& x,
-                                const torch::Tensor& weight,
-                                const torch::Tensor& conv_state,
-                                const std::optional<torch::Tensor>& bias_opt,
-                                const torch::Tensor& cache_indices,
-                                int64_t activation_mode,
-                                int64_t pad_slot_id);
-
 bool has_mega_moe();
 
 std::tuple<torch::Tensor, torch::Tensor> apply_npu_mega_moe(
