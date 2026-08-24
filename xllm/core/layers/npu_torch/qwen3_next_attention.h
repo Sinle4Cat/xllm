@@ -72,6 +72,7 @@ class Qwen3NextAttentionImpl : public torch::nn::Module {
   bool k_norm_weight_adjusted_ = false;
   std::vector<int64_t> mrope_section_;
   torch::Tensor mrope_gather_pattern_;
+  torch::Tensor mrope_gather_indices_;
 
   QKVParallelLinear qkv_proj_{nullptr};
   RowParallelLinear o_proj_{nullptr};

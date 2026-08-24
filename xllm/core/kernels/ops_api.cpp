@@ -2162,6 +2162,102 @@ void npu_inplace_partial_rotary_mul(NpuInplacePartialRotaryMulParams& params) {
 #endif
 }
 
+torch::Tensor mega_gdn_decode(const torch::Tensor& qkv,
+                              const torch::Tensor& z,
+                              const torch::Tensor& b,
+                              const torch::Tensor& a,
+                              const torch::Tensor& conv_weight,
+                              torch::Tensor& conv_state,
+                              const torch::Tensor& a_log,
+                              const torch::Tensor& dt_bias,
+                              torch::Tensor& ssm_state,
+                              const torch::Tensor& read_state_indices,
+                              const torch::Tensor& write_state_indices,
+                              const torch::Tensor& norm_weight) {
+#if defined(USE_NPU)
+  return npu::npu_mega_gdn_decode(qkv,
+                                  z,
+                                  b,
+                                  a,
+                                  conv_weight,
+                                  conv_state,
+                                  a_log,
+                                  dt_bias,
+                                  ssm_state,
+                                  read_state_indices,
+                                  write_state_indices,
+                                  norm_weight);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor mega_gdn_draft_decode(const torch::Tensor& qkv,
+                                    const torch::Tensor& z,
+                                    const torch::Tensor& b,
+                                    const torch::Tensor& a,
+                                    const torch::Tensor& conv_weight,
+                                    torch::Tensor& conv_state,
+                                    const torch::Tensor& a_log,
+                                    const torch::Tensor& dt_bias,
+                                    torch::Tensor& ssm_state,
+                                    const torch::Tensor& read_state_indices,
+                                    const torch::Tensor& write_state_indices,
+                                    const torch::Tensor& q_cu_seq_lens,
+                                    const torch::Tensor& state_validity_mask,
+                                    const torch::Tensor& norm_weight) {
+#if defined(USE_NPU)
+  return npu::npu_mega_gdn_draft_decode(qkv,
+                                        z,
+                                        b,
+                                        a,
+                                        conv_weight,
+                                        conv_state,
+                                        a_log,
+                                        dt_bias,
+                                        ssm_state,
+                                        read_state_indices,
+                                        write_state_indices,
+                                        q_cu_seq_lens,
+                                        state_validity_mask,
+                                        norm_weight);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
+torch::Tensor mega_gdn_mtp_decode(const torch::Tensor& qkv,
+                                  const torch::Tensor& z,
+                                  const torch::Tensor& b,
+                                  const torch::Tensor& a,
+                                  const torch::Tensor& conv_weight,
+                                  torch::Tensor& conv_state,
+                                  const torch::Tensor& a_log,
+                                  const torch::Tensor& dt_bias,
+                                  torch::Tensor& ssm_state,
+                                  const torch::Tensor& read_state_indices,
+                                  const torch::Tensor& write_state_indices,
+                                  const torch::Tensor& num_accepted_tokens,
+                                  const torch::Tensor& norm_weight) {
+#if defined(USE_NPU)
+  return npu::npu_mega_gdn_mtp_decode(qkv,
+                                      z,
+                                      b,
+                                      a,
+                                      conv_weight,
+                                      conv_state,
+                                      a_log,
+                                      dt_bias,
+                                      ssm_state,
+                                      read_state_indices,
+                                      write_state_indices,
+                                      num_accepted_tokens,
+                                      norm_weight);
+#else
+  NOT_IMPLEMENTED();
+#endif
+}
+
 torch::Tensor recurrent_gated_delta_rule(
     const torch::Tensor& query,
     const torch::Tensor& key,

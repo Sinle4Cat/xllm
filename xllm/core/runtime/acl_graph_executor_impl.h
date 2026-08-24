@@ -147,6 +147,7 @@ class AclGraph {
   void update_spec_verify_attention_tiling(const ModelInputParams& params);
 
   bool update_graph_tasks(const ModelInputParams& params);
+  bool update_paged_attention_graph_tasks(const ModelInputParams& params);
   void signal_static_graph_tasks(const c10_npu::NPUStream& signal_stream);
   bool static_graph_task_signature_matches(
       const ModelInputParams& params) const;

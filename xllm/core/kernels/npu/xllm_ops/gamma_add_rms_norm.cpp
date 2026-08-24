@@ -14,6 +14,7 @@ limitations under the License.
 ==============================================================================*/
 
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
+#include "core/kernels/npu/utils.h"
 #include "core/kernels/npu/xllm_ops/xllm_ops_api.h"
 
 namespace xllm::kernel::npu {
@@ -37,6 +38,36 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> gamma_add_rms_norm(
   rstd_shape.reserve(static_cast<size_t>(x1.dim()));
   for (int64_t index = 0; index < x1.dim(); ++index) {
     rstd_shape.emplace_back(index < keep_dims ? x1_shape[index] : 1);
+  }
+
+  // The custom GammaAddRmsNorm dynamic kernel cannot be parsed by the A5
+  // runtime. Preserve the operator's dtype rounding points with an eager
+  // composite. Keep the original custom-op route on earlier generations.
+  if (is_ascend950()) {
+    const torch::ScalarType dtype = x1.scalar_type();
+    torch::Tensor x_out;
+    if (dtype == torch::kFloat16) {
+      x_out = x1 + x2;
+    } else {
+      x_out = (x1.to(torch::kFloat32) + x2.to(torch::kFloat32)).to(dtype);
+    }
+
+    torch::Tensor adjusted_gamma = gamma;
+    if (add_gamma_offset) {
+      adjusted_gamma = (gamma + 1).to(dtype);
+    }
+    std::vector<int64_t> norm_dims;
+    norm_dims.reserve(static_cast<size_t>(gamma.dim()));
+    for (int64_t index = keep_dims; index < x1.dim(); ++index) {
+      norm_dims.emplace_back(index);
+    }
+    const torch::Tensor x_fp32 = x_out.to(torch::kFloat32);
+    torch::Tensor rstd_out = torch::rsqrt(
+        torch::mean(torch::square(x_fp32), norm_dims, /*keepdim=*/true) +
+        epsilon);
+    torch::Tensor y_out =
+        ((x_fp32 * rstd_out).to(dtype) * adjusted_gamma).to(dtype);
+    return {y_out, rstd_out, x_out};
   }
 
   torch::Tensor y_out = torch::empty_like(x1);

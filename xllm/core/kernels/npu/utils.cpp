@@ -114,10 +114,16 @@ torch::Tensor expand_kv_heads(const torch::Tensor& tensor,
 
   CHECK_EQ(num_heads % num_kv_heads, 0)
       << "num_heads must be divisible by num_kv_heads";
+  CHECK_GE(tensor.dim(), 2);
+  CHECK_EQ(tensor.size(-2), num_kv_heads);
   const int64_t expansion_factor = num_heads / num_kv_heads;
-  return tensor.unsqueeze(2)
-      .expand({tensor.size(0), num_kv_heads, expansion_factor, tensor.size(2)})
-      .reshape({tensor.size(0), num_heads, tensor.size(2)});
+  std::vector<int64_t> expanded_shape(tensor.sizes().begin(),
+                                      tensor.sizes().end());
+  expanded_shape.insert(expanded_shape.end() - 1, expansion_factor);
+  std::vector<int64_t> output_shape(tensor.sizes().begin(),
+                                    tensor.sizes().end());
+  output_shape[output_shape.size() - 2] = num_heads;
+  return tensor.unsqueeze(-2).expand(expanded_shape).reshape(output_shape);
 }
 
 }  // namespace xllm::kernel::npu

@@ -102,12 +102,14 @@ torch::Tensor mega_gdn_prefill_op(const torch::Tensor& mixed_qkv,
   check_tensor(norm_weight, "norm_weight", "mega_gdn_prefill_op");
 
   auto masks = get_or_create_masks(mixed_qkv.device());
-  uint32_t ffts_len = 0;
   uint64_t ffts_addr = 0;
-  const auto status = rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
-  CHECK_EQ(status, 0) << "rtGetC2cCtrlAddr failed for mega_gdn_prefill_op";
-  CHECK_GT(ffts_len, 0)
-      << "rtGetC2cCtrlAddr returned an empty FFTS control region";
+  if (!is_ascend950()) {
+    uint32_t ffts_len = 0;
+    const int32_t status = rtGetC2cCtrlAddr(&ffts_addr, &ffts_len);
+    CHECK_EQ(status, 0) << "rtGetC2cCtrlAddr failed for mega_gdn_prefill_op";
+    CHECK_GT(ffts_len, 0)
+        << "rtGetC2cCtrlAddr returned an empty FFTS control region";
+  }
   CHECK_GT(num_matrices, 0) << "num_matrices must be positive";
   int64_t ffts_addr_arg = static_cast<int64_t>(ffts_addr);
 

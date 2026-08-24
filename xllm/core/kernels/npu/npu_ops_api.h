@@ -51,6 +51,17 @@ void batch_decode(const torch::Tensor& query,
                   const torch::Tensor& seq_lens,
                   torch::Tensor& output);
 
+// Graph-safe FlashAttentionScoreV4 with caller-owned outputs. The mask follows
+// ACLNN semantics: true entries are excluded from attention.
+void npu_flash_attention_score_v4_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& attention_mask,
+    int64_t num_heads,
+    double scale,
+    torch::Tensor& output);
+
 void apply_rotary(torch::Tensor& query,
                   torch::Tensor& key,
                   const torch::Tensor& cos,
@@ -73,6 +84,63 @@ std::tuple<torch::Tensor, torch::Tensor> npu_fused_infer_attention(
     const std::string& input_layout,
     bool softmax_lse_flag = false,
     bool is_causal = true);
+
+void npu_fused_infer_attention_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag,
+    bool is_causal,
+    torch::Tensor& output,
+    torch::Tensor& softmax_lse);
+
+// Allocate the caller-owned maximum workspace used by the A5 ACL graph-task
+// update path. The returned tensor is reusable across sequence-length updates.
+torch::Tensor npu_fused_infer_attention_graph_workspace(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag);
+
+// Graph-safe A5 FIA update with caller-owned workspace and outputs.
+void npu_fused_infer_attention_graph_out(
+    const torch::Tensor& query,
+    const torch::Tensor& key,
+    const torch::Tensor& value,
+    const std::optional<torch::Tensor>& atten_mask,
+    const std::optional<torch::Tensor>& block_table,
+    const std::vector<int64_t>& actual_seq_lengths,
+    const std::vector<int64_t>& actual_seq_lengths_kv,
+    int64_t num_heads,
+    int64_t num_key_value_heads,
+    double scale,
+    int64_t block_size,
+    int64_t sparse_mode,
+    const std::string& input_layout,
+    bool softmax_lse_flag,
+    const torch::Tensor& workspace,
+    torch::Tensor& output,
+    torch::Tensor& softmax_lse);
 
 void batch_chunked_paged_prefill(const torch::Tensor& query,
                                  const torch::Tensor& k_cache,

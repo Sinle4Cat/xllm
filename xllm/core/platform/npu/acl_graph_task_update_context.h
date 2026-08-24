@@ -46,6 +46,11 @@ enum class CausalConv1dGraphBranch {
   kSpecVerify,
 };
 
+enum class PagedAttentionGraphBranch {
+  kDecode,
+  kExpandedDecode,
+};
+
 struct CausalConv1dGraphTask {
   torch::Tensor output;
   torch::Tensor x;
@@ -60,17 +65,39 @@ struct CausalConv1dGraphTask {
   std::shared_ptr<c10_npu::NPUEvent> event;
 };
 
+struct PagedAttentionGraphTask {
+  torch::Tensor output;
+  torch::Tensor softmax_lse;
+  // A5 graph-task updates must keep their FIA workspace alive for the
+  // lifetime of the captured task. Allocating a new workspace on every
+  // update makes the graph retain one allocator block per decode step.
+  torch::Tensor workspace;
+  torch::Tensor query;
+  torch::Tensor key_cache;
+  torch::Tensor value_cache;
+  torch::Tensor block_table;
+  int64_t num_heads = 0;
+  int64_t num_key_value_heads = 0;
+  double scale = 1.0;
+  int64_t block_size = 0;
+  PagedAttentionGraphBranch branch = PagedAttentionGraphBranch::kDecode;
+  c10_npu::NPUTaskGroupHandle handle{};
+  std::shared_ptr<c10_npu::NPUEvent> event;
+};
+
 class AclGraphTaskUpdateContext final {
  public:
   void begin_capture() {
     capturing = true;
     causal_conv1d_tasks.clear();
+    paged_attention_tasks.clear();
   }
 
   void end_capture() { capturing = false; }
 
   bool capturing = false;
   std::vector<CausalConv1dGraphTask> causal_conv1d_tasks;
+  std::vector<PagedAttentionGraphTask> paged_attention_tasks;
 };
 
 }  // namespace xllm::npu

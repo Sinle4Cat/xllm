@@ -20,10 +20,12 @@ limitations under the License.
 #include <cstdlib>
 #include <fstream>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <tuple>
 
 #include "xllm/core/kernels/npu/npu_ops_api.h"
+#include "xllm/core/kernels/npu/utils.h"
 #include "xllm/core/kernels/ops_api.h"
 #include "xllm/core/platform/npu/acl_graph_task_update_context.h"
 
@@ -355,6 +357,350 @@ torch::Tensor expand_sequence_tensor_to_batch(const torch::Tensor& tensor,
       .contiguous();
 }
 
+bool has_supported_mega_gdn_geometry(int64_t conv_dim,
+                                     int64_t num_value_heads) {
+  const int64_t qk_channels = conv_dim - num_value_heads * 128;
+  if (qk_channels <= 0 || qk_channels % 256 != 0) {
+    return false;
+  }
+  const int64_t num_key_heads = qk_channels / 256;
+  return num_key_heads >= 1 && num_key_heads <= 16 &&
+         (num_key_heads & (num_key_heads - 1)) == 0 &&
+         num_value_heads % num_key_heads == 0 &&
+         num_value_heads / num_key_heads <= 4;
+}
+
+bool has_supported_mega_gdn_tensors(const torch::Tensor& qkv,
+                                    const torch::Tensor& z,
+                                    const torch::Tensor& b,
+                                    const torch::Tensor& a,
+                                    const torch::Tensor& conv_weight,
+                                    const torch::Tensor& conv_state,
+                                    const torch::Tensor& a_log,
+                                    const torch::Tensor& dt_bias,
+                                    const torch::Tensor& ssm_state,
+                                    const torch::Tensor& read_state_indices,
+                                    const torch::Tensor& write_state_indices,
+                                    const torch::Tensor& norm_weight) {
+  if (!qkv.defined() || !z.defined() || !b.defined() || !a.defined() ||
+      !conv_weight.defined() || !conv_state.defined() || !a_log.defined() ||
+      !dt_bias.defined() || !ssm_state.defined() ||
+      !read_state_indices.defined() || !write_state_indices.defined() ||
+      !norm_weight.defined()) {
+    return false;
+  }
+  if (qkv.scalar_type() != torch::kBFloat16 ||
+      z.scalar_type() != torch::kBFloat16 ||
+      b.scalar_type() != torch::kBFloat16 ||
+      a.scalar_type() != torch::kBFloat16 ||
+      conv_weight.scalar_type() != torch::kBFloat16 ||
+      conv_state.scalar_type() != torch::kBFloat16 ||
+      norm_weight.scalar_type() != torch::kBFloat16 ||
+      a_log.scalar_type() != torch::kFloat32 ||
+      dt_bias.scalar_type() != torch::kFloat32 ||
+      ssm_state.scalar_type() != torch::kFloat32 ||
+      read_state_indices.scalar_type() != torch::kInt32 ||
+      write_state_indices.scalar_type() != torch::kInt32) {
+    return false;
+  }
+  for (const auto& tensor : {qkv,
+                             z,
+                             b,
+                             a,
+                             conv_weight,
+                             conv_state,
+                             a_log,
+                             dt_bias,
+                             ssm_state,
+                             read_state_indices,
+                             write_state_indices,
+                             norm_weight}) {
+    if (!tensor.device().is_privateuseone() ||
+        tensor.device() != qkv.device() || !tensor.is_contiguous()) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool graph_uses_same_linear_state_slot(const ModelInputParams& input_params,
+                                       int64_t batch_size) {
+  if (!input_params.enable_graph) {
+    return true;
+  }
+  const auto& read_ids = input_params.embedding.linear_state_read_ids;
+  const auto& write_ids = input_params.embedding.linear_state_ids;
+  if (write_ids.size() < static_cast<size_t>(batch_size)) {
+    return false;
+  }
+  // ACL graph parameters do not currently persist a distinct read-slot
+  // tensor. An empty host read list therefore denotes the normal live-slot
+  // decode case; the route passes the persistent write-slot tensor for both.
+  if (read_ids.empty()) {
+    return true;
+  }
+  if (read_ids.size() < static_cast<size_t>(batch_size)) {
+    return false;
+  }
+  const auto& has_initial_state = input_params.parallel.has_initial_state;
+  if (!has_initial_state.empty() &&
+      has_initial_state.size() < static_cast<size_t>(batch_size)) {
+    return false;
+  }
+  for (int64_t i = 0; i < batch_size; ++i) {
+    const size_t index = static_cast<size_t>(i);
+    const bool has_no_initial_state =
+        !has_initial_state.empty() && has_initial_state[index] == 0;
+    if (read_ids[index] == -1 && has_no_initial_state) {
+      continue;
+    }
+    if (read_ids[index] != write_ids[index]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int64_t mega_gdn_active_batch_size(const ModelInputParams& input_params,
+                                   int64_t padded_batch_size) {
+  if (!input_params.enable_graph ||
+      input_params.parallel.has_initial_state.empty()) {
+    return padded_batch_size;
+  }
+  return std::min<int64_t>(padded_batch_size,
+                           input_params.parallel.has_initial_state.size());
+}
+
+bool can_use_mega_gdn_decode(const torch::Tensor& qkv,
+                             const torch::Tensor& z,
+                             const torch::Tensor& b,
+                             const torch::Tensor& a,
+                             const torch::Tensor& conv_weight,
+                             const torch::Tensor& conv_state,
+                             const torch::Tensor& a_log,
+                             const torch::Tensor& dt_bias,
+                             const torch::Tensor& ssm_state,
+                             const torch::Tensor& read_state_indices,
+                             const torch::Tensor& write_state_indices,
+                             const torch::Tensor& norm_weight,
+                             const AttentionMetadata& attn_metadata,
+                             const ModelInputParams& input_params,
+                             int64_t original_num_tokens,
+                             int64_t checkpoint_stride) {
+  if (!xllm::kernel::npu::is_ascend950() || input_params.is_spec_verify ||
+      attn_metadata.is_prefill || attn_metadata.is_chunked_prefill ||
+      checkpoint_stride != 1 ||
+      std::getenv("XLLM_DISABLE_MEGA_GDN_DECODE") != nullptr ||
+      !has_supported_mega_gdn_tensors(qkv,
+                                      z,
+                                      b,
+                                      a,
+                                      conv_weight,
+                                      conv_state,
+                                      a_log,
+                                      dt_bias,
+                                      ssm_state,
+                                      read_state_indices,
+                                      write_state_indices,
+                                      norm_weight)) {
+    return false;
+  }
+  if (qkv.dim() != 3 || z.dim() != 4 || b.dim() != 3 || a.dim() != 3) {
+    return false;
+  }
+  const int64_t batch_size = qkv.size(0);
+  const int64_t conv_dim = qkv.size(2);
+  const int64_t num_value_heads = z.size(2);
+  if (batch_size < 1 || batch_size > 32 || qkv.size(1) != 1 ||
+      original_num_tokens != batch_size ||
+      z.sizes() != torch::IntArrayRef({batch_size, 1, num_value_heads, 128}) ||
+      b.sizes() != torch::IntArrayRef({batch_size, 1, num_value_heads}) ||
+      a.sizes() != b.sizes() ||
+      !has_supported_mega_gdn_geometry(conv_dim, num_value_heads)) {
+    return false;
+  }
+  const int64_t num_state_slots = conv_state.size(0);
+  if (conv_weight.sizes() != torch::IntArrayRef({4, conv_dim}) ||
+      conv_state.dim() != 3 || conv_state.size(1) != 3 ||
+      conv_state.size(2) != conv_dim || num_state_slots < 1 ||
+      num_state_slots > 1024 ||
+      ssm_state.sizes() !=
+          torch::IntArrayRef({num_state_slots, num_value_heads, 128, 128}) ||
+      a_log.numel() != num_value_heads || dt_bias.numel() != num_value_heads ||
+      norm_weight.numel() != 128 || read_state_indices.dim() != 1 ||
+      write_state_indices.dim() != 1 ||
+      read_state_indices.numel() != batch_size ||
+      write_state_indices.numel() != batch_size ||
+      !graph_uses_same_linear_state_slot(input_params, batch_size)) {
+    return false;
+  }
+  return true;
+}
+
+bool can_use_mega_gdn_mtp_decode(const torch::Tensor& qkv,
+                                 const torch::Tensor& z,
+                                 const torch::Tensor& b,
+                                 const torch::Tensor& a,
+                                 const torch::Tensor& conv_weight,
+                                 const torch::Tensor& conv_state,
+                                 const torch::Tensor& a_log,
+                                 const torch::Tensor& dt_bias,
+                                 const torch::Tensor& ssm_state,
+                                 const torch::Tensor& read_state_indices,
+                                 const torch::Tensor& write_state_indices,
+                                 const torch::Tensor& num_accepted_tokens,
+                                 const torch::Tensor& norm_weight,
+                                 const AttentionMetadata& attn_metadata,
+                                 const ModelInputParams& input_params,
+                                 int64_t original_num_tokens,
+                                 int64_t checkpoint_stride) {
+  const auto reject = [&](const char* reason) {
+    if (input_params.enable_graph &&
+        std::getenv("XLLM_DEBUG_MEGA_GDN_ROUTE") != nullptr) {
+      LOG_FIRST_N(WARNING, 1)
+          << "MegaGdnMtpDecode graph route rejected: " << reason;
+    }
+    return false;
+  };
+  if (!xllm::kernel::npu::is_ascend950() || !input_params.is_spec_verify ||
+      std::getenv("XLLM_DISABLE_MEGA_GDN_MTP_DECODE") != nullptr ||
+      !num_accepted_tokens.defined() ||
+      num_accepted_tokens.scalar_type() != torch::kInt32 ||
+      !num_accepted_tokens.is_contiguous() ||
+      !has_supported_mega_gdn_tensors(qkv,
+                                      z,
+                                      b,
+                                      a,
+                                      conv_weight,
+                                      conv_state,
+                                      a_log,
+                                      dt_bias,
+                                      ssm_state,
+                                      read_state_indices,
+                                      write_state_indices,
+                                      norm_weight)) {
+    return reject("base tensor or environment precondition");
+  }
+  if (qkv.dim() != 3 || z.dim() != 4 || b.dim() != 3 || a.dim() != 3) {
+    return reject("rank precondition");
+  }
+  const int64_t padded_batch_size = qkv.size(0);
+  const int64_t batch_size =
+      mega_gdn_active_batch_size(input_params, padded_batch_size);
+  const int64_t padded_sequence_length = qkv.size(1);
+  const int64_t sequence_length = checkpoint_stride;
+  const int64_t conv_dim = qkv.size(2);
+  const int64_t num_value_heads = z.size(2);
+  if (batch_size < 1 || batch_size > 32 || sequence_length < 2 ||
+      sequence_length > 17 || padded_sequence_length < sequence_length ||
+      original_num_tokens > padded_batch_size * padded_sequence_length ||
+      z.sizes() != torch::IntArrayRef({padded_batch_size,
+                                       padded_sequence_length,
+                                       num_value_heads,
+                                       128}) ||
+      b.sizes() !=
+          torch::IntArrayRef(
+              {padded_batch_size, padded_sequence_length, num_value_heads}) ||
+      a.sizes() != b.sizes() ||
+      !has_supported_mega_gdn_geometry(conv_dim, num_value_heads)) {
+    return reject("projected tensor shape or geometry");
+  }
+  const int64_t num_state_slots = conv_state.size(0);
+  if (conv_weight.sizes() != torch::IntArrayRef({4, conv_dim}) ||
+      conv_state.dim() != 3 || conv_state.size(1) != sequence_length + 2 ||
+      conv_state.size(2) != conv_dim || num_state_slots < 1 ||
+      ssm_state.sizes() !=
+          torch::IntArrayRef(
+              {num_state_slots * sequence_length, num_value_heads, 128, 128}) ||
+      a_log.numel() != num_value_heads || dt_bias.numel() != num_value_heads ||
+      norm_weight.numel() != 128 || read_state_indices.dim() != 1 ||
+      write_state_indices.dim() != 1 || num_accepted_tokens.dim() != 1 ||
+      read_state_indices.numel() < batch_size ||
+      write_state_indices.numel() < batch_size ||
+      num_accepted_tokens.numel() < batch_size ||
+      attn_metadata.q_seq_lens_vec.size() !=
+          static_cast<size_t>(padded_batch_size) ||
+      input_params.num_accepted_tokens_host.size() !=
+          static_cast<size_t>(padded_batch_size) ||
+      !graph_uses_same_linear_state_slot(input_params, batch_size)) {
+    return reject("state tensor shape or metadata");
+  }
+  int64_t valid_tokens = 0;
+  for (const int32_t query_length : attn_metadata.q_seq_lens_vec) {
+    if (query_length < 0 || query_length > padded_sequence_length) {
+      return reject("query length range");
+    }
+    valid_tokens += query_length;
+  }
+  if ((!input_params.enable_graph && valid_tokens != original_num_tokens) ||
+      (input_params.enable_graph && valid_tokens < original_num_tokens)) {
+    return reject("valid token count");
+  }
+  for (int64_t i = 0; i < batch_size; ++i) {
+    if (attn_metadata.q_seq_lens_vec[static_cast<size_t>(i)] !=
+            sequence_length ||
+        input_params.num_accepted_tokens_host[static_cast<size_t>(i)] < 1 ||
+        input_params.num_accepted_tokens_host[static_cast<size_t>(i)] >
+            sequence_length) {
+      return reject("active sequence length or accepted-token range");
+    }
+  }
+  return true;
+}
+
+bool has_valid_mega_gdn_draft_metadata(const ModelInputParams& input_params,
+                                       int64_t total_tokens,
+                                       int64_t num_state_slots) {
+  if (!input_params.is_mtp_draft || input_params.is_spec_verify ||
+      total_tokens <= 0 || num_state_slots <= 0) {
+    return false;
+  }
+  const auto& q_seq_lens = input_params.mtp_draft_q_seq_lens_host;
+  const auto& write_ids = input_params.embedding.linear_state_ids;
+  const auto& read_ids = input_params.embedding.linear_state_read_ids;
+  const auto& validity = input_params.linear_state_validity_mask;
+  const size_t batch_size = q_seq_lens.size();
+  if (batch_size == 0 || batch_size > 32 || write_ids.size() != batch_size ||
+      read_ids.size() != batch_size || validity.size() != batch_size) {
+    return false;
+  }
+
+  int64_t grouped_tokens = 0;
+  for (size_t batch_idx = 0; batch_idx < batch_size; ++batch_idx) {
+    const int32_t q_seq_len = q_seq_lens[batch_idx];
+    const int32_t read_id = read_ids[batch_idx];
+    const int32_t write_id = write_ids[batch_idx];
+    const int64_t has_initial_state = validity[batch_idx];
+    if ((q_seq_len != 1 && q_seq_len != 2) || write_id < 0 ||
+        write_id >= num_state_slots ||
+        (has_initial_state != 0 && has_initial_state != 1) ||
+        (has_initial_state == 1 &&
+         (read_id < 0 || read_id >= num_state_slots)) ||
+        (has_initial_state == 0 && read_id != -1 &&
+         (read_id < 0 || read_id >= num_state_slots))) {
+      return false;
+    }
+    grouped_tokens += q_seq_len;
+  }
+  if (grouped_tokens != total_tokens) {
+    return false;
+  }
+
+  for (size_t write_idx = 0; write_idx < batch_size; ++write_idx) {
+    for (size_t other_idx = 0; other_idx < batch_size; ++other_idx) {
+      if (write_idx == other_idx) {
+        continue;
+      }
+      if (write_ids[write_idx] == write_ids[other_idx] ||
+          (validity[other_idx] != 0 &&
+           write_ids[write_idx] == read_ids[other_idx])) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
 torch::Tensor run_causal_conv1d_graph_update(
     const std::shared_ptr<xllm::npu::AclGraphTaskUpdateContext>& graph_context,
     const torch::Tensor& x,
@@ -645,6 +991,15 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       local_v_heads == 4 || local_v_heads == 6 || local_v_heads == 8 ||
       local_v_heads == 12 || local_v_heads == 16 || local_v_heads == 24 ||
       local_v_heads == 32 || local_v_heads == 48 || local_v_heads == 64;
+  // PR #41's Ascend950 synchronization path is used only for the head shapes
+  // that pass the A5 prefill accuracy matrix.  V1/K1 and V3/K1 can expose
+  // stale state, while V64/K16 exceeds the verified intra-block schedule and
+  // produces an inaccurate output.  Keep those shapes on the existing
+  // unfused path.  A2/A3 retain their complete prefill-superkernel routing
+  // table.
+  const bool supported_prefill_super_op_soc_shape =
+      !xllm::kernel::npu::is_ascend950() ||
+      (local_v_heads != 1 && local_v_heads != 3 && local_v_heads != 64);
   bool used_direct_prefill_qkv = false;
 
   torch::Tensor conv_cache = kv_cache.get_conv_cache();
@@ -689,10 +1044,100 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       graph_context != nullptr && graph_context->capturing;
 
   const auto& norm_weight = norm_->weight();
+
+  const int64_t draft_batch_size =
+      static_cast<int64_t>(input_params.mtp_draft_q_seq_lens_host.size());
+  const torch::Tensor& draft_q_cu_seq_lens =
+      input_params.mtp_draft_q_cu_seq_lens;
+  const torch::Tensor& draft_state_validity_mask =
+      input_params.embedding.linear_state_validity_mask;
+  const int64_t draft_num_state_slots = conv_cache.size(0);
+  if (xllm::kernel::npu::is_ascend950() &&
+      std::getenv("XLLM_DISABLE_MEGA_GDN_DRAFT_DECODE") == nullptr &&
+      has_valid_mega_gdn_draft_metadata(
+          input_params, original_num_tokens, draft_num_state_slots) &&
+      checkpoint_stride == 1 && supported_qwen35_tp &&
+      num_k_heads_ % tp_size_ == 0 && num_v_heads_ % tp_size_ == 0 &&
+      head_k_dim_ == 128 && head_v_dim_ == 128 &&
+      has_supported_mega_gdn_geometry(local_conv_dim, local_v_heads) &&
+      std::abs(norm_->eps() - 1e-6) < 1e-12 && mixed_qkv.dim() == 3 &&
+      mixed_qkv.size(0) == batch_size && mixed_qkv.size(1) == seq_len &&
+      mixed_qkv.size(2) == local_conv_dim && z.dim() == 4 &&
+      z.size(0) == batch_size && z.size(1) == seq_len &&
+      z.size(2) == local_v_heads && z.size(3) == head_v_dim_ && a.dim() == 3 &&
+      b.dim() == 3 && a.sizes() == b.sizes() && a.size(0) == batch_size &&
+      a.size(1) == seq_len && a.size(2) == local_v_heads &&
+      conv_weight.dim() == 2 &&
+      conv_weight.sizes() == torch::IntArrayRef({4, local_conv_dim}) &&
+      conv_cache.dim() == 3 && conv_cache.size(1) == 3 &&
+      conv_cache.size(2) == local_conv_dim && ssm_cache.dim() == 4 &&
+      ssm_cache.sizes() == torch::IntArrayRef({draft_num_state_slots,
+                                               local_v_heads,
+                                               head_v_dim_,
+                                               head_k_dim_}) &&
+      logical_state_indices.dim() == 1 &&
+      logical_state_indices.numel() == draft_batch_size &&
+      logical_state_read_indices.dim() == 1 &&
+      logical_state_read_indices.numel() == draft_batch_size &&
+      draft_q_cu_seq_lens.defined() && draft_q_cu_seq_lens.dim() == 1 &&
+      draft_q_cu_seq_lens.numel() == draft_batch_size + 1 &&
+      draft_q_cu_seq_lens.scalar_type() == torch::kInt32 &&
+      draft_state_validity_mask.defined() &&
+      draft_state_validity_mask.dim() == 1 &&
+      draft_state_validity_mask.numel() == draft_batch_size &&
+      draft_state_validity_mask.scalar_type() == torch::kBool &&
+      draft_q_cu_seq_lens.device() == device &&
+      draft_state_validity_mask.device() == device &&
+      draft_q_cu_seq_lens.is_contiguous() &&
+      draft_state_validity_mask.is_contiguous()) {
+    torch::Tensor draft_read_state_indices = input_params.enable_graph
+                                                 ? logical_state_indices
+                                                 : logical_state_read_indices;
+    draft_read_state_indices = torch::where(draft_state_validity_mask,
+                                            draft_read_state_indices,
+                                            logical_state_indices)
+                                   .contiguous();
+    torch::Tensor packed_qkv = reshape_qkvz_unpad(attn_metadata, mixed_qkv)
+                                   .view({original_num_tokens, local_conv_dim});
+    torch::Tensor packed_z =
+        reshape_qkvz_unpad(attn_metadata, z)
+            .view({original_num_tokens, local_v_heads, head_v_dim_});
+    torch::Tensor packed_b = reshape_qkvz_unpad(attn_metadata, b)
+                                 .view({original_num_tokens, local_v_heads});
+    torch::Tensor packed_a = reshape_qkvz_unpad(attn_metadata, a)
+                                 .view({original_num_tokens, local_v_heads});
+    LOG_FIRST_N(INFO, 1)
+        << "Using MegaGdnDraftDecode for Qwen3.5 MTP draft: batch="
+        << draft_batch_size << ", tokens=" << original_num_tokens
+        << ", graph=" << input_params.enable_graph;
+    torch::Tensor norm_out =
+        xllm::kernel::mega_gdn_draft_decode(packed_qkv,
+                                            packed_z,
+                                            packed_b,
+                                            packed_a,
+                                            conv_weight,
+                                            conv_cache,
+                                            A_log_,
+                                            dt_bias_,
+                                            ssm_cache,
+                                            draft_read_state_indices,
+                                            logical_state_indices,
+                                            draft_q_cu_seq_lens,
+                                            draft_state_validity_mask,
+                                            norm_weight);
+    torch::Tensor rearranged_norm =
+        norm_out.reshape({original_num_tokens, local_v_heads * head_v_dim_});
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(rearranged_norm,
+                              row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
+    return o_proj_->forward(rearranged_norm);
+  }
+
   int64_t packed_prefill_tokens = 0;
   int64_t prefill_num_matrices = 0;
   bool prefill_lengths_valid =
-      batch_size >= 1 && batch_size <= 8 && seq_len > 1 &&
+      batch_size >= 1 && batch_size <= 32 && seq_len > 1 &&
       attn_metadata.q_seq_lens_vec.size() == static_cast<size_t>(batch_size) &&
       input_params.parallel.query_start_loc.size() ==
           static_cast<size_t>(batch_size + 1) &&
@@ -738,15 +1183,17 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
   }
   if (std::getenv("XLLM_ENABLE_QWEN35_GDN_PREFILL_E2E") != nullptr &&
       std::getenv("XLLM_DISABLE_QWEN35_GDN_PREFILL_E2E") == nullptr &&
-      !use_spec_verify && is_any_prefill && fla_ssm_state_layout &&
-      prefill_lengths_valid && prefill_state_metadata_valid &&
+      !use_spec_verify && !input_params.is_mtp_draft && is_any_prefill &&
+      fla_ssm_state_layout && prefill_lengths_valid &&
+      prefill_state_metadata_valid &&
       packed_prefill_tokens == original_num_tokens &&
       packed_prefill_tokens <= kMegaGdnPrefillMaxTokens &&
       supported_qwen35_tp && num_k_heads_ % tp_size_ == 0 &&
       num_v_heads_ % tp_size_ == 0 && local_q_heads > 0 &&
-      supported_prefill_super_op_heads && local_v_heads % local_q_heads == 0 &&
-      head_k_dim_ == 128 && head_v_dim_ == 128 &&
-      std::abs(norm_->eps() - 1e-6) < 1e-12 &&
+      supported_prefill_super_op_heads &&
+      supported_prefill_super_op_soc_shape &&
+      local_v_heads % local_q_heads == 0 && head_k_dim_ == 128 &&
+      head_v_dim_ == 128 && std::abs(norm_->eps() - 1e-6) < 1e-12 &&
       logical_state_read_indices.dim() == 1 &&
       logical_state_read_indices.numel() == batch_size &&
       logical_state_read_indices.scalar_type() == torch::kInt32 &&
@@ -792,6 +1239,11 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       linear_state_read_base_indices.is_contiguous() &&
       linear_state_base_indices.is_contiguous() &&
       logical_state_indices.is_contiguous()) {
+    LOG_FIRST_N(INFO, 1) << "Using MegaGdnPrefillOp rank=" << rank_
+                         << " batch_size=" << batch_size
+                         << " packed_tokens=" << packed_prefill_tokens
+                         << " local_q_heads=" << local_q_heads
+                         << " local_v_heads=" << local_v_heads;
     const bool debug_hash_e2e =
         std::getenv("XLLM_DEBUG_HASH_MEGA_GDN_PREFILL") != nullptr;
     static thread_local int64_t debug_e2e_call = 0;
@@ -831,7 +1283,14 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
         attn_metadata.q_cu_seq_lens,
         norm_weight,
         prefill_num_matrices);
-    if (std::getenv("XLLM_DEBUG_SYNC_MEGA_GDN_PREFILL") != nullptr) {
+    // Ascend950 does not provide coherent cross-AIV business-data caches at
+    // the kernel/ACL-graph boundary.  The Prefill Super kernel publishes the
+    // persistent Conv/SSM state consumed by the first decode graph replay, so
+    // complete that publication before the scheduler can enqueue decode work
+    // on another stream.  Without this fence, a reused graph slot can retain
+    // stale state and collapse generation to a repeated token stream.
+    if (xllm::kernel::npu::is_ascend950() ||
+        std::getenv("XLLM_DEBUG_SYNC_MEGA_GDN_PREFILL") != nullptr) {
       c10_npu::getCurrentNPUStream().synchronize();
     }
     if (debug_hash_e2e) {
@@ -909,6 +1368,197 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
                 << " output=" << hash_last_token(projected_out);
     }
     return projected_out;
+  }
+
+  // ACL graph capture owns persistent write-slot and accepted-token tensors.
+  // Prefix-fork read slots are not persistent graph inputs yet, so graph mode
+  // is deliberately limited to the common same-slot decode contract.
+  const torch::Tensor& mega_read_state_indices =
+      input_params.enable_graph ? logical_state_indices
+                                : logical_state_read_indices;
+
+  if (use_spec_verify && input_params.enable_graph &&
+      std::getenv("XLLM_DEBUG_MEGA_GDN_ROUTE") != nullptr) {
+    const int64_t active_batch_size =
+        mega_gdn_active_batch_size(input_params, batch_size);
+    std::ostringstream state_metadata;
+    for (int64_t i = 0; i < active_batch_size; ++i) {
+      const size_t index = static_cast<size_t>(i);
+      state_metadata << " [" << i
+                     << ":q=" << attn_metadata.q_seq_lens_vec[index]
+                     << ",a=" << input_params.num_accepted_tokens_host[index]
+                     << ",w=" << input_params.embedding.linear_state_ids[index]
+                     << ",r="
+                     << input_params.embedding.linear_state_read_ids[index]
+                     << ",init="
+                     << input_params.parallel.has_initial_state[index] << "]";
+    }
+    LOG_FIRST_N(INFO, 1)
+        << "MegaGdnMtpDecode graph route diagnostics: split="
+        << split_inputs.has_value() << ", fla_layout=" << fla_ssm_state_layout
+        << ", batch=" << batch_size << ", padded_sequence=" << seq_len
+        << ", original_tokens=" << original_num_tokens
+        << ", checkpoint_stride=" << checkpoint_stride
+        << ", q_seq_lens=" << attn_metadata.q_seq_lens_vec.size()
+        << ", accepted_host=" << input_params.num_accepted_tokens_host.size()
+        << ", write_ids=" << input_params.embedding.linear_state_ids.size()
+        << ", read_ids=" << input_params.embedding.linear_state_read_ids.size()
+        << ", has_initial=" << input_params.parallel.has_initial_state.size()
+        << ", qkv_contiguous=" << mixed_qkv.is_contiguous()
+        << ", z_contiguous=" << z.is_contiguous()
+        << ", state_slots=" << conv_cache.size(0)
+        << ", active_batch=" << active_batch_size << ", graph_same_slot="
+        << graph_uses_same_linear_state_slot(input_params, active_batch_size)
+        << ", supported_tensors="
+        << has_supported_mega_gdn_tensors(mixed_qkv,
+                                          z,
+                                          b,
+                                          a,
+                                          conv_weight,
+                                          conv_cache,
+                                          A_log_,
+                                          dt_bias_,
+                                          ssm_cache,
+                                          mega_read_state_indices,
+                                          logical_state_indices,
+                                          norm_weight)
+        << ", state_metadata=" << state_metadata.str();
+  }
+
+  if (split_inputs.has_value() && fla_ssm_state_layout &&
+      can_use_mega_gdn_decode(mixed_qkv,
+                              z,
+                              b,
+                              a,
+                              conv_weight,
+                              conv_cache,
+                              A_log_,
+                              dt_bias_,
+                              ssm_cache,
+                              mega_read_state_indices,
+                              logical_state_indices,
+                              norm_weight,
+                              attn_metadata,
+                              input_params,
+                              original_num_tokens,
+                              checkpoint_stride)) {
+    LOG_FIRST_N(INFO, 1) << "Using MegaGdnDecode for Qwen3.5 decode: batch="
+                         << batch_size
+                         << ", graph=" << input_params.enable_graph;
+    torch::Tensor norm_out = xllm::kernel::mega_gdn_decode(
+        mixed_qkv.view({batch_size, mixed_qkv.size(-1)}),
+        z.view({batch_size, z.size(2), z.size(3)}),
+        b.view({batch_size, b.size(2)}),
+        a.view({batch_size, a.size(2)}),
+        conv_weight,
+        conv_cache,
+        A_log_,
+        dt_bias_,
+        ssm_cache,
+        mega_read_state_indices,
+        logical_state_indices,
+        norm_weight);
+    auto rearranged_norm =
+        norm_out.reshape({batch_size, norm_out.size(1) * norm_out.size(2)});
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(rearranged_norm,
+                              row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
+    return o_proj_->forward(rearranged_norm);
+  }
+
+  if (split_inputs.has_value() && fla_ssm_state_layout &&
+      can_use_mega_gdn_mtp_decode(mixed_qkv,
+                                  z,
+                                  b,
+                                  a,
+                                  conv_weight,
+                                  conv_cache,
+                                  A_log_,
+                                  dt_bias_,
+                                  ssm_cache,
+                                  mega_read_state_indices,
+                                  logical_state_indices,
+                                  input_params.num_accepted_tokens,
+                                  norm_weight,
+                                  attn_metadata,
+                                  input_params,
+                                  original_num_tokens,
+                                  checkpoint_stride)) {
+    const int64_t mega_batch_size =
+        mega_gdn_active_batch_size(input_params, batch_size);
+    LOG_FIRST_N(INFO, 1)
+        << "Using MegaGdnMtpDecode for Qwen3.5 spec verify: batch="
+        << mega_batch_size << ", speculative_tokens=" << checkpoint_stride - 1
+        << ", graph=" << input_params.enable_graph;
+    const int64_t mega_sequence_length = checkpoint_stride;
+    torch::Tensor mega_qkv = mixed_qkv.slice(0, 0, mega_batch_size)
+                                 .slice(1, 0, mega_sequence_length)
+                                 .contiguous();
+    torch::Tensor mega_z = z.slice(0, 0, mega_batch_size)
+                               .slice(1, 0, mega_sequence_length)
+                               .contiguous();
+    torch::Tensor mega_b = b.slice(0, 0, mega_batch_size)
+                               .slice(1, 0, mega_sequence_length)
+                               .contiguous();
+    torch::Tensor mega_a = a.slice(0, 0, mega_batch_size)
+                               .slice(1, 0, mega_sequence_length)
+                               .contiguous();
+    torch::Tensor mega_read_indices =
+        mega_read_state_indices.slice(0, 0, mega_batch_size).contiguous();
+    torch::Tensor mega_write_indices =
+        logical_state_indices.slice(0, 0, mega_batch_size).contiguous();
+    torch::Tensor mega_accepted_tokens =
+        input_params.num_accepted_tokens.slice(0, 0, mega_batch_size)
+            .contiguous();
+    torch::Tensor norm_out =
+        xllm::kernel::mega_gdn_mtp_decode(mega_qkv,
+                                          mega_z,
+                                          mega_b,
+                                          mega_a,
+                                          conv_weight,
+                                          conv_cache,
+                                          A_log_,
+                                          dt_bias_,
+                                          ssm_cache,
+                                          mega_read_indices,
+                                          mega_write_indices,
+                                          mega_accepted_tokens,
+                                          norm_weight);
+    if (seq_len > mega_sequence_length) {
+      torch::Tensor sequence_padding =
+          z.slice(0, 0, mega_batch_size)
+              .slice(1, mega_sequence_length, seq_len) *
+          0;
+      norm_out = torch::cat({norm_out, sequence_padding}, 1);
+    }
+    if (batch_size > mega_batch_size) {
+      torch::Tensor batch_padding = z.slice(0, mega_batch_size, batch_size) * 0;
+      norm_out = torch::cat({norm_out, batch_padding}, 0);
+    }
+    norm_out = norm_out.view(
+        {-1, norm_out.size(norm_out.dim() - 2), norm_out.size(-1)});
+    auto rearranged_norm = norm_out.reshape(
+        {norm_out.size(0), norm_out.size(1) * norm_out.size(2)});
+    rearranged_norm = reshape_qkvz_unpad(attn_metadata, rearranged_norm);
+    if (rearranged_norm.size(0) > original_num_tokens) {
+      rearranged_norm =
+          rearranged_norm.slice(0, 0, original_num_tokens).contiguous();
+    }
+    if (fc1_ctx && is_sequence_sharded(*fc1_ctx)) {
+      return o_proj_->forward(rearranged_norm,
+                              row_parallel_reduce_mode_for_fc1(*fc1_ctx));
+    }
+    return o_proj_->forward(rearranged_norm);
+  }
+
+  if (xllm::kernel::npu::is_ascend950() && input_params.enable_graph) {
+    LOG(FATAL) << "Qwen3.5 Ascend950 graph execution requires a Mega GDN "
+                  "Prefill, Decode, MTP Decode, or Draft Decode route; "
+                  "small-operator fallback is disabled. batch="
+               << batch_size << ", sequence_length=" << seq_len
+               << ", spec_verify=" << use_spec_verify
+               << ", mtp_draft=" << input_params.is_mtp_draft;
   }
 
   const auto& read_state_ids = input_params.embedding.linear_state_read_ids;
@@ -1021,6 +1671,43 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
     const std::vector<int64_t> linear_state_indices_host(
         input_params.embedding.linear_state_ids.begin(),
         input_params.embedding.linear_state_ids.end());
+    auto run_causal_conv1d_decode = [&]() -> torch::Tensor {
+      // The generated TileLang causal-conv decode kernel is not compatible
+      // with Ascend950. Use the custom ACLNN implementation on A5 while
+      // preserving the existing A2/A3 path byte-for-byte below.
+      if (xllm::kernel::npu::is_ascend950()) {
+        const std::vector<int64_t> empty_initial_state_mode;
+        const std::vector<int64_t> empty_num_accepted_tokens;
+        return xllm::kernel::causal_conv1d(
+            conv_input,
+            conv_weight,
+            conv_cache,
+            std::optional<torch::Tensor>(),
+            torch::IntArrayRef(input_params.parallel.query_start_loc),
+            torch::IntArrayRef(linear_state_indices_host),
+            torch::IntArrayRef(empty_initial_state_mode),
+            torch::IntArrayRef(empty_num_accepted_tokens),
+            xllm::npu::kCausalConv1dActivationSilu,
+            xllm::npu::kCausalConv1dGraphPadSlotId,
+            xllm::npu::kCausalConv1dRunModeUpdate);
+      }
+
+      auto conv_input_2d = conv_input.dim() == 3
+                               ? conv_input.reshape({-1, conv_input.size(-1)})
+                               : conv_input;
+      xllm::kernel::CausalConv1dUpdateParams conv1d_params;
+      conv1d_params.x = conv_input_2d;
+      conv1d_params.conv_state = conv_cache;
+      conv1d_params.weight = conv_weight;
+      conv1d_params.conv_state_indices = logical_state_indices;
+      conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
+      conv1d_params.max_query_len = attn_metadata.max_query_len;
+      auto output = xllm::kernel::causal_conv1d_update(conv1d_params);
+      if (conv_input.dim() == 3) {
+        output = output.view({conv_input.size(0), -1, output.size(-1)});
+      }
+      return output;
+    };
     if (register_conv1d_graph_update) {
       if (use_spec_verify) {
         const auto conv1d_branch =
@@ -1036,21 +1723,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             num_accepted,
             conv1d_branch);
       } else {
-        auto conv_input_2d = conv_input.dim() == 3
-                                 ? conv_input.reshape({-1, conv_input.size(-1)})
-                                 : conv_input;
-        xllm::kernel::CausalConv1dUpdateParams conv1d_params;
-        conv1d_params.x = conv_input_2d;
-        conv1d_params.conv_state = conv_cache;
-        conv1d_params.weight = conv_weight;
-        conv1d_params.conv_state_indices = logical_state_indices;
-        conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
-        conv1d_params.max_query_len = attn_metadata.max_query_len;
-        mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);
-        if (conv_input.dim() == 3) {
-          mixed_qkv =
-              mixed_qkv.view({conv_input.size(0), -1, mixed_qkv.size(-1)});
-        }
+        mixed_qkv = run_causal_conv1d_decode();
       }
     } else {
       if (use_spec_verify) {
@@ -1070,21 +1743,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
             xllm::npu::kCausalConv1dRunModeUpdate);
         mixed_qkv = output;
       } else {
-        auto conv_input_2d = conv_input.dim() == 3
-                                 ? conv_input.reshape({-1, conv_input.size(-1)})
-                                 : conv_input;
-        xllm::kernel::CausalConv1dUpdateParams conv1d_params;
-        conv1d_params.x = conv_input_2d;
-        conv1d_params.conv_state = conv_cache;
-        conv1d_params.weight = conv_weight;
-        conv1d_params.conv_state_indices = logical_state_indices;
-        conv1d_params.query_start_loc = attn_metadata.q_cu_seq_lens;
-        conv1d_params.max_query_len = attn_metadata.max_query_len;
-        mixed_qkv = xllm::kernel::causal_conv1d_update(conv1d_params);
-        if (conv_input.dim() == 3) {
-          mixed_qkv =
-              mixed_qkv.view({conv_input.size(0), -1, mixed_qkv.size(-1)});
-        }
+        mixed_qkv = run_causal_conv1d_decode();
       }
     }
     mixed_qkv = reshape_projected_tokens_with_pad(attn_metadata, mixed_qkv);
@@ -1095,7 +1754,10 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
       checkpoint_stride == 1;
   // Compute gated delta net decay and beta terms.
   if (use_spec_verify || attn_metadata.is_chunked_prefill ||
-      checkpoint_stride > 1) {
+      checkpoint_stride > 1 || xllm::kernel::npu::is_ascend950()) {
+    // The generated A5 gating/update AOT kernels are not reliable on the
+    // current Ascend950 runtime. Keep A2/A3 on their fused path and preserve
+    // the explicit FP32 softplus formulation for both A5 prefill and decode.
     beta = torch::sigmoid(b);
     torch::Tensor A_log_exp = A_log_.exp();
     torch::Tensor a_float = a.to(torch::kFloat32);
@@ -1276,7 +1938,7 @@ torch::Tensor Qwen3GatedDeltaNetBaseImpl::forward(
                                        : last_recurrent_state.transpose(-1, -2);
     ssm_cache.index_put_({linear_state_base_indices},
                          state_to_store.to(ssm_cache.dtype()));
-  } else if (checkpoint_stride > 1) {
+  } else if (checkpoint_stride > 1 || xllm::kernel::npu::is_ascend950()) {
     auto ssm_state =
         torch::index_select(ssm_cache, 0, linear_state_base_indices);
     if (!fla_ssm_state_layout) {

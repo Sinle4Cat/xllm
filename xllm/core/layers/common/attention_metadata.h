@@ -31,6 +31,12 @@ namespace ffi = tvm::ffi;
 #include "dsa_metadata.h"
 #include "layers/common/kv_shard_batch_metadata.h"
 
+#if defined(USE_NPU)
+namespace xllm::npu {
+struct AclGraphTaskUpdateContext;
+}
+#endif
+
 namespace xllm::layer {
 
 struct ExpandedDecodeMetadata {
@@ -219,6 +225,7 @@ struct AttentionMetadata {
   std::vector<int64_t> kv_cu_seq_lens_host_vec;
   // Non-cumulative per-sequence lengths for chunked_prefill mode.
   std::vector<int64_t> kv_seq_lens_host_vec;
+  std::shared_ptr<npu::AclGraphTaskUpdateContext> acl_graph_task_update_context;
 #endif
 };
 

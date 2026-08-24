@@ -35,7 +35,9 @@ limitations under the License.
 #endif
 #include "core/common/metrics.h"
 #include "core/framework/speculative/mtp_async_state.h"
+#include "core/kernels/npu/npu_ops_api.h"
 #include "core/kernels/npu/tilelang/tilelang_ops_api.h"
+#include "core/kernels/npu/utils.h"
 #include "core/kernels/ops_api.h"
 #include "core/platform/device.h"
 #include "core/platform/npu/acl_graph_task_update_context.h"
@@ -54,6 +56,79 @@ constexpr uint64_t kStaticGraphTaskHashSeed = 0x6a09e667f3bcc909ull;
 constexpr size_t kMaxStaticMtpGraphVariantsPerSlot = 16;
 constexpr uint64_t kMlaGraphKeyMask = 1ull << 62;
 constexpr uint64_t kMlaGraphKeyPayloadMask = (1ull << 62) - 1;
+
+struct LinearStateCaptureSnapshot {
+  torch::Tensor conv_cache;
+  torch::Tensor ssm_cache;
+  torch::Tensor conv_indices;
+  torch::Tensor ssm_indices;
+  torch::Tensor conv_values;
+  torch::Tensor ssm_values;
+};
+
+std::vector<LinearStateCaptureSnapshot> snapshot_linear_state_slots(
+    const std::vector<KVCache>& kv_caches,
+    const std::vector<int32_t>& write_slot_ids) {
+  std::vector<int64_t> slot_ids(write_slot_ids.begin(), write_slot_ids.end());
+  std::sort(slot_ids.begin(), slot_ids.end());
+  slot_ids.erase(std::unique(slot_ids.begin(), slot_ids.end()), slot_ids.end());
+  if (slot_ids.empty()) {
+    return {};
+  }
+
+  std::vector<LinearStateCaptureSnapshot> snapshots;
+  snapshots.reserve(kv_caches.size());
+  for (const KVCache& kv_cache : kv_caches) {
+    torch::Tensor conv_cache = kv_cache.get_conv_cache();
+    torch::Tensor ssm_cache = kv_cache.get_ssm_cache();
+    if (!conv_cache.defined() && !ssm_cache.defined()) {
+      continue;
+    }
+    CHECK(conv_cache.defined() && ssm_cache.defined())
+        << "linear-attention layers must provide both conv and ssm caches";
+    CHECK_GT(conv_cache.size(0), 0);
+    CHECK_EQ(ssm_cache.size(0) % conv_cache.size(0), 0)
+        << "linear-state checkpoint layout mismatch";
+    for (int64_t slot_id : slot_ids) {
+      CHECK_GE(slot_id, 0);
+      CHECK_LT(slot_id, conv_cache.size(0));
+    }
+
+    const int64_t checkpoint_stride = ssm_cache.size(0) / conv_cache.size(0);
+    std::vector<int64_t> ssm_row_ids;
+    ssm_row_ids.reserve(slot_ids.size() * checkpoint_stride);
+    for (int64_t slot_id : slot_ids) {
+      for (int64_t checkpoint = 0; checkpoint < checkpoint_stride;
+           ++checkpoint) {
+        ssm_row_ids.push_back(slot_id * checkpoint_stride + checkpoint);
+      }
+    }
+
+    const auto index_options =
+        torch::TensorOptions().dtype(torch::kInt64).device(conv_cache.device());
+    torch::Tensor conv_indices = torch::tensor(slot_ids, index_options);
+    torch::Tensor ssm_indices = torch::tensor(ssm_row_ids, index_options);
+    snapshots.push_back(
+        LinearStateCaptureSnapshot{conv_cache,
+                                   ssm_cache,
+                                   conv_indices,
+                                   ssm_indices,
+                                   conv_cache.index_select(0, conv_indices),
+                                   ssm_cache.index_select(0, ssm_indices)});
+  }
+  return snapshots;
+}
+
+void restore_linear_state_slots(
+    const std::vector<LinearStateCaptureSnapshot>& snapshots) {
+  for (const LinearStateCaptureSnapshot& snapshot : snapshots) {
+    snapshot.conv_cache.index_copy_(
+        /*dim=*/0, snapshot.conv_indices, snapshot.conv_values);
+    snapshot.ssm_cache.index_copy_(
+        /*dim=*/0, snapshot.ssm_indices, snapshot.ssm_values);
+  }
+}
+
 bool uses_static_mtp_graph_task_variant(const ModelInputParams& params,
                                         uint32_t bucket_num_tokens,
                                         int64_t block_size) {
@@ -362,6 +437,13 @@ bool AclGraph::capture(CausalLM* model,
     graph_task_context_->begin_capture();
     graph_params->graph.acl_graph_task_update_context = graph_task_context_;
   }
+  // ACL graph capture executes the recorded kernels once. Hybrid decode
+  // kernels update their conv/SSM caches in place, so the verification replay
+  // below must start from the same state as capture. Snapshot only the slots
+  // written by this padded graph batch; copying the complete linear cache can
+  // consume hundreds of MiB per layer on large models.
+  const auto linear_state_capture_snapshot = snapshot_linear_state_slots(
+      kv_cache, graph_params->embedding.linear_state_ids);
   const bool capture_static_graph_tasks = uses_static_mtp_graph_task_variant(
       graph_params.value(), num_tokens_, options.block_size());
   // Synchronize stream to ensure all data is copied to graph persistent buffers
@@ -396,6 +478,7 @@ bool AclGraph::capture(CausalLM* model,
     // Reuse one pool per graph slot so bucket captures can share allocator
     // storage while the double-buffer slots remain independent.
     bool capture_started = false;
+    bool linear_state_restored = false;
     try {
       graph_.capture_begin(
           graph_pool,
@@ -416,6 +499,8 @@ bool AclGraph::capture(CausalLM* model,
       }
       graph_.capture_end();
       capture_started = false;
+      restore_linear_state_slots(linear_state_capture_snapshot);
+      linear_state_restored = true;
     } catch (...) {
       if (capture_started) {
         try {
@@ -427,6 +512,9 @@ bool AclGraph::capture(CausalLM* model,
           LOG(ERROR) << "ACL graph capture_end during cleanup failed.";
         }
         graph_.reset();
+      }
+      if (!linear_state_restored) {
+        restore_linear_state_slots(linear_state_capture_snapshot);
       }
       if (need_restore_stream) {
         c10_npu::setCurrentNPUStream(
@@ -456,9 +544,13 @@ bool AclGraph::capture(CausalLM* model,
 }
 
 bool AclGraph::update_graph_tasks(const ModelInputParams& params) {
-  if (graph_task_context_ == nullptr ||
-      graph_task_context_->causal_conv1d_tasks.empty()) {
+  if (graph_task_context_ == nullptr) {
     return false;
+  }
+
+  bool updated = update_paged_attention_graph_tasks(params);
+  if (graph_task_context_->causal_conv1d_tasks.empty()) {
+    return updated;
   }
 
   const std::vector<int64_t> empty_host_args;
@@ -505,6 +597,100 @@ bool AclGraph::update_graph_tasks(const ModelInputParams& params) {
         task.activation_mode,
         task.pad_slot_id,
         task.run_mode);
+    c10_npu::graph_task_update_end(update_stream);
+    CHECK(task.event != nullptr);
+    task.event->record(update_stream);
+  }
+  return true;
+}
+
+bool AclGraph::update_paged_attention_graph_tasks(
+    const ModelInputParams& params) {
+  if (graph_task_context_ == nullptr ||
+      graph_task_context_->paged_attention_tasks.empty()) {
+    return false;
+  }
+
+  c10_npu::NPUStream update_stream = update_stream_.value();
+  c10_npu::NPUStreamGuard stream_guard(update_stream);
+  for (auto& task : graph_task_context_->paged_attention_tasks) {
+    std::vector<int64_t> key_value_seq_lens;
+    if (task.branch == PagedAttentionGraphBranch::kExpandedDecode) {
+      key_value_seq_lens.assign(params.graph.expanded_kv_seq_lens_vec.begin(),
+                                params.graph.expanded_kv_seq_lens_vec.end());
+    } else {
+      key_value_seq_lens.assign(params.attention.host.kv_seq_lens.begin(),
+                                params.attention.host.kv_seq_lens.end());
+    }
+    CHECK_EQ(key_value_seq_lens.size(), task.query.size(0))
+        << "paged attention graph update lengths must match capture batch";
+    std::vector<int64_t> query_seq_lens(task.query.size(0), 1);
+
+    if (xllm::kernel::npu::is_ascend950() && !task.workspace.defined()) {
+      // Allocate once outside capture and retain it with the graph task. The
+      // max-workspace API deliberately covers all later KV sequence lengths.
+      task.workspace =
+          xllm::kernel::npu::npu_fused_infer_attention_graph_workspace(
+              task.query,
+              task.key_cache,
+              task.value_cache,
+              std::nullopt,
+              std::make_optional(task.block_table),
+              query_seq_lens,
+              key_value_seq_lens,
+              task.num_heads,
+              task.num_key_value_heads,
+              task.scale,
+              task.block_size,
+              /*sparse_mode=*/0,
+              /*input_layout=*/"BSND",
+              /*softmax_lse_flag=*/false);
+      VLOG(kGraphExecutorLogVerboseLevel)
+          << "allocated persistent A5 paged-attention graph workspace: "
+          << task.workspace.nbytes() << " bytes";
+    }
+
+    c10_npu::graph_task_update_begin(update_stream, task.handle);
+    if (xllm::kernel::npu::is_ascend950()) {
+      CHECK(task.workspace.defined());
+      xllm::kernel::npu::npu_fused_infer_attention_graph_out(
+          task.query,
+          task.key_cache,
+          task.value_cache,
+          std::nullopt,
+          std::make_optional(task.block_table),
+          query_seq_lens,
+          key_value_seq_lens,
+          task.num_heads,
+          task.num_key_value_heads,
+          task.scale,
+          task.block_size,
+          /*sparse_mode=*/0,
+          /*input_layout=*/"BSND",
+          /*softmax_lse_flag=*/false,
+          task.workspace,
+          task.output,
+          task.softmax_lse);
+    } else {
+      xllm::kernel::npu::npu_fused_infer_attention_out(
+          task.query,
+          task.key_cache,
+          task.value_cache,
+          std::nullopt,
+          std::make_optional(task.block_table),
+          query_seq_lens,
+          key_value_seq_lens,
+          task.num_heads,
+          task.num_key_value_heads,
+          task.scale,
+          task.block_size,
+          /*sparse_mode=*/0,
+          /*input_layout=*/"BSND",
+          /*softmax_lse_flag=*/false,
+          /*is_causal=*/false,
+          task.output,
+          task.softmax_lse);
+    }
     c10_npu::graph_task_update_end(update_stream);
     if (task.event != nullptr) {
       task.event->record(update_stream);
@@ -704,9 +890,13 @@ ModelOutput AclGraph::replay(CausalLM* model,
 
   aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
 
-  if (graph_paged_attention_tiling_data_.defined()) {
-    make_graph_wait_for_current_stream(stream);
-  }
+  // Persistent tokens, positions and attention metadata are refreshed with
+  // non-blocking copies on the producer stream above. Graph replay executes on
+  // the stream used during capture, which can be a different pooled stream.
+  // Make every replay wait for its inputs; otherwise ordinary decode can race
+  // those copies and consume values from the previous step. The helper is a
+  // no-op when both streams are identical.
+  make_graph_wait_for_current_stream(stream);
   const bool use_static_graph_tasks =
       graph_params.has_value() &&
       static_graph_task_signature_matches(graph_params.value());
@@ -727,6 +917,7 @@ ModelOutput AclGraph::replay(CausalLM* model,
         << "update() should return ModelInputParams for graph task update";
     if (use_static_graph_tasks) {
       // This graph variant's task-ready event was recorded before replay.
+      update_paged_attention_graph_tasks(graph_params.value());
     } else {
       update_graph_tasks(graph_params.value());
     }
@@ -1137,6 +1328,9 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
 
   const bool static_mtp_variant = uses_static_mtp_graph_task_variant(
       params_single, bucket_num_tokens, options_.block_size());
+  size_t graph_count_after_capture = 0;
+  size_t graph_pool_count_after_capture = 0;
+  size_t graph_stream_count_after_capture = 0;
   {
     std::lock_guard<std::mutex> lock(graph_slots_mutex_);
     if (static_mtp_variant) {
@@ -1151,7 +1345,16 @@ ModelOutput AclGraphExecutorImpl::run(const torch::Tensor& tokens,
     // shared_ptr keeps a replay/prepare that already left the map alive if a
     // later capture evicts this static variant.
     active_slot.graphs[graph_key] = graph;
+    graph_count_after_capture = get_graph_count();
+    graph_pool_count_after_capture = get_graph_memory_pool_count();
+    graph_stream_count_after_capture = get_graph_capture_stream_count();
   }
+  LOG(INFO) << "ACL graph inventory after capture: graphs="
+            << graph_count_after_capture
+            << ", pools=" << graph_pool_count_after_capture
+            << ", capture_streams=" << graph_stream_count_after_capture
+            << ", active_pool=(" << active_slot.graph_pool.first << ", "
+            << active_slot.graph_pool.second << ")";
 
   // Return the output from capture (no need to replay since capture
   // already executed)

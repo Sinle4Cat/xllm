@@ -88,12 +88,6 @@ void reshape_paged_cache(torch::Tensor& key,
                          const torch::Tensor& slot_mapping) {
   CHECK(value.has_value()) << "NPU reshape_paged_cache requires value.";
   CHECK(v_cache.has_value()) << "NPU reshape_paged_cache requires v_cache.";
-  if (is_ascend950()) {
-    reshape_and_cache_a5(
-        key, value.value(), k_cache, v_cache.value(), slot_mapping);
-    return;
-  }
-
   atb::npu_reshape_and_cache(
       key, value.value(), k_cache, v_cache.value(), slot_mapping);
 }

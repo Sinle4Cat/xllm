@@ -99,6 +99,32 @@ bool should_broadcast_spec_tokens(const ParallelArgs& parallel_args,
 
 constexpr int64_t kMaxSpecVerifyGraphUpdateBlockTableWidth = (1 << 15) - 1;
 
+void set_mtp_draft_gdn_metadata(ModelInputParams& input_params,
+                                const std::vector<int32_t>& q_seq_lens,
+                                const torch::Device& device) {
+  CHECK(!q_seq_lens.empty());
+  CHECK_EQ(q_seq_lens.size(), input_params.linear_state_validity_mask.size())
+      << "MTP draft GDN sequence and state-validity metadata must align";
+
+  std::vector<int32_t> q_cu_seq_lens;
+  q_cu_seq_lens.reserve(q_seq_lens.size() + 1);
+  q_cu_seq_lens.emplace_back(0);
+  for (const int32_t q_seq_len : q_seq_lens) {
+    CHECK(q_seq_len == 1 || q_seq_len == 2)
+        << "MTP draft GDN supports one or two tokens per sequence";
+    q_cu_seq_lens.emplace_back(q_cu_seq_lens.back() + q_seq_len);
+  }
+
+  input_params.is_mtp_draft = true;
+  input_params.mtp_draft_q_seq_lens_host = q_seq_lens;
+  input_params.mtp_draft_q_cu_seq_lens =
+      torch::tensor(q_cu_seq_lens,
+                    torch::TensorOptions().dtype(torch::kInt32).device(device));
+  input_params.embedding.linear_state_validity_mask =
+      torch::tensor(input_params.linear_state_validity_mask,
+                    torch::TensorOptions().dtype(torch::kBool).device(device));
+}
+
 // Speculative state is replicated across every model rank within one DP
 // replica. With orthogonal CP x TP, tp_group_ covers only one CP shard, while
 // cp_group_ connects the same TP rank across CP shards. Broadcast along both
@@ -3584,8 +3610,10 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
   }
   std::vector<torch::Tensor> expanded_embeddings;
   std::vector<int32_t> selected_row_idx;
+  std::vector<int32_t> draft_gdn_q_seq_lens;
   expanded_embeddings.reserve(num_sequences * 2);
   selected_row_idx.reserve(num_sequences);
+  draft_gdn_q_seq_lens.reserve(num_sequences);
 
   auto to_worker_device = [this](const torch::Tensor& tensor) {
     if (!tensor.defined() || tensor.device() == device_) {
@@ -3646,6 +3674,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
       specBuilder::update_kv_seq_lens_and_max(
           buf.out_kv_seq_lens, kv_len, buf.meta.kv_max_seq_len);
       selected_row_idx.emplace_back(2 * seq_id + 1);
+      draft_gdn_q_seq_lens.emplace_back(2);
       continue;
     }
     const bool use_two_rows =
@@ -3669,6 +3698,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     selected_row_idx.emplace_back(
         static_cast<int32_t>(expanded_embeddings.size()));
     add_row(state.token_id, /*position_offset=*/0, state.embedding);
+    draft_gdn_q_seq_lens.emplace_back(use_two_rows ? 2 : 1);
   }
 
   CHECK_EQ(buf.out_new_cache_slots.size(), buf.out_positions.size())
@@ -3724,6 +3754,7 @@ void MTPWorkerImpl::prepare_draft_extend_inputs(
     }
   }
   input_params.attention.rebuild_device_buffer(device_);
+  set_mtp_draft_gdn_metadata(input_params, draft_gdn_q_seq_lens, device_);
 
   input_params.embedding.input_embedding = torch::stack(expanded_embeddings);
 
@@ -3838,6 +3869,8 @@ void MTPWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
       std::move(input_params.attention.host.q_cu_seq_lens),
       buf.meta.kv_max_seq_len,
       std::move(buf.out_kv_seq_lens));
+  set_mtp_draft_gdn_metadata(
+      input_params, std::vector<int32_t>(num_sequences, 1), device_);
   if (supports_explicit_spec_verify_replay_update()) {
     input_params.attention.host.q_cu_seq_lens.clear();
     input_params.attention.host.q_cu_seq_lens.reserve(

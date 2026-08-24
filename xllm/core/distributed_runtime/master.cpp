@@ -43,6 +43,7 @@ limitations under the License.
 #include "core/framework/config/speculative_config.h"
 #include "dit_master.h"
 #if defined(USE_NPU)
+#include "core/kernels/npu/utils.h"
 #include "framework/parallel_state/npu_rank_table_env.h"
 #endif
 #include "core/platform/device_name_utils.h"
@@ -400,10 +401,14 @@ Master::Master(const Options& options, EngineType type)
   // World size is the node count (one worker per process).
   const int32_t global_world_size = options_.nnodes();
   std::string model_type;
+  const bool is_mtp_engine =
+      type == EngineType::SSM &&
+      SpeculativeConfig::is_mtp_algorithm(options_.speculative_algorithm());
   if ((options_.cp_size() > 1 && Platform::uses_model_cp_sharding()) ||
       (ModelConfig::is_python_model_impl(
            ModelConfig::get_instance().model_impl()) &&
-       options_.num_speculative_tokens() > 0)) {
+       options_.num_speculative_tokens() > 0) ||
+      is_mtp_engine) {
     model_type = util::get_model_type(model_path, options_.backend());
   }
   const std::optional<std::string> speculative_error =
@@ -416,6 +421,20 @@ Master::Master(const Options& options, EngineType type)
       validate_model_cp(options_, type, model_type, global_world_size);
   CHECK(!cp_error.has_value()) << cp_error.value();
   options_.enable_mla(util::should_enable_mla(model_path, options_.backend()));
+#if defined(USE_NPU)
+  // A5 Qwen3.5 MTP schedule overlap can forward device-resident accepted
+  // state across independent AIV kernel launches before private caches are
+  // made coherent. This presents as valid HTTP responses followed by a long
+  // run of the same token. Disable overlap for this exact configuration until
+  // every producer/consumer handoff has an explicit cache-visibility contract.
+  // Other SoCs and non-MTP/model paths retain the requested setting.
+  if (is_mtp_engine && options_.enable_schedule_overlap() &&
+      model_type == "qwen3_5_text" && kernel::npu::is_ascend950()) {
+    options_.enable_schedule_overlap(false);
+    LOG(WARNING) << "Force disabling schedule overlap for Ascend 950 "
+                    "Qwen3.5 MTP to preserve cross-kernel cache coherence";
+  }
+#endif
   print_startup_banner(model_path, options_.backend(), options_.node_rank());
   LOG(INFO) << "Master init options: " << options_.to_string();
   ParallelConfig::get_instance().cp_size(options_.cp_size());
