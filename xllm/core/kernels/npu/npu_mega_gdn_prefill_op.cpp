@@ -136,7 +136,9 @@ torch::Tensor mega_gdn_prefill_op(const torch::Tensor& mixed_qkv,
                norm_weight,
                ffts_addr_arg,
                num_matrices,
-               norm_output);
+               norm_output,
+               conv_state,
+               ssm_cache);
   return norm_output;
 }
 
