@@ -19,6 +19,7 @@ limitations under the License.
 #include <c10/core/TensorOptions.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
+#include <torch_npu/csrc/core/npu/NPUFunctions.h>
 #include <torch_npu/csrc/core/npu/NPUGuard.h>
 #include <torch_npu/csrc/libs/init_npu.h>
 #include <torch_npu/torch_npu.h>
@@ -333,7 +334,7 @@ bool AclGraph::capture(CausalLM* model,
 
   auto& tensor_options = model->options();
 
-  torch::npu::synchronize();
+  c10_npu::device_synchronize();
 
   // Begin graph capture using NPUGraph mempool for temporary tensor management
   // Get current NPU stream from libtorch NPU API

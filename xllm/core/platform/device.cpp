@@ -97,14 +97,10 @@ int32_t Device::index() const { return device_.index(); }
 // set device before init device context
 void Device::init_device_context() const {
 #if defined(USE_NPU)
-  if (ModelConfig::is_python_model_impl(
-          ModelConfig::get_instance().model_impl())) {
-    // Python path: full NPU runtime already initialized in main() via
-    // aclInit + torch_npu._C._npu_init(). Only switch device here.
-    c10_npu::SetDevice(index());
-  } else {
-    torch_npu::init_npu(index());
-  }
+  // The process runtime is initialized before workers are created.  The
+  // post5 torch_npu runtime no longer exports the C++ init_npu convenience
+  // wrapper, so only select the worker device here.
+  c10_npu::SetDevice(index());
 #endif
 }
 

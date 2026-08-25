@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <torch_npu/csrc/core/npu/NPUFormat.h>
+
 #include "core/kernels/npu/aclnn/pytorch_npu_helper.hpp"
 #include "xllm_ops_api.h"
 
@@ -48,7 +50,7 @@ at::Tensor apply_int4_quantize(const at::Tensor& self,
   at::Tensor result;
   const int64_t npu_format = get_tensor_npu_format(self);
   if (npu_format == ACL_FORMAT_FRACTAL_NZ) {
-    result = at_npu::native::OpPreparation::apply_tensor_with_format(
+    result = at_npu::native::empty_with_format(
         output_shape, output_options, ACL_FORMAT_FRACTAL_NZ, true);
   } else {
     result = at_npu::native::OpPreparation::apply_tensor_without_format(
